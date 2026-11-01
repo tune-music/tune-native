@@ -31,11 +31,20 @@ pub struct Track {
     pub duration: Duration,
     pub cover: Option<String>,
     pub album: Option<String>,
+    pub album_title: String,
+    pub artist_id: Option<String>,
     /// Пачка волны, из которой пришёл трек.
     pub batch: Option<String>,
 }
 
 impl Track {
+    pub fn share_link(&self) -> String {
+        match &self.album {
+            Some(album) => format!("https://music.yandex.ru/album/{album}/track/{}", self.id),
+            None => format!("https://music.yandex.ru/track/{}", self.id),
+        }
+    }
+
     /// Так трек называют обратная связь и очередь волны: id:альбом.
     pub fn full_id(&self) -> String {
         match &self.album {
@@ -50,6 +59,16 @@ pub struct Profile {
     pub uid: String,
     pub name: String,
     pub plus: bool,
+}
+
+impl Playlist {
+    pub fn album(id: &str, title: &str) -> Self {
+        Self { source: Source::Album, owner: String::new(), kind: id.to_string(), title: title.to_string(), count: 1, cover: None }
+    }
+
+    pub fn artist(id: &str, title: &str) -> Self {
+        Self { source: Source::Artist, owner: String::new(), kind: id.to_string(), title: title.to_string(), count: 1, cover: None }
+    }
 }
 
 /// Откуда берутся треки списка.
@@ -103,7 +122,7 @@ fn agent() -> ureq::Agent {
     ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).http_status_as_error(false).build().into()
 }
 
-fn data_dir() -> PathBuf {
+pub fn data_dir() -> PathBuf {
     PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("dev.tune.native")
 }
 
@@ -198,6 +217,8 @@ fn parse_track(v: &Value) -> Option<Track> {
         duration: Duration::from_millis(v["durationMs"].as_u64().unwrap_or(0)),
         cover: v["coverUri"].as_str().filter(|c| !c.is_empty()).map(str::to_string),
         album: v["albums"][0]["id"].as_u64().map(|a| a.to_string()),
+        album_title: v["albums"][0]["title"].as_str().unwrap_or_default().to_string(),
+        artist_id: id_text(&v["artists"][0]["id"]),
         batch: None,
     })
 }

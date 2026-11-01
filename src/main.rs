@@ -1,19 +1,23 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;
+mod fonts;
 mod login;
 mod media;
 mod player;
+mod seek;
 mod ui;
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iced::futures::channel::{mpsc, oneshot};
 use iced::widget::text::Wrapping;
-use iced::widget::{button, column, container, image, mouse_area, operation, row, scrollable, slider, stack, text, text_input, Id, Space};
+use iced::keyboard;
+use iced::widget::{button, canvas, column, container, image, mouse_area, operation, row, scrollable, slider, stack, text, text_input, Id, Space};
 use iced::{event, mouse, time, window, Alignment, Event, Element, Length, Padding, Size, Subscription, Task};
 
 use api::{Pin, PinTarget, Playlist, Profile, Source, Track, Wave, NEED_LOGIN};
@@ -28,6 +32,14 @@ const BAR_HEIGHT: f32 = 80.0;
 const CARD: f32 = 190.0;
 const WAVE_COVER: f32 = 120.0;
 const PILL_WIDTH: f32 = 320.0;
+const MENU_WIDTH: f32 = 270.0;
+const MENU_ITEM: f32 = 40.0;
+const NOTICE_TIME: Duration = Duration::from_secs(4);
+
+/// Где курсор и какого размера окно. Меняются постоянно, поэтому не идут через сообщения:
+/// иначе интерфейс перестраивался бы от каждого движения мыши.
+static CURSOR: Mutex<(f32, f32)> = Mutex::new((0.0, 0.0));
+static WINDOW: Mutex<(f32, f32)> = Mutex::new((1280.0, 820.0));
 const PIN_COVER_PREFIX: &str = "pin:";
 const SIDEBAR: f32 = 224.0;
 const LIKE: f32 = 32.0;
@@ -72,6 +84,8 @@ enum Section {
 #[derive(Clone)]
 enum Preview {
     Wave,
+    /// Главная с перемоткой в самом начале трека.
+    WaveSeek,
     Collection,
     Likes,
     Playlists,
@@ -79,6 +93,8 @@ enum Preview {
     Playlist,
     /// Первый плейлист в очереди, открыта главная.
     PlaylistHome,
+    /// Открытое меню первого трека.
+    Menu,
     Search(String),
 }
 
@@ -96,6 +112,10 @@ struct App {
     uid: Option<String>,
     liked_ids: Vec<String>,
     liked_set: HashSet<String>,
+    disliked: HashSet<String>,
+    /// Открытое меню трека и где его показать.
+    menu: Option<(Track, f32, f32)>,
+    notice: Option<(u64, String)>,
     liked: Vec<Track>,
     likes_loading: bool,
     pins: Vec<Pin>,
@@ -139,7 +159,7 @@ enum Message {
     LoginOpen,
     LoginFinished,
     Logout,
-    Account(Result<(Profile, Vec<String>), String>),
+    Account(Result<(Profile, Vec<String>, Vec<String>), String>),
     Back,
     BarHover(bool),
     Open(Section),
@@ -161,8 +181,17 @@ enum Message {
     PinsLoaded(Result<Vec<Pin>, String>),
     PlaylistLoaded(String, Result<Vec<Track>, String>),
     PlaylistMore,
-    Dislike,
-    Saved(Result<(), String>),
+    MenuOpen(Track),
+    MenuClose,
+    Dislike(Track),
+    DislikeSaved(String, bool, Result<(), String>),
+    PlayNext(Track),
+    PlayLast(Track),
+    TrackWave(Track),
+    OpenAlbum(Track),
+    OpenArtist(Track),
+    CopyLink(Track),
+    NoticeClear(u64),
     WindowReady(Option<isize>),
     Media(media::Event),
     Play(Section, usize),
@@ -201,6 +230,9 @@ impl App {
             uid: None,
             liked_ids: Vec::new(),
             liked_set: HashSet::new(),
+            disliked: HashSet::new(),
+            menu: None,
+            notice: None,
             liked: Vec::new(),
             likes_loading: false,
             pins: Vec::new(),
@@ -268,6 +300,9 @@ impl App {
         self.liked.clear();
         self.liked_ids.clear();
         self.liked_set.clear();
+        self.disliked.clear();
+        self.menu = None;
+        self.notice = None;
         self.covers.clear();
         self.playlists.clear();
         self.playlist = None;
@@ -394,6 +429,16 @@ impl App {
         Task::perform(background(move || api::wave_new(&seeds, &token)), move |r| Message::WaveStarted(autoplay, r))
     }
 
+    /// Показывает уведомление и убирает его через несколько секунд.
+    fn notify(&mut self, text: String) -> Task<Message> {
+        let id = self.notice.as_ref().map_or(1, |(id, _)| id + 1);
+        self.notice = Some((id, text));
+        Task::perform(
+            background(|| std::thread::sleep(NOTICE_TIME)),
+            move |()| Message::NoticeClear(id),
+        )
+    }
+
     fn likes_more(&mut self) -> Task<Message> {
         let Some(token) = self.token() else { return Task::none() };
         let from = self.liked.len();
@@ -470,15 +515,16 @@ impl App {
                 self.reset();
                 return Task::done(Message::LoginOpen);
             }
-            Message::Account(Ok((profile, ids))) => {
+            Message::Account(Ok((profile, ids, disliked))) => {
+                self.disliked = disliked.into_iter().collect();
                 self.uid = Some(profile.uid.clone());
                 self.profile = Some(profile);
                 self.liked_set = ids.iter().cloned().collect();
                 self.liked_ids = ids;
                 let pins = self.token().map_or(Task::none(), |token| Task::perform(background(move || api::pins(&token)), Message::PinsLoaded));
                 let page = match self.preview.clone() {
-                    Some(Preview::Wave) => self.wave_load(vec![api::MY_WAVE.to_string()], false),
-                    Some(Preview::Likes) => self.update(Message::Open(Section::Likes)),
+                    Some(Preview::Wave | Preview::WaveSeek) => self.wave_load(vec![api::MY_WAVE.to_string()], false),
+                    Some(Preview::Likes | Preview::Menu) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
                     Some(Preview::Playlists | Preview::Playlist | Preview::PlaylistHome) => self.update(Message::Open(Section::Playlists)),
                     Some(Preview::Search(query)) => {
@@ -588,6 +634,13 @@ impl App {
                         if matches!(self.preview, Some(Preview::Collection)) {
                             self.preview = None;
                         }
+                        if matches!(self.preview, Some(Preview::Menu)) {
+                            self.preview = None;
+                            self.menu = self.liked.first().cloned().map(|t| (t, 700.0, 200.0));
+                            self.seeking = Some(60.0);
+                            self.queue = self.liked.clone();
+                            self.current = Some(0).filter(|_| !self.queue.is_empty());
+                        }
                         if matches!(self.preview.take(), Some(Preview::Likes)) {
                             self.queue = self.liked.clone();
                             self.current = Some(0).filter(|_| !self.queue.is_empty());
@@ -598,6 +651,7 @@ impl App {
                 }
             }
             Message::Like(track) => {
+                self.menu = None;
                 let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
                 let liked = !self.liked_set.contains(&track.id);
                 self.apply_like(&track, liked);
@@ -625,7 +679,7 @@ impl App {
                 self.wave_loading = false;
                 match result {
                     // Пока грузилась фоновая волна, пользователь мог включить свой список.
-                    Ok(_) if !autoplay && self.current.is_some() && !matches!(self.preview, Some(Preview::Wave)) => {}
+                    Ok(_) if !autoplay && self.current.is_some() && !matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek)) => {}
                     Ok(wave) => {
                         if let Some(p) = &self.player {
                             p.stop();
@@ -641,7 +695,10 @@ impl App {
                         self.current = Some(0).filter(|_| !self.queue.is_empty());
                         self.prune_covers();
                         let covers = self.fetch_wave_covers(&self.queue);
-                        if matches!(self.preview, Some(Preview::Wave)) {
+                        if matches!(self.preview, Some(Preview::WaveSeek)) {
+                            self.seeking = Some(5.0);
+                        }
+                        if matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek)) {
                             self.preview = None;
                         }
                         if autoplay {
@@ -720,16 +777,87 @@ impl App {
                 self.playlist_shown = (from + PLAYLIST_PAGE).min(self.playlist_tracks.len());
                 return self.fetch_covers(&self.playlist_tracks[from..self.playlist_shown]);
             }
-            Message::Dislike => {
-                let (Some(uid), Some(token), Some(track)) = (self.uid.clone(), self.token(), self.current_track().cloned()) else { return Task::none() };
-                self.feedback("dislike", Some(&track), None);
-                let id = track.id.clone();
-                let save = Task::perform(background(move || api::set_disliked(&uid, &id, true, &token)), Message::Saved);
-                let next = self.current.filter(|i| i + 1 < self.queue.len()).map_or(Task::none(), |i| self.play(i + 1));
-                return Task::batch([save, next]);
+            Message::MenuOpen(track) => {
+                let (x, y) = *CURSOR.lock().unwrap();
+                self.menu = Some((track, x, y));
             }
-            Message::Saved(Ok(())) => {}
-            Message::Saved(Err(e)) => return self.fail(e),
+            Message::MenuClose => self.menu = None,
+            Message::Dislike(track) => {
+                self.menu = None;
+                let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
+                let disliked = !self.disliked.contains(&track.id);
+                if disliked {
+                    self.disliked.insert(track.id.clone());
+                } else {
+                    self.disliked.remove(&track.id);
+                }
+                if self.queue.iter().any(|t| t.id == track.id) {
+                    self.feedback(if disliked { "dislike" } else { "undislike" }, Some(&track), None);
+                }
+                let text = if disliked { "Трек больше не будет появляться в ваших рекомендациях" } else { "Теперь трек сможет появляться в ваших рекомендациях" };
+                let notice = self.notify(text.to_string());
+                let id = track.id.clone();
+                let saved = id.clone();
+                let save = Task::perform(background(move || api::set_disliked(&uid, &id, disliked, &token)), move |r| Message::DislikeSaved(saved.clone(), disliked, r));
+                // Как в оригинале: дизлайк играющего трека сразу переключает на следующий.
+                let next = if disliked && self.current_track().is_some_and(|t| t.id == track.id) {
+                    self.current.filter(|i| i + 1 < self.queue.len()).map_or(Task::none(), |i| self.play(i + 1))
+                } else {
+                    Task::none()
+                };
+                return Task::batch([notice, save, next]);
+            }
+            Message::DislikeSaved(_, _, Ok(())) => {}
+            Message::DislikeSaved(id, disliked, Err(e)) => {
+                if disliked {
+                    self.disliked.remove(&id);
+                } else {
+                    self.disliked.insert(id);
+                }
+                return self.fail(e);
+            }
+            Message::PlayNext(track) => {
+                self.menu = None;
+                let notice = self.notify(format!("Трек {} добавлен в начало очереди", track.title));
+                let at = self.current.map_or(0, |i| i + 1);
+                self.queue.insert(at.min(self.queue.len()), track);
+                let start = if self.current.is_none() { self.play(0) } else { Task::none() };
+                return Task::batch([notice, start]);
+            }
+            Message::PlayLast(track) => {
+                self.menu = None;
+                let notice = self.notify(format!("Трек {} добавлен в конец очереди", track.title));
+                self.queue.push(track);
+                let start = if self.current.is_none() { self.play(0) } else { Task::none() };
+                return Task::batch([notice, start]);
+            }
+            Message::TrackWave(track) => {
+                self.menu = None;
+                return self.update(Message::WaveStartSeeds(vec![format!("track:{}", track.id)]));
+            }
+            Message::OpenAlbum(track) => {
+                self.menu = None;
+                if let Some(album) = &track.album {
+                    return self.open_list(Playlist::album(album, &track.album_title));
+                }
+            }
+            Message::OpenArtist(track) => {
+                self.menu = None;
+                if let Some(artist) = &track.artist_id {
+                    let name = track.artists.split(',').next().unwrap_or_default();
+                    return self.open_list(Playlist::artist(artist, name));
+                }
+            }
+            Message::CopyLink(track) => {
+                self.menu = None;
+                let notice = self.notify("Ссылка на трек скопирована".to_string());
+                return Task::batch([iced::clipboard::write(track.share_link()), notice]);
+            }
+            Message::NoticeClear(id) => {
+                if self.notice.as_ref().is_some_and(|(current, _)| *current == id) {
+                    self.notice = None;
+                }
+            }
             Message::WindowReady(hwnd) => {
                 if let Some(hwnd) = hwnd {
                     black_caption(hwnd);
@@ -873,13 +1001,13 @@ impl App {
     }
 
     fn view_login(&self, opened: bool) -> Element<'_, Message> {
-        let mut content = column![text("Tune").size(32).font(ui::FONT_HEADLINE)].spacing(14).align_x(Alignment::Center);
+        let mut content = column![text("Tune").size(32).font(ui::font_headline())].spacing(14).align_x(Alignment::Center);
         if opened {
             content = content.push(text("Войдите в аккаунт Яндекса в открывшемся окне").color(ui::MUTED));
         } else {
             content = content
                 .push(text("Для музыки нужен аккаунт Яндекса").color(ui::MUTED))
-                .push(button(text("Войти через Яндекс").font(ui::FONT_HEADLINE)).padding([10, 20]).style(ui::accent).on_press(Message::LoginOpen));
+                .push(button(text("Войти через Яндекс").font(ui::font_headline())).padding([10, 20]).style(ui::accent).on_press(Message::LoginOpen));
         }
         if let Some(error) = &self.error {
             content = content.push(text(error).color(ui::DANGER));
@@ -909,7 +1037,68 @@ impl App {
             }
             container(main).padding(Padding::ZERO.right(12).bottom(12)).width(Length::Fill).height(Length::Fill).into()
         };
-        container(row![self.view_sidebar(), main]).width(Length::Fill).height(Length::Fill).style(ui::root).into()
+        let base = container(row![self.view_sidebar(), main]).width(Length::Fill).height(Length::Fill).style(ui::root);
+        let mut layers = stack![base];
+        if let Some((track, x, y)) = &self.menu {
+            layers = layers.push(mouse_area(container(Space::new()).width(Length::Fill).height(Length::Fill)).on_press(Message::MenuClose).on_right_press(Message::MenuClose));
+            layers = layers.push(self.view_menu(track, *x, *y));
+        }
+        if let Some((_, notice)) = &self.notice {
+            layers = layers.push(
+                container(container(text(notice).color(ui::TEXT)).padding([12, 18]).style(ui::popover))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Start)
+                    .padding(Padding::new(0.0).top(16)),
+            );
+        }
+        layers.into()
+    }
+
+    /// Контекстное меню трека: те же пункты и названия, что в оригинале.
+    fn view_menu<'a>(&self, track: &'a Track, x: f32, y: f32) -> Element<'a, Message> {
+        let item = |icon, label: &'a str, message: Message| {
+            button(row![ui::icon(icon, 20.0, ui::MUTED), text(label).color(ui::TEXT)].spacing(12).align_y(Alignment::Center))
+                .width(Length::Fill)
+                .height(MENU_ITEM)
+                .padding([9, 10])
+                .style(ui::menu_item)
+                .on_press(message)
+        };
+        let liked = self.liked_set.contains(&track.id);
+        let disliked = self.disliked.contains(&track.id);
+        let mut items = column![
+            item(if liked { ui::HEART } else { ui::HEART_OUTLINE }, if liked { "Убрать из «Мне нравится»" } else { "Нравится" }, Message::Like(track.clone())),
+            item(ui::DISLIKE, if disliked { "Убрать дизлайк" } else { "Не нравится" }, Message::Dislike(track.clone())),
+            item(ui::WAVE, "Моя волна по треку", Message::TrackWave(track.clone())),
+            item(ui::QUEUE_NEXT, "Играть следующим", Message::PlayNext(track.clone())),
+            item(ui::QUEUE_LAST, "Добавить в конец очереди", Message::PlayLast(track.clone())),
+        ];
+        let mut count = 5.0;
+        if track.album.is_some() {
+            items = items.push(item(ui::ALBUM, "Перейти к альбому", Message::OpenAlbum(track.clone())));
+            count += 1.0;
+        }
+        if track.artist_id.is_some() {
+            items = items.push(item(ui::ARTIST, "Перейти к исполнителю", Message::OpenArtist(track.clone())));
+            count += 1.0;
+        }
+        items = items.push(item(ui::LINK, "Скопировать ссылку", Message::CopyLink(track.clone())));
+        count += 1.0;
+        // Меню не должно выходить за край окна.
+        let (width, height) = *WINDOW.lock().unwrap();
+        let x = x.min(width - MENU_WIDTH - 8.0).max(8.0);
+        let y = y.min(height - (count * MENU_ITEM + 16.0) - 8.0).max(8.0);
+        container(container(items).width(MENU_WIDTH).padding(8).style(ui::popover))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(Padding::new(0.0).left(x).top(y))
+            .into()
+    }
+
+    fn more_button<'a>(&self, track: &Track, size: f32) -> Element<'a, Message> {
+        button(container(ui::icon(ui::MORE, size, ui::MUTED)).center(LIKE)).padding(0).style(ui::ghost).on_press(Message::MenuOpen(track.clone())).into()
     }
 
     fn view_sidebar(&self) -> Element<'_, Message> {
@@ -925,13 +1114,13 @@ impl App {
                 .style(ui::nav)
                 .on_press(Message::Open(section))
         };
-        let mut account = column![text(self.profile.as_ref().map_or("", |p| p.name.as_str())).size(14).font(ui::FONT_MEDIUM).color(ui::TEXT).wrapping(Wrapping::None)].clip(true).width(Length::Fill);
+        let mut account = column![text(self.profile.as_ref().map_or("", |p| p.name.as_str())).size(14).font(ui::font_medium()).color(ui::TEXT).wrapping(Wrapping::None)].clip(true).width(Length::Fill);
         if self.profile.as_ref().is_some_and(|p| p.plus) {
-            account = account.push(container(text("Плюс").size(12).font(ui::FONT_MEDIUM)).padding([1, 8]).style(ui::plus));
+            account = account.push(container(text("Плюс").size(12).font(ui::font_medium())).padding([1, 8]).style(ui::plus));
         }
         let first = self.profile.as_ref().and_then(|p| p.name.chars().next()).map(|c| c.to_uppercase().to_string()).unwrap_or_default();
         let profile = row![
-            container(text(first).size(18).font(ui::FONT_MEDIUM)).center(42).style(ui::avatar),
+            container(text(first).size(18).font(ui::font_medium())).center(42).style(ui::avatar),
             account,
             button(ui::icon(ui::LOGOUT, 18.0, ui::MUTED)).padding(6).style(ui::ghost).on_press(Message::Logout),
         ]
@@ -939,7 +1128,7 @@ impl App {
         .align_y(Alignment::Center);
         container(
             column![
-                container(text("Tune").size(26).font(ui::FONT_HEADLINE).color(ui::ACCENT)).padding(Padding::new(0.0).left(12)),
+                container(text("Tune").size(26).font(ui::font_headline()).color(ui::ACCENT)).padding(Padding::new(0.0).left(12)),
                 Space::new().height(8),
                 column![
                     item(ui::SEARCH, "Поиск", Section::Search),
@@ -974,7 +1163,7 @@ impl App {
                 let line = row![
                     cover,
                     column![
-                        text(&pin.title).size(13).font(ui::FONT_MEDIUM).color(ui::TEXT).wrapping(Wrapping::None),
+                        text(&pin.title).size(13).font(ui::font_medium()).color(ui::TEXT).wrapping(Wrapping::None),
                         text(pin.subtitle).size(12).color(ui::MUTED).wrapping(Wrapping::None),
                     ]
                     .width(Length::Fill)
@@ -989,7 +1178,7 @@ impl App {
 
     /// Заголовок блока со стрелкой, как на страницах оригинала.
     fn block_title<'a>(&self, title: &'a str, section: Section) -> Element<'a, Message> {
-        button(row![text(title).size(24).font(ui::FONT_HEADLINE).color(ui::TEXT), ui::icon(ui::CHEVRON, 24.0, ui::MUTED)].spacing(6).align_y(Alignment::Center))
+        button(row![text(title).size(24).font(ui::font_headline()).color(ui::TEXT), ui::icon(ui::CHEVRON, 24.0, ui::MUTED)].spacing(6).align_y(Alignment::Center))
             .padding(0)
             .style(button::text)
             .on_press(Message::Open(section))
@@ -1004,7 +1193,7 @@ impl App {
             }
             return container(
                 column![
-                    text("Моя волна").size(56).font(ui::FONT_HEADLINE).color(ui::WHITE),
+                    text("Моя волна").size(56).font(ui::font_headline()).color(ui::WHITE),
                     Space::new().height(16),
                     button(container(ui::icon(ui::PLAY, 36.0, ui::ON_ACCENT)).center(64)).padding(8).style(ui::round).on_press(Message::WaveStart),
                 ]
@@ -1019,26 +1208,27 @@ impl App {
         let name = track.artists.split(',').next().unwrap_or_default().to_string();
         let total = track.duration.as_secs_f32().max(1.0);
         let shown = self.seeking.unwrap_or(self.position.as_secs_f32()).min(total);
-        let title = container(text(&track.title).size(18).font(ui::FONT_HEADLINE).color(ui::TEXT).wrapping(Wrapping::None)).center(Length::Fill).padding([0, 24]).clip(true);
-        let pill = container(stack![slider(0.0..=total, shown, Message::Seek).on_release(Message::SeekDone).height(56).style(if shown < 0.5 { ui::seek_pill_start } else { ui::seek_pill }), title]).width(PILL_WIDTH).height(56);
+        let title = container(text(&track.title).size(18).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None)).center(Length::Fill).padding([0, 24]).clip(true);
+        let progress = canvas(seek::Seek { value: shown, total, radius: 28.0, base: ui::CONTROL, fill: ui::CONTROL_HOVER }).width(Length::Fill).height(56);
+        let pill = container(stack![progress, title]).width(PILL_WIDTH).height(56);
         let mut top = column![].spacing(4).align_x(Alignment::Center);
         match &self.queue_title {
             Some(source) => {
-                let back = row![text(source).size(20).font(ui::FONT_HEADLINE).color(ui::ACCENT), ui::icon(ui::CLOSE, 22.0, ui::ACCENT)].spacing(8).align_y(Alignment::Center);
+                let back = row![text(source).size(20).font(ui::font_headline()).color(ui::ACCENT), ui::icon(ui::CLOSE, 22.0, ui::ACCENT)].spacing(8).align_y(Alignment::Center);
                 top = top.push(button(back).padding([6, 14]).style(ui::source_button).on_press(Message::WaveStart));
             }
-            None => top = top.push(text("Моя волна").size(20).font(ui::FONT_HEADLINE).color(ui::ACCENT)),
+            None => top = top.push(text("Моя волна").size(20).font(ui::font_headline()).color(ui::ACCENT)),
         }
         let time = if self.starting { "Загрузка…".to_string() } else { format!("{} / {}", clock(Duration::from_secs_f32(shown)), clock(track.duration)) };
         container(
             column![
                 top,
                 Space::new().height(12),
-                text(name).size(64).font(ui::FONT_HEADLINE).color(ui::WHITE).wrapping(Wrapping::None),
+                text(name).size(64).font(ui::font_headline()).color(ui::WHITE).wrapping(Wrapping::None),
                 Space::new().height(16),
                 self.cover(track, WAVE_COVER),
                 Space::new().height(16),
-                row![circle(ui::DISLIKE, Message::Dislike), pill, circle(if liked { ui::HEART } else { ui::HEART_OUTLINE }, Message::Like(track.clone()))].spacing(8).align_y(Alignment::Center),
+                row![pill, circle(if liked { ui::HEART } else { ui::HEART_OUTLINE }, Message::Like(track.clone())), circle(ui::MORE, Message::MenuOpen(track.clone()))].spacing(8).align_y(Alignment::Center),
                 Space::new().height(8),
                 text(time).size(13).color(ui::MUTED),
                 Space::new().height(12),
@@ -1068,7 +1258,7 @@ impl App {
             row![
                 tile,
                 column![
-                    row![text("Мне нравится").size(24).font(ui::FONT_HEADLINE).color(ui::TEXT), ui::icon(ui::CHEVRON, 24.0, ui::MUTED)].spacing(6).align_y(Alignment::Center),
+                    row![text("Мне нравится").size(24).font(ui::font_headline()).color(ui::TEXT), ui::icon(ui::CHEVRON, 24.0, ui::MUTED)].spacing(6).align_y(Alignment::Center),
                     text(count).color(ui::MUTED),
                 ],
             ]
@@ -1087,7 +1277,7 @@ impl App {
             })
         };
         let mut page = column![
-            text("Коллекция").size(36).font(ui::FONT_HEADLINE).color(ui::TEXT),
+            text("Коллекция").size(36).font(ui::font_headline()).color(ui::TEXT),
             Space::new().height(16),
             likes,
             row![column_of(0..4), column_of(4..8)].spacing(24),
@@ -1108,7 +1298,7 @@ impl App {
             };
             let card = column![
                 cover,
-                text(&playlist.title).font(ui::FONT_MEDIUM).color(ui::TEXT).wrapping(Wrapping::None),
+                text(&playlist.title).font(ui::font_medium()).color(ui::TEXT).wrapping(Wrapping::None),
                 text(format!("{} {}", playlist.count, tracks_word(playlist.count as usize))).size(13).color(ui::MUTED),
             ]
             .spacing(6)
@@ -1126,7 +1316,7 @@ impl App {
         };
         let title = row![
             button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back),
-            text("Мне нравится").size(36).font(ui::FONT_HEADLINE).color(ui::TEXT),
+            text("Мне нравится").size(36).font(ui::font_headline()).color(ui::TEXT),
             text(count).color(ui::MUTED),
         ]
         .spacing(12)
@@ -1151,8 +1341,8 @@ impl App {
         if let Some(playlist) = &self.playlist {
             let title = row![
                 back,
-                text(&playlist.title).size(36).font(ui::FONT_HEADLINE).color(ui::TEXT).wrapping(Wrapping::None),
-                text(format!("{} {}", playlist.count, tracks_word(playlist.count as usize))).color(ui::MUTED),
+                text(&playlist.title).size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None),
+                text(if self.playlist_tracks.is_empty() { String::new() } else { format!("{} {}", playlist.count, tracks_word(playlist.count as usize)) }).color(ui::MUTED),
             ]
             .spacing(12)
             .align_y(Alignment::Center);
@@ -1167,7 +1357,7 @@ impl App {
             };
             return column![title, center].spacing(16).height(Length::Fill).into();
         }
-        let title = row![back, text("Плейлисты").size(36).font(ui::FONT_HEADLINE).color(ui::TEXT)].spacing(12).align_y(Alignment::Center);
+        let title = row![back, text("Плейлисты").size(36).font(ui::font_headline()).color(ui::TEXT)].spacing(12).align_y(Alignment::Center);
         let center: Element<'_, Message> = if !self.playlists.is_empty() {
             scrollable(container(self.view_playlist_cards()).padding(Padding::ZERO.right(SCROLLBAR))).height(Length::Fill).into()
         } else if self.playlists_loading || self.uid.is_none() {
@@ -1216,17 +1406,18 @@ impl App {
         let line = row![
             cover,
             column![
-                text(&track.title).font(ui::FONT_MEDIUM).color(ui::WHITE).wrapping(Wrapping::None),
+                text(&track.title).font(ui::font_medium()).color(ui::WHITE).wrapping(Wrapping::None),
                 text(&track.artists).color(ui::MUTED).wrapping(Wrapping::None),
             ]
             .width(Length::Fill)
             .clip(true),
             self.like_button(track, 20.0),
             text(clock(track.duration)).color(ui::MUTED),
+            self.more_button(track, 18.0),
         ]
         .spacing(12)
         .align_y(Alignment::Center);
-        button(line).width(Length::Fill).padding([8, 8]).style(ui::row).on_press(Message::Play(section, index)).into()
+        mouse_area(button(line).width(Length::Fill).padding([8, 8]).style(ui::row).on_press(Message::Play(section, index))).on_right_press(Message::MenuOpen(track.clone())).into()
     }
 
     fn like_button<'a>(&self, track: &Track, size: f32) -> Element<'a, Message> {
@@ -1258,11 +1449,12 @@ impl App {
         let about = row![
             self.cover(track, BAR_COVER),
             column![
-                text(&track.title).font(ui::FONT_MEDIUM).color(ui::WHITE).wrapping(Wrapping::None),
+                text(&track.title).font(ui::font_medium()).color(ui::WHITE).wrapping(Wrapping::None),
                 text(status).color(ui::MUTED).wrapping(Wrapping::None),
             ]
             .width(Length::Fill)
             .clip(true),
+            self.more_button(track, 20.0),
         ]
         .spacing(12)
         .align_y(Alignment::Center)
@@ -1270,7 +1462,6 @@ impl App {
 
         let transport = container(
             row![
-                side(ui::DISLIKE, Message::Dislike),
                 side(ui::PREVIOUS, Message::Previous),
                 toggle,
                 side(ui::NEXT, Message::Next),
@@ -1288,7 +1479,7 @@ impl App {
         let volume = container(right.push(ui::icon(ui::VOLUME, 24.0, ui::MUTED)).push(slider(0.0..=1.0, self.volume, Message::Volume).step(0.01).width(90).style(ui::volume)))
             .align_right(Length::FillPortion(3));
 
-        let seek = slider(0.0..=total, shown, Message::Seek).on_release(Message::SeekDone).height(BAR_HEIGHT).style(if shown < 0.5 { ui::seek_start } else { ui::seek });
+        let seek = canvas(seek::Seek { value: shown, total, radius: 12.0, base: iced::Color::TRANSPARENT, fill: ui::CONTROL }).width(Length::Fill).height(BAR_HEIGHT);
         let controls = container(row![about, transport, volume].spacing(16).align_y(Alignment::Center)).padding([8, 8]).center_y(BAR_HEIGHT).width(Length::Fill);
         Some(
             mouse_area(container(stack![seek, controls]).width(Length::Fill).height(BAR_HEIGHT).style(ui::player).clip(true))
@@ -1302,7 +1493,7 @@ impl App {
 fn placeholder<'a>(title: &'a str, hint: Option<&'a str>) -> Element<'a, Message> {
     let mut content = column![].spacing(6).align_x(Alignment::Center);
     match hint {
-        Some(hint) => content = content.push(text(title).size(24).font(ui::FONT_HEADLINE).color(ui::TEXT)).push(text(hint).color(ui::MUTED)),
+        Some(hint) => content = content.push(text(title).size(24).font(ui::font_headline()).color(ui::TEXT)).push(text(hint).color(ui::MUTED)),
         None => content = content.push(text(title).color(ui::MUTED)),
     }
     container(content).center(Length::Fill).into()
@@ -1339,6 +1530,15 @@ impl PipeMedia for Subscription<Message> {
     fn pipe_media(self) -> Self {
         let back = event::listen_with(|event, _, _| match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Back)) => Some(Message::Back),
+            Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                *CURSOR.lock().unwrap() = (position.x, position.y);
+                None
+            }
+            Event::Window(window::Event::Resized(size)) => {
+                *WINDOW.lock().unwrap() = (size.width, size.height);
+                None
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Escape), .. }) => Some(Message::MenuClose),
             _ => None,
         });
         Subscription::batch([self, back, Subscription::run(media::events).map(Message::Media)])
@@ -1357,7 +1557,8 @@ fn load_account(token: String) -> Task<Message> {
         background(move || {
             let profile = api::profile(&token)?;
             let ids = api::liked_ids(&profile.uid, &token)?;
-            Ok((profile, ids))
+            let disliked = api::disliked_ids(&profile.uid, &token)?;
+            Ok((profile, ids, disliked))
         }),
         Message::Account,
     )
@@ -1464,7 +1665,9 @@ fn main() -> iced::Result {
         }
         [_, flag, what] if flag == "--preview" => Some(match what.as_str() {
             "wave" => Preview::Wave,
+            "wave-seek" => Preview::WaveSeek,
             "likes" => Preview::Likes,
+            "menu" => Preview::Menu,
             "collection" => Preview::Collection,
             "playlists" => Preview::Playlists,
             "playlist" => Preview::Playlist,
@@ -1473,10 +1676,15 @@ fn main() -> iced::Result {
         }),
         _ => None,
     };
-    iced::application(move || App::new(preview.clone()), App::update, App::view)
-        .title("Tune")
+    let yandex_fonts = fonts::load();
+    ui::YANDEX_FONTS.store(!yandex_fonts.is_empty(), Ordering::Relaxed);
+    let mut app = iced::application(move || App::new(preview.clone()), App::update, App::view);
+    for font in yandex_fonts {
+        app = app.font(font);
+    }
+    app.title("Tune")
         .theme(ui::theme())
-        .default_font(ui::FONT)
+        .default_font(ui::font())
         .subscription(App::subscription)
         .window(window::Settings { size: Size::new(1280.0, 820.0), min_size: Some(Size::new(900.0, 600.0)), ..window::Settings::default() })
         .run()

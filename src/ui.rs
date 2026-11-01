@@ -3,6 +3,8 @@
 use iced::border::{self, Border};
 use iced::font::{Family, Weight};
 use iced::theme::Palette;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use iced::widget::{button, container, slider, svg, text_input};
 use iced::{color, Background, Color, Element, Font, Length, Shadow, Theme};
 
@@ -21,9 +23,27 @@ pub const ACCENT_HOVER: Color = color!(0xdada0b);
 pub const ON_ACCENT: Color = color!(0x000000);
 pub const DANGER: Color = color!(0xf87171);
 
-pub const FONT: Font = Font::with_name("Segoe UI");
-pub const FONT_MEDIUM: Font = Font { family: Family::Name("Segoe UI"), weight: Weight::Semibold, ..Font::DEFAULT };
-pub const FONT_HEADLINE: Font = Font { family: Family::Name("Segoe UI"), weight: Weight::Bold, ..Font::DEFAULT };
+/// Загружены ли шрифты Яндекса; если нет, используется системный.
+pub static YANDEX_FONTS: AtomicBool = AtomicBool::new(false);
+
+fn text_family() -> &'static str {
+    if YANDEX_FONTS.load(Ordering::Relaxed) { "YS Text" } else { "Segoe UI" }
+}
+
+pub fn font() -> Font {
+    Font { family: Family::Name(text_family()), ..Font::DEFAULT }
+}
+
+/// В оригинале названия написаны средним начертанием.
+pub fn font_medium() -> Font {
+    let weight = if YANDEX_FONTS.load(Ordering::Relaxed) { Weight::Medium } else { Weight::Semibold };
+    Font { family: Family::Name(text_family()), weight, ..Font::DEFAULT }
+}
+
+pub fn font_headline() -> Font {
+    let family = if YANDEX_FONTS.load(Ordering::Relaxed) { "YS Music Headline" } else { "Segoe UI" };
+    Font { family: Family::Name(family), weight: Weight::Bold, ..Font::DEFAULT }
+}
 
 pub fn theme() -> Theme {
     Theme::custom("Tune", Palette { background: BLACK, text: TEXT, primary: ACCENT, success: ACCENT, warning: ACCENT, danger: DANGER })
@@ -40,7 +60,13 @@ pub const HEART: &str = "M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.4
 pub const HEART_OUTLINE: &str = "M16.5 3c-1.74 0-3.41.81-4.5 2.09C10.91 3.81 9.24 3 7.5 3 4.42 3 2 5.42 2 8.5c0 3.78 3.4 6.86 8.55 11.54L12 21.35l1.45-1.32C18.6 15.36 22 12.28 22 8.5 22 5.42 19.58 3 16.5 3zm-4.4 15.55l-.1.1-.1-.1C7.14 14.24 4 11.39 4 8.5 4 6.5 5.5 5 7.5 5c1.54 0 3.04.99 3.57 2.36h1.87C13.46 5.99 14.96 5 16.5 5c2 0 3.5 1.5 3.5 3.5 0 2.89-3.14 5.74-7.9 10.05z";
 pub const BACK: &str = "M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z";
 pub const CHEVRON: &str = "M9.29 6.71a1 1 0 0 1 1.42 0l4.58 4.59a1 1 0 0 1 0 1.41l-4.58 4.59a1 1 0 1 1-1.42-1.41L13.17 12 9.29 8.12a1 1 0 0 1 0-1.41z";
-pub const DISLIKE: &str = "M2.8 4.2 1.4 5.6l3.3 3.3C4.3 9.4 4 10 4 10.6 2.8 11.6 2 13 2 14.5 2 17 4.4 19 7.5 19c1.1 0 2.3-.4 3.2-1l1.3 1.2 1.4-1.3 5.1 5.1 1.4-1.4L2.8 4.2zM16.5 3c-1.7 0-3.4.8-4.5 2.1C10.9 3.8 9.2 3 7.8 3l14 14c.2-1.2.2-2.4.2-3.5V8.5C22 5.4 19.6 3 16.5 3z";
+pub const DISLIKE: &str = "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zM4 12c0-4.42 3.58-8 8-8 1.85 0 3.55.63 4.9 1.69L5.69 16.9C4.63 15.55 4 13.85 4 12zm8 8c-1.85 0-3.55-.63-4.9-1.69L18.31 7.1C19.37 8.45 20 10.15 20 12c0 4.42-3.58 8-8 8z";
+pub const MORE: &str = "M6 10a2 2 0 1 0 0 4 2 2 0 0 0 0-4zm6 0a2 2 0 1 0 0 4 2 2 0 0 0 0-4zm6 0a2 2 0 1 0 0 4 2 2 0 0 0 0-4z";
+pub const ALBUM: &str = "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 14a4 4 0 1 1 0-8 4 4 0 0 1 0 8zm0-5a1 1 0 1 0 0 2 1 1 0 0 0 0-2z";
+pub const ARTIST: &str = "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z";
+pub const LINK: &str = "M3.9 12a3.1 3.1 0 0 1 3.1-3.1h4V7H7a5 5 0 0 0 0 10h4v-1.9H7A3.1 3.1 0 0 1 3.9 12zM8 13h8v-2H8v2zm9-6h-4v1.9h4a3.1 3.1 0 0 1 0 6.2h-4V17h4a5 5 0 0 0 0-10z";
+pub const QUEUE_NEXT: &str = "M3 6h13v2H3zm0 5h13v2H3zm0 5h9v2H3zm12-1 6 3.5-6 3.5z";
+pub const QUEUE_LAST: &str = "M3 6h18v2H3zm0 5h18v2H3zm0 5h11v2H3zm14-1v3h-3v2h3v3h2v-3h3v-2h-3v-3z";
 pub const CLOSE: &str = "M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z";
 pub const LOGOUT: &str = "M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z";
 
@@ -124,8 +150,22 @@ pub fn tile(_: &Theme) -> container::Style {
     container::Style { border: border::rounded(6), ..fill(TILE) }
 }
 
+/// Всплывающее меню и уведомление: --ym-background-color-primary-enabled-popover.
+pub fn popover(_: &Theme) -> container::Style {
+    container::Style { border: Border { color: CONTROL, width: 1.0, radius: 12.0.into() }, ..fill(color!(0x1a1a1a)) }
+}
+
 pub fn avatar(_: &Theme) -> container::Style {
     container::Style { border: border::rounded(24), ..fill(TILE) }
+}
+
+/// Пункт всплывающего меню.
+pub fn menu_item(_: &Theme, status: button::Status) -> button::Style {
+    match status {
+        button::Status::Hovered => flat(Some(CONTROL), TEXT, 6.0),
+        button::Status::Pressed => flat(Some(CONTROL_HOVER), TEXT, 6.0),
+        button::Status::Active | button::Status::Disabled => flat(None, TEXT, 6.0),
+    }
 }
 
 /// Значок подписки.
@@ -152,53 +192,6 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
         value: TEXT,
         selection: Color { a: 0.35, ..ACCENT },
     }
-}
-
-/// Перемотка фоном всей панели плеера, как в оригинале: пройденная часть светлее.
-pub fn seek(_: &Theme, _: slider::Status) -> slider::Style {
-    slider::Style {
-        rail: slider::Rail {
-            backgrounds: (Background::Color(CONTROL), Background::Color(Color::TRANSPARENT)),
-            width: 80.0,
-            border: border::rounded(12),
-        },
-        handle: slider::Handle {
-            shape: slider::HandleShape::Rectangle { width: 0, border_radius: 0.0.into() },
-            background: Background::Color(Color::TRANSPARENT),
-            border_width: 0.0,
-            border_color: Color::TRANSPARENT,
-        },
-    }
-}
-
-/// Перемотка фоном капсулы с названием на главной.
-pub fn seek_pill(_: &Theme, _: slider::Status) -> slider::Style {
-    slider::Style {
-        rail: slider::Rail {
-            backgrounds: (Background::Color(CONTROL_PRESSED), Background::Color(CONTROL)),
-            width: 56.0,
-            border: border::rounded(28),
-        },
-        handle: slider::Handle {
-            shape: slider::HandleShape::Rectangle { width: 0, border_radius: 0.0.into() },
-            background: Background::Color(Color::TRANSPARENT),
-            border_width: 0.0,
-            border_color: Color::TRANSPARENT,
-        },
-    }
-}
-
-/// Те же панели в начале трека: иначе пустая пройденная часть видна тонкой линией.
-pub fn seek_start(_: &Theme, status: slider::Status) -> slider::Style {
-    let mut style = seek(&iced::Theme::Dark, status);
-    style.rail.backgrounds.0 = Background::Color(Color::TRANSPARENT);
-    style
-}
-
-pub fn seek_pill_start(_: &Theme, status: slider::Status) -> slider::Style {
-    let mut style = seek_pill(&iced::Theme::Dark, status);
-    style.rail.backgrounds.0 = style.rail.backgrounds.1;
-    style
 }
 
 /// Источник музыки над треком на главной.
