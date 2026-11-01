@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;
+mod login;
 mod media;
 mod player;
 mod ui;
@@ -15,12 +16,11 @@ use iced::widget::text::Wrapping;
 use iced::widget::{button, column, container, image, operation, row, scrollable, slider, text, text_input, Id, Space};
 use iced::{time, window, Alignment, Element, Length, Padding, Size, Subscription, Task};
 
-use api::{DeviceCode, Playlist, Track, Wave, NEED_LOGIN};
+use api::{Playlist, Track, Wave, NEED_LOGIN};
 use media::Media;
 use player::Player;
 use raw_window_handle::RawWindowHandle;
 
-const LOGIN_POLL: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(500);
 const COVER: f32 = 40.0;
 const BAR_COVER: f32 = 56.0;
@@ -52,7 +52,8 @@ fn background<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> impl
 }
 
 enum Screen {
-    Login(Option<DeviceCode>),
+    /// true — открыто окно входа.
+    Login(bool),
     Main(String),
 }
 
@@ -120,11 +121,8 @@ struct App {
 
 #[derive(Clone, Debug)]
 enum Message {
-    LoginStarted(Result<DeviceCode, String>),
-    OpenLogin,
-    LoginPoll,
-    LoginChecked(Result<Option<String>, String>),
-    LoginAgain,
+    LoginOpen,
+    LoginFinished,
     Logout,
     Account(Result<(String, Vec<String>), String>),
     Open(Section),
@@ -169,10 +167,10 @@ impl App {
         let token = api::load_token();
         let task = match &token {
             Some(token) => load_account(token.clone()),
-            None => start_login(),
+            None => Task::done(Message::LoginOpen),
         };
         let app = Self {
-            screen: token.map_or(Screen::Login(None), Screen::Main),
+            screen: token.map_or(Screen::Login(false), Screen::Main),
             section: Section::Wave,
             query: String::new(),
             results: Vec::new(),
@@ -224,7 +222,7 @@ impl App {
         if error == NEED_LOGIN {
             self.reset();
             self.error = Some("Вход устарел, войдите ещё раз".into());
-            return start_login();
+            return Task::done(Message::LoginOpen);
         }
         self.error = Some(error);
         Task::none()
@@ -236,7 +234,7 @@ impl App {
             p.stop();
         }
         api::logout();
-        self.screen = Screen::Login(None);
+        self.screen = Screen::Login(false);
         self.section = Section::Wave;
         self.results.clear();
         self.queue.clear();
@@ -393,42 +391,24 @@ impl App {
 
     fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::LoginStarted(Ok(code)) => {
-                let clipboard = iced::clipboard::write(code.user_code.clone());
-                self.screen = Screen::Login(Some(code));
-                return clipboard;
-            }
-            Message::LoginStarted(Err(e)) => self.error = Some(e),
-            Message::OpenLogin => {
-                if let Screen::Login(Some(code)) = &self.screen {
-                    if code.url.starts_with("https://") {
-                        let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", &code.url]).spawn();
-                    }
+            Message::LoginOpen => {
+                if matches!(self.screen, Screen::Login(true)) {
+                    return Task::none();
                 }
+                self.screen = Screen::Login(true);
+                return Task::perform(background(login_window), |_| Message::LoginFinished);
             }
-            Message::LoginPoll => {
-                if let Screen::Login(Some(code)) = &self.screen {
-                    let device_code = code.device_code.clone();
-                    return Task::perform(background(move || api::login_poll(&device_code)), Message::LoginChecked);
+            Message::LoginFinished => {
+                if let Some(token) = api::load_token() {
+                    self.error = None;
+                    self.screen = Screen::Main(token.clone());
+                    return load_account(token);
                 }
-            }
-            Message::LoginChecked(Ok(Some(token))) => {
-                self.error = None;
-                self.screen = Screen::Main(token.clone());
-                return load_account(token);
-            }
-            Message::LoginChecked(Ok(None)) => {}
-            Message::LoginChecked(Err(e)) => {
-                self.screen = Screen::Login(None);
-                self.error = Some(e);
-            }
-            Message::LoginAgain => {
-                self.error = None;
-                return start_login();
+                self.screen = Screen::Login(false);
             }
             Message::Logout => {
                 self.reset();
-                return start_login();
+                return Task::done(Message::LoginOpen);
             }
             Message::Account(Ok((uid, ids))) => {
                 self.uid = Some(uid);
@@ -746,7 +726,6 @@ impl App {
 
     fn subscription(&self) -> Subscription<Message> {
         match &self.screen {
-            Screen::Login(Some(_)) => time::every(LOGIN_POLL).map(|_| Message::LoginPoll),
             Screen::Main(_) if self.active => time::every(TICK).map(|_| Message::Tick),
             _ => Subscription::none(),
         }
@@ -755,25 +734,19 @@ impl App {
 
     fn view(&self) -> Element<'_, Message> {
         match &self.screen {
-            Screen::Login(code) => self.view_login(code.as_ref()),
+            Screen::Login(opened) => self.view_login(*opened),
             Screen::Main(_) => self.view_main(),
         }
     }
 
-    fn view_login<'a>(&'a self, code: Option<&'a DeviceCode>) -> Element<'a, Message> {
+    fn view_login(&self, opened: bool) -> Element<'_, Message> {
         let mut content = column![text("Tune").size(32).font(ui::FONT_BOLD)].spacing(14).align_x(Alignment::Center);
-        match code {
-            Some(code) => {
-                content = content
-                    .push(text("Введите код на странице Яндекса. Он уже скопирован.").color(ui::MUTED))
-                    .push(text(&code.user_code).size(40).font(ui::FONT_BOLD))
-                    .push(button(text("Открыть страницу входа").font(ui::FONT_BOLD)).padding([10, 20]).style(ui::accent).on_press(Message::OpenLogin))
-                    .push(text("После подтверждения приложение откроется само").size(13).color(ui::MUTED));
-            }
-            None if self.error.is_some() => {
-                content = content.push(button(text("Попробовать ещё раз").font(ui::FONT_BOLD)).padding([10, 20]).style(ui::accent).on_press(Message::LoginAgain));
-            }
-            None => content = content.push(text("Получаем код входа…").color(ui::MUTED)),
+        if opened {
+            content = content.push(text("Войдите в аккаунт Яндекса в открывшемся окне").color(ui::MUTED));
+        } else {
+            content = content
+                .push(text("Для музыки нужен аккаунт Яндекса").color(ui::MUTED))
+                .push(button(text("Войти через Яндекс").font(ui::FONT_BOLD)).padding([10, 20]).style(ui::accent).on_press(Message::LoginOpen));
         }
         if let Some(error) = &self.error {
             content = content.push(text(error).color(ui::DANGER));
@@ -1108,8 +1081,11 @@ impl PipeMedia for Subscription<Message> {
     }
 }
 
-fn start_login() -> Task<Message> {
-    Task::perform(background(api::login_start), Message::LoginStarted)
+/// Запускает окно входа отдельным процессом и ждёт, пока его закроют.
+fn login_window() -> bool {
+    std::env::current_exe()
+        .and_then(|exe| std::process::Command::new(exe).arg("--login").status())
+        .is_ok_and(|status| status.success())
 }
 
 fn load_account(token: String) -> Task<Message> {
@@ -1194,6 +1170,9 @@ fn smoke_library(query: &str) -> Result<(), String> {
 
 fn main() -> iced::Result {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|flag| flag == "--login") {
+        login::run();
+    }
     let preview = match args.as_slice() {
         [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" => {
             let result = if flag == "--smoke" { smoke(query) } else { smoke_library(query) };

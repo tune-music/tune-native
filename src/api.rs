@@ -1,4 +1,4 @@
-//! Яндекс Музыка: вход по коду, поиск и ссылка на файл трека.
+//! Яндекс Музыка: токен, поиск, библиотека, волна и ссылка на файл трека.
 //!
 //! Те же запросы делает оригинальный клиент. Данные приложения общеизвестны, их используют
 //! открытые клиенты (MarshalX/yandex-music-api).
@@ -13,8 +13,6 @@ use sha2::Sha256;
 
 const API: &str = "https://api.music.yandex.net";
 const CLIENT: &str = "YandexMusicDesktopAppWindows/5.120.0";
-const CLIENT_ID: &str = "23cabbbdc6cd418abb4b39c32c41195d";
-const CLIENT_SECRET: &str = "53bc75238f0c4d08a118e51fe9203300";
 const SIGN_KEY: &[u8] = b"kzqU4XhfCaY6B6JTHODeq5";
 const QUALITY: &str = "nq";
 const CODECS: [&str; 5] = ["mp3", "aac", "aac-mp4", "he-aac", "he-aac-mp4"];
@@ -63,13 +61,6 @@ pub struct Wave {
 }
 
 #[derive(Clone, Debug)]
-pub struct DeviceCode {
-    pub device_code: String,
-    pub user_code: String,
-    pub url: String,
-}
-
-#[derive(Clone, Debug)]
 pub struct FileInfo {
     pub url: String,
     pub key: Option<String>,
@@ -94,46 +85,19 @@ pub fn load_token() -> Option<String> {
     (!token.is_empty()).then(|| token.to_string())
 }
 
+pub fn save_token(token: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(data_dir())?;
+    std::fs::write(token_path(), token)
+}
+
+/// Куки страницы входа: без них Яндекс помнит аккаунт, как браузер.
+pub fn login_data_dir() -> PathBuf {
+    data_dir().join("login")
+}
+
 pub fn logout() {
     let _ = std::fs::remove_file(token_path());
-}
-
-/// Код для страницы подтверждения Яндекса.
-pub fn login_start() -> Result<DeviceCode, String> {
-    let body = agent()
-        .post("https://oauth.yandex.ru/device/code")
-        .send_form([("client_id", CLIENT_ID), ("device_name", "Tune Native")])
-        .map_err(|e| format!("Не удалось связаться с Яндексом: {e}"))?
-        .into_body()
-        .read_to_string()
-        .map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    let (Some(device_code), Some(user_code), Some(url)) = (v["device_code"].as_str(), v["user_code"].as_str(), v["verification_url"].as_str()) else {
-        return Err("Яндекс не выдал код входа".into());
-    };
-    Ok(DeviceCode { device_code: device_code.into(), user_code: user_code.into(), url: url.into() })
-}
-
-/// Токен, когда вход подтверждён; None — ещё ждём.
-pub fn login_poll(device_code: &str) -> Result<Option<String>, String> {
-    let body = agent()
-        .post("https://oauth.yandex.ru/token")
-        .send_form([("grant_type", "device_code"), ("code", device_code), ("client_id", CLIENT_ID), ("client_secret", CLIENT_SECRET)])
-        .map_err(|e| format!("Не удалось связаться с Яндексом: {e}"))?
-        .into_body()
-        .read_to_string()
-        .map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    if let Some(token) = v["access_token"].as_str() {
-        std::fs::create_dir_all(data_dir()).map_err(|e| e.to_string())?;
-        std::fs::write(token_path(), token).map_err(|e| e.to_string())?;
-        return Ok(Some(token.to_string()));
-    }
-    match v["error"].as_str() {
-        Some("authorization_pending") => Ok(None),
-        Some("expired_token") => Err("Код устарел, войдите ещё раз".into()),
-        _ => Err("Яндекс не подтвердил вход".into()),
-    }
+    let _ = std::fs::remove_dir_all(login_data_dir());
 }
 
 fn get(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, String> {
