@@ -2,21 +2,29 @@
 
 mod api;
 mod player;
+mod ui;
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
 use iced::futures::channel::oneshot;
-use iced::widget::{button, column, container, image, row, scrollable, slider, text, text_input, Space};
-use iced::{time, Alignment, Element, Length, Subscription, Task, Theme};
+use iced::widget::text::Wrapping;
+use iced::widget::{button, column, container, image, operation, row, scrollable, slider, text, text_input, Id, Space};
+use iced::{time, window, Alignment, Element, Length, Size, Subscription, Task};
 
 use api::{DeviceCode, Track, NEED_LOGIN};
 use player::Player;
 
 const LOGIN_POLL: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(500);
-const COVER: f32 = 44.0;
+const COVER: f32 = 40.0;
+const BAR_COVER: f32 = 56.0;
+const SIDEBAR: f32 = 200.0;
+const NUMBER: f32 = 28.0;
+/// Место под полосу прокрутки, чтобы колонка времени в заголовке совпала со строками.
+const LIST_GUTTER: f32 = 5.0;
+const SEARCH_INPUT: &str = "search";
 
 /// Блокирующая работа в отдельном потоке, чтобы не останавливать интерфейс.
 fn background<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> impl Future<Output = T> {
@@ -52,6 +60,8 @@ struct App {
     seeking: Option<f32>,
     volume: f32,
     error: Option<String>,
+    /// Запуск с готовым поиском: первый трек показывается в плеере, но не играет.
+    preview: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +72,7 @@ enum Message {
     LoginChecked(Result<Option<String>, String>),
     LoginAgain,
     Logout,
+    FocusSearch,
     Query(String),
     Search,
     Found(u64, Result<Vec<Track>, String>),
@@ -79,14 +90,14 @@ enum Message {
 }
 
 impl App {
-    fn new() -> (Self, Task<Message>) {
+    fn new(preview: Option<String>) -> (Self, Task<Message>) {
         let (player, error) = match Player::new() {
             Ok(p) => (Some(p), None),
             Err(e) => (None, Some(e)),
         };
         let token = api::load_token();
         let task = if token.is_none() { start_login() } else { Task::none() };
-        let app = Self {
+        let mut app = Self {
             screen: token.map_or(Screen::Login(None), Screen::Main),
             query: String::new(),
             tracks: Vec::new(),
@@ -103,9 +114,15 @@ impl App {
             seeking: None,
             volume: 0.8,
             error,
+            preview: preview.is_some(),
         };
         if let Some(p) = &app.player {
             p.set_volume(app.volume);
+        }
+        if let Some(query) = preview {
+            app.query = query;
+            let search = app.update(Message::Search);
+            return (app, search);
         }
         (app, task)
     }
@@ -197,6 +214,7 @@ impl App {
                 self.screen = Screen::Login(None);
                 return start_login();
             }
+            Message::FocusSearch => return operation::focus(Id::new(SEARCH_INPUT)),
             Message::Query(query) => self.query = query,
             Message::Search => {
                 let Some(token) = self.token() else { return Task::none() };
@@ -218,7 +236,13 @@ impl App {
                 match result {
                     Ok(tracks) => {
                         self.tracks = tracks;
-                        self.covers.clear();
+                        // Обложка играющего трека нужна нижней панели и после нового поиска.
+                        let queue = &self.queue;
+                        self.covers.retain(|id, _| queue.iter().any(|t| t.id == *id));
+                        if std::mem::take(&mut self.preview) {
+                            self.queue = self.tracks.clone();
+                            self.current = Some(0).filter(|_| !self.queue.is_empty());
+                        }
                         return Task::batch(self.tracks.iter().filter_map(|t| {
                             let id = t.id.clone();
                             let uri = t.cover.clone()?;
@@ -248,6 +272,10 @@ impl App {
                 }
             }
             Message::Toggle => {
+                // Трек доиграл: кнопка запускает его заново.
+                if let (false, false, Some(index)) = (self.active, self.starting, self.current) {
+                    return self.play(index);
+                }
                 if let Some(p) = &self.player {
                     p.toggle();
                 }
@@ -307,95 +335,192 @@ impl App {
     }
 
     fn view_login<'a>(&'a self, code: Option<&'a DeviceCode>) -> Element<'a, Message> {
-        let mut content = column![text("Tune Native").size(28)].spacing(14).align_x(Alignment::Center);
+        let mut content = column![text("Tune").size(32).font(ui::FONT_BOLD)].spacing(14).align_x(Alignment::Center);
         match code {
             Some(code) => {
                 content = content
-                    .push(text("Введите этот код на странице Яндекса. Он уже скопирован."))
-                    .push(text(&code.user_code).size(36))
-                    .push(button("Открыть страницу входа").on_press(Message::OpenLogin))
-                    .push(text("После подтверждения окно обновится само.").size(13));
+                    .push(text("Введите код на странице Яндекса. Он уже скопирован.").color(ui::MUTED))
+                    .push(text(&code.user_code).size(40).font(ui::FONT_BOLD))
+                    .push(button(text("Открыть страницу входа").font(ui::FONT_BOLD)).padding([10, 20]).style(ui::accent).on_press(Message::OpenLogin))
+                    .push(text("После подтверждения приложение откроется само").size(13).color(ui::MUTED));
             }
-            None if self.error.is_some() => content = content.push(button("Попробовать ещё раз").on_press(Message::LoginAgain)),
-            None => content = content.push(text("Получаем код входа…")),
+            None if self.error.is_some() => {
+                content = content.push(button(text("Попробовать ещё раз").font(ui::FONT_BOLD)).padding([10, 20]).style(ui::accent).on_press(Message::LoginAgain));
+            }
+            None => content = content.push(text("Получаем код входа…").color(ui::MUTED)),
         }
         if let Some(error) = &self.error {
-            content = content.push(text(error).style(text::danger));
+            content = content.push(text(error).color(ui::DANGER));
         }
-        container(content).center(Length::Fill).into()
+        container(content).center(Length::Fill).style(ui::page).into()
     }
 
     fn view_main(&self) -> Element<'_, Message> {
-        let top = row![
-            text_input("Поиск треков", &self.query).on_input(Message::Query).on_submit(Message::Search).padding(10),
-            button("Найти").on_press(Message::Search).padding(10),
-            button("Выйти").on_press(Message::Logout).padding(10).style(button::secondary),
-        ]
-        .spacing(8);
+        let body = row![self.view_sidebar(), self.view_search()];
+        let mut layout = column![container(body).height(Length::Fill)];
+        if let Some(bar) = self.view_bar() {
+            layout = layout.push(container(Space::new()).width(Length::Fill).height(1).style(ui::line)).push(bar);
+        }
+        layout.into()
+    }
 
-        let list = self.tracks.iter().enumerate().fold(column![].spacing(2), |list, (index, track)| {
-            let cover: Element<'_, Message> = match self.covers.get(&track.id) {
-                Some(handle) => image(handle.clone()).width(COVER).height(COVER).into(),
-                None => Space::new().width(COVER).height(COVER).into(),
-            };
-            let line = row![
-                cover,
-                column![text(&track.title), text(&track.artists).size(13)].width(Length::Fill),
-                text(clock(track.duration)).size(13),
+    fn view_sidebar(&self) -> Element<'_, Message> {
+        let search = button(row![ui::icon(ui::SEARCH, 20.0, ui::TEXT), text("Поиск").font(ui::FONT_BOLD)].spacing(12).align_y(Alignment::Center))
+            .width(Length::Fill)
+            .padding([9, 12])
+            .style(ui::selected)
+            .on_press(Message::FocusSearch);
+        let logout = button(row![ui::icon(ui::LOGOUT, 20.0, ui::MUTED), text("Выйти").color(ui::MUTED)].spacing(12).align_y(Alignment::Center))
+            .width(Length::Fill)
+            .padding([9, 12])
+            .style(ui::ghost)
+            .on_press(Message::Logout);
+        container(
+            column![
+                container(text("Tune").size(22).font(ui::FONT_BOLD)).padding([6, 12]),
+                search,
+                Space::new().height(Length::Fill),
+                logout,
             ]
-            .spacing(12)
-            .align_y(Alignment::Center);
-            let playing = self.current.and_then(|i| self.queue.get(i)).is_some_and(|t| t.id == track.id);
-            let style = if playing { button::primary } else { button::text };
-            list.push(button(line).width(Length::Fill).padding(6).style(style).on_press(Message::Play(index)))
-        });
+            .spacing(10),
+        )
+        .width(SIDEBAR)
+        .height(Length::Fill)
+        .padding(12)
+        .style(ui::panel)
+        .into()
+    }
+
+    fn view_search(&self) -> Element<'_, Message> {
+        let input = text_input("Трек или исполнитель", &self.query)
+            .id(SEARCH_INPUT)
+            .on_input(Message::Query)
+            .on_submit(Message::Search)
+            .padding([10, 14])
+            .size(15)
+            .style(ui::input);
 
         let center: Element<'_, Message> = if self.searching {
-            container(text("Ищем…")).center(Length::Fill).into()
+            container(text("Ищем…").color(ui::MUTED)).center(Length::Fill).into()
         } else if self.tracks.is_empty() {
-            container(text("Найдите трек, чтобы начать").style(text::secondary)).center(Length::Fill).into()
+            container(
+                column![
+                    text("Что послушаем?").size(22).font(ui::FONT_BOLD),
+                    text("Введите название трека или исполнителя и нажмите Enter").color(ui::MUTED),
+                ]
+                .spacing(6)
+                .align_x(Alignment::Center),
+            )
+            .center(Length::Fill)
+            .into()
         } else {
-            scrollable(list).spacing(8).height(Length::Fill).into()
+            let list = self.tracks.iter().enumerate().fold(column![].spacing(2), |list, (index, track)| list.push(self.view_track(index, track)));
+            column![self.view_header(), scrollable(list).spacing(8).height(Length::Fill)].spacing(8).into()
         };
 
-        let mut page = column![top, center].spacing(12).padding(12);
+        let mut page = column![text("Поиск").size(26).font(ui::FONT_BOLD), input, center].spacing(16);
         if let Some(error) = &self.error {
-            page = page.push(text(error).style(text::danger));
+            page = page.push(text(error).color(ui::DANGER));
         }
-        if let Some(bar) = self.view_bar() {
-            page = page.push(bar);
+        container(page).padding([20, 24]).width(Length::Fill).height(Length::Fill).style(ui::page).into()
+    }
+
+    fn view_header(&self) -> Element<'_, Message> {
+        let label = |s| text(s).size(12).color(ui::MUTED);
+        column![
+            row![
+                container(label("#")).width(NUMBER).center_x(NUMBER),
+                container(label("Название")).width(Length::Fill),
+                label("Время"),
+                Space::new().width(LIST_GUTTER),
+            ]
+            .spacing(12)
+            .padding([0, 8]),
+            container(Space::new()).width(Length::Fill).height(1).style(ui::line),
+        ]
+        .spacing(8)
+        .into()
+    }
+
+    fn view_track<'a>(&'a self, index: usize, track: &'a Track) -> Element<'a, Message> {
+        let playing = self.current.and_then(|i| self.queue.get(i)).is_some_and(|t| t.id == track.id);
+        let number: Element<'_, Message> = if playing {
+            ui::icon(ui::PLAY, 16.0, ui::ACCENT)
+        } else {
+            text(index + 1).size(13).color(ui::MUTED).into()
+        };
+        let line = row![
+            container(number).width(NUMBER).center_x(NUMBER),
+            self.cover(track, COVER),
+            column![
+                text(&track.title).color(if playing { ui::ACCENT } else { ui::TEXT }).wrapping(Wrapping::None),
+                text(&track.artists).size(13).color(ui::MUTED).wrapping(Wrapping::None),
+            ]
+            .width(Length::Fill)
+            .clip(true),
+            text(clock(track.duration)).size(13).color(ui::MUTED),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center);
+        button(line).width(Length::Fill).padding([6, 8]).style(ui::ghost).on_press(Message::Play(index)).into()
+    }
+
+    fn cover<'a>(&'a self, track: &Track, size: f32) -> Element<'a, Message> {
+        match self.covers.get(&track.id) {
+            Some(handle) => image(handle.clone()).width(size).height(size).border_radius(4).into(),
+            None => container(Space::new()).width(size).height(size).style(ui::line).into(),
         }
-        page.into()
     }
 
     fn view_bar(&self) -> Option<Element<'_, Message>> {
         let track = self.queue.get(self.current?)?;
         let total = track.duration.as_secs_f32().max(1.0);
         let shown = self.seeking.unwrap_or(self.position.as_secs_f32()).min(total);
-        let paused = self.player.as_ref().is_none_or(Player::is_paused);
-        let status = if self.starting { "Загрузка…".to_string() } else { track.artists.clone() };
-        Some(
+        let playing = self.starting || (self.active && !self.player.as_ref().is_none_or(Player::is_paused));
+        let status = if self.starting { "Загрузка…" } else { track.artists.as_str() };
+
+        let side = |icon, message| button(ui::icon(icon, 22.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(message);
+        let toggle = button(ui::icon(if playing { ui::PAUSE } else { ui::PLAY }, 22.0, ui::ON_ACCENT)).padding(9).style(ui::round).on_press(Message::Toggle);
+
+        let about = row![
+            self.cover(track, BAR_COVER),
             column![
-                row![
-                    text(clock(Duration::from_secs_f32(shown))).size(13),
-                    slider(0.0..=total, shown, Message::Seek).on_release(Message::SeekDone),
-                    text(clock(track.duration)).size(13),
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center),
-                row![
-                    button("⏮").on_press(Message::Previous).style(button::secondary),
-                    button(if paused { "▶" } else { "⏸" }).on_press(Message::Toggle),
-                    button("⏭").on_press(Message::Next).style(button::secondary),
-                    column![text(&track.title), text(status).size(13).style(text::secondary)].width(Length::Fill),
-                    text("Громкость").size(13),
-                    slider(0.0..=1.0, self.volume, Message::Volume).step(0.01).width(120),
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center),
+                text(&track.title).font(ui::FONT_BOLD).wrapping(Wrapping::None),
+                text(status).size(13).color(ui::MUTED).wrapping(Wrapping::None),
             ]
-            .spacing(6)
-            .into(),
+            .clip(true),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center)
+        .width(Length::FillPortion(3));
+
+        let transport = column![
+            row![side(ui::PREVIOUS, Message::Previous), toggle, side(ui::NEXT, Message::Next)].spacing(10).align_y(Alignment::Center),
+            row![
+                text(clock(Duration::from_secs_f32(shown))).size(12).color(ui::MUTED),
+                slider(0.0..=total, shown, Message::Seek).on_release(Message::SeekDone).style(ui::seek),
+                text(clock(track.duration)).size(12).color(ui::MUTED),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(6)
+        .align_x(Alignment::Center)
+        .width(Length::FillPortion(4));
+
+        let volume = container(
+            row![ui::icon(ui::VOLUME, 20.0, ui::MUTED), slider(0.0..=1.0, self.volume, Message::Volume).step(0.01).width(110).style(ui::volume)]
+                .spacing(8)
+                .align_y(Alignment::Center),
+        )
+        .align_right(Length::FillPortion(3));
+
+        Some(
+            container(row![about, transport, volume].spacing(24).align_y(Alignment::Center))
+                .padding([10, 16])
+                .width(Length::Fill)
+                .style(ui::panel)
+                .into(),
         )
     }
 }
@@ -441,10 +566,15 @@ fn main() -> iced::Result {
             return Ok(());
         }
     }
-    iced::application(App::new, App::update, App::view)
-        .title("Tune Native")
-        .theme(Theme::Dark)
+    let preview = match args.as_slice() {
+        [_, flag, query] if flag == "--preview" => Some(query.clone()),
+        _ => None,
+    };
+    iced::application(move || App::new(preview.clone()), App::update, App::view)
+        .title("Tune")
+        .theme(ui::theme())
+        .default_font(ui::FONT)
         .subscription(App::subscription)
-        .window_size((900.0, 640.0))
+        .window(window::Settings { size: Size::new(1100.0, 720.0), min_size: Some(Size::new(760.0, 480.0)), ..window::Settings::default() })
         .run()
 }
