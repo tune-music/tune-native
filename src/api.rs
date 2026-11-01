@@ -46,6 +46,13 @@ impl Track {
 }
 
 #[derive(Clone, Debug)]
+pub struct Profile {
+    pub uid: String,
+    pub name: String,
+    pub plus: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct Playlist {
     pub owner: String,
     pub kind: String,
@@ -175,10 +182,13 @@ pub fn search(text: &str, token: &str) -> Result<Vec<Track>, String> {
     Ok(v["result"]["tracks"]["results"].as_array().into_iter().flatten().filter_map(parse_track).collect())
 }
 
-pub fn account_uid(token: &str) -> Result<String, String> {
+pub fn profile(token: &str) -> Result<Profile, String> {
     let v = get("account/status", &[], token)?;
-    let uid = &result(&v)["account"]["uid"];
-    uid.as_u64().map(|u| u.to_string()).ok_or("Яндекс не сообщил номер аккаунта".into())
+    let v = result(&v);
+    let account = &v["account"];
+    let uid = account["uid"].as_u64().map(|u| u.to_string()).ok_or("Яндекс не сообщил номер аккаунта")?;
+    let name = account["displayName"].as_str().or(account["firstName"].as_str()).or(account["login"].as_str()).unwrap_or_default();
+    Ok(Profile { uid, name: name.to_string(), plus: v["plus"]["hasPlus"].as_bool().unwrap_or(false) })
 }
 
 /// Номера треков из «Мне нравится», сначала новые.
@@ -359,9 +369,9 @@ pub fn file_info(track_id: &str, token: &str) -> Result<FileInfo, String> {
     })
 }
 
-/// Обложка размером 50×50. Нет сети — трек просто останется без неё.
-pub fn cover(uri: &str) -> Option<Vec<u8>> {
-    let url = format!("https://{}", uri.replace("%%", "50x50"));
+/// Обложка нужного размера, например 100x100. Нет сети — останется заглушка.
+pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
+    let url = format!("https://{}", uri.replace("%%", size));
     let resp = agent().get(url).call().ok()?;
     if resp.status().as_u16() != 200 {
         return None;
