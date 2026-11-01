@@ -52,13 +52,38 @@ pub struct Profile {
     pub plus: bool,
 }
 
+/// Откуда берутся треки списка.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Source {
+    Playlist,
+    Album,
+    Artist,
+}
+
 #[derive(Clone, Debug)]
 pub struct Playlist {
+    pub source: Source,
     pub owner: String,
     pub kind: String,
     pub title: String,
     pub count: u64,
     pub cover: Option<String>,
+}
+
+/// Что пользователь закрепил в боковой панели.
+#[derive(Clone, Debug)]
+pub enum PinTarget {
+    List(Playlist),
+    Wave(Vec<String>),
+}
+
+#[derive(Clone, Debug)]
+pub struct Pin {
+    pub target: PinTarget,
+    pub title: String,
+    pub subtitle: &'static str,
+    pub cover: Option<String>,
+    pub round: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +207,11 @@ pub fn search(text: &str, token: &str) -> Result<Vec<Track>, String> {
     Ok(v["result"]["tracks"]["results"].as_array().into_iter().flatten().filter_map(parse_track).collect())
 }
 
+/// Сырой ответ API для разбора новых запросов: `tune-native --api путь`.
+pub fn raw(path: &str, token: &str) -> Result<String, String> {
+    get(path, &[], token).map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
+}
+
 pub fn profile(token: &str) -> Result<Profile, String> {
     let v = get("account/status", &[], token)?;
     let v = result(&v);
@@ -257,6 +287,7 @@ fn parse_playlist(v: &Value, uid: &str) -> Option<Playlist> {
     let kind = v["kind"].as_u64()?.to_string();
     let cover = v["cover"]["uri"].as_str().or(v["cover"]["itemsUri"][0].as_str()).or(v["ogImage"].as_str());
     Some(Playlist {
+        source: Source::Playlist,
         owner: v["owner"]["uid"].as_u64().map_or_else(|| uid.to_string(), |u| u.to_string()),
         kind,
         title: v["title"].as_str()?.to_string(),
@@ -270,7 +301,69 @@ pub fn playlists(uid: &str, token: &str) -> Result<Vec<Playlist>, String> {
     Ok(v["result"].as_array().into_iter().flatten().filter_map(|p| parse_playlist(p, uid)).collect())
 }
 
+fn id_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_pin(item: &Value) -> Option<Pin> {
+    let data = &item["data"];
+    let list = |source, title: &str, cover: Option<&str>| Playlist {
+        source,
+        owner: String::new(),
+        kind: id_text(&data["id"]).unwrap_or_default(),
+        title: title.to_string(),
+        count: 0,
+        cover: cover.map(str::to_string),
+    };
+    match item["type"].as_str()? {
+        "playlist_item" => {
+            let cover = data["cover"]["uri"].as_str().or(data["cover"]["itemsUri"][0].as_str()).map(str::to_string);
+            let owner = id_text(&data["uid"])?;
+            let title = data["title"].as_str()?.to_string();
+            let target = Playlist { source: Source::Playlist, owner, kind: id_text(&data["kind"])?, title: title.clone(), count: 0, cover: cover.clone() };
+            Some(Pin { target: PinTarget::List(target), title, subtitle: "Плейлист", cover, round: false })
+        }
+        "wave_item" => {
+            let seeds = data["seeds"].as_array()?.iter().filter_map(|s| s.as_str().map(str::to_string)).collect();
+            let cover = data["backgroundImageUrl"].as_str().or(data["agent"]["cover"]["uri"].as_str()).map(str::to_string);
+            let title = data["title"].as_str()?.to_string();
+            Some(Pin { target: PinTarget::Wave(seeds), title, subtitle: "Моя волна", cover, round: true })
+        }
+        "album_item" => {
+            let title = data["title"].as_str()?;
+            let cover = data["coverUri"].as_str();
+            Some(Pin { target: PinTarget::List(list(Source::Album, title, cover)), title: title.to_string(), subtitle: "Альбом", cover: cover.map(str::to_string), round: false })
+        }
+        "artist_item" => {
+            let title = data["name"].as_str()?;
+            let cover = data["cover"]["uri"].as_str().or(data["coverUri"].as_str());
+            Some(Pin { target: PinTarget::List(list(Source::Artist, title, cover)), title: title.to_string(), subtitle: "Исполнитель", cover: cover.map(str::to_string), round: true })
+        }
+        _ => None,
+    }
+}
+
+pub fn pins(token: &str) -> Result<Vec<Pin>, String> {
+    let v = get("pins", &[], token)?;
+    Ok(result(&v)["pins"].as_array().into_iter().flatten().filter_map(parse_pin).collect())
+}
+
 pub fn playlist_tracks(playlist: &Playlist, token: &str) -> Result<Vec<Track>, String> {
+    match playlist.source {
+        Source::Playlist => {}
+        Source::Album => {
+            let v = get(&format!("albums/{}/with-tracks", playlist.kind), &[], token)?;
+            return Ok(result(&v)["volumes"].as_array().into_iter().flatten().flat_map(|disk| disk.as_array().into_iter().flatten()).filter_map(parse_track).collect());
+        }
+        Source::Artist => {
+            let v = get(&format!("artists/{}/tracks", playlist.kind), &[("page-size", "100")], token)?;
+            return Ok(result(&v)["tracks"].as_array().into_iter().flatten().filter_map(parse_track).collect());
+        }
+    }
     let v = get(&format!("users/{}/playlists/{}", playlist.owner, playlist.kind), &[("rich-tracks", "true")], token)?;
     Ok(result(&v)["tracks"].as_array().into_iter().flatten().filter_map(|item| parse_track(&item["track"])).collect())
 }
@@ -286,8 +379,10 @@ fn parse_sequence(v: &Value) -> Vec<Track> {
         .collect()
 }
 
-pub fn wave_new(token: &str) -> Result<Wave, String> {
-    let body = json!({ "seeds": [WAVE_SEED], "includeTracksInResponse": true, "allowExplicit": true }).to_string();
+pub const MY_WAVE: &str = WAVE_SEED;
+
+pub fn wave_new(seeds: &[String], token: &str) -> Result<Wave, String> {
+    let body = json!({ "seeds": seeds, "includeTracksInResponse": true, "allowExplicit": true }).to_string();
     let v = post("rotor/session/new", "application/json", body, token)?;
     let v = result(&v);
     let session = v["radioSessionId"].as_str().ok_or("Яндекс не запустил волну")?;
@@ -382,6 +477,21 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_pins_of_each_type() {
+        let v: Value = serde_json::from_str(r#"{"pins":[
+            {"type":"playlist_item","data":{"kind":3,"uid":5,"title":"Мне нравится","cover":{"uri":"a/%%"}}},
+            {"type":"wave_item","data":{"seeds":["user:onyourwave"],"title":"Моя волна","backgroundImageUrl":"b/%%"}},
+            {"type":"album_item","data":{"id":7,"title":"Альбом","coverUri":"c/%%"}},
+            {"type":"artist_item","data":{"id":8,"name":"Имя","cover":{"uri":"d/%%"}}},
+            {"type":"unknown","data":{}}]}"#).unwrap();
+        let pins: Vec<Pin> = v["pins"].as_array().unwrap().iter().filter_map(parse_pin).collect();
+        assert_eq!(pins.len(), 4);
+        assert!(matches!(&pins[1].target, PinTarget::Wave(seeds) if seeds[0] == "user:onyourwave"));
+        assert!(matches!(&pins[2].target, PinTarget::List(list) if list.source == Source::Album && list.kind == "7"));
+        assert!(pins[3].round);
+    }
 
     #[test]
     fn playlist_uses_owner_and_cover() {
