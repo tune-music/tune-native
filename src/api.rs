@@ -737,6 +737,95 @@ pub fn history(limit: usize, token: &str) -> Result<Vec<Track>, String> {
     tracks_by_ids(&ids, token)
 }
 
+/// Что можно закрепить в боковой панели.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PinRef {
+    Album(String),
+    Artist(String),
+    Playlist(String, String),
+}
+
+impl PinRef {
+    fn path(&self) -> &'static str {
+        match self {
+            PinRef::Album(_) => "pin/album",
+            PinRef::Artist(_) => "pin/artist",
+            PinRef::Playlist(..) => "pin/playlist",
+        }
+    }
+
+    fn body(&self) -> Value {
+        match self {
+            PinRef::Album(id) | PinRef::Artist(id) => json!({ "id": id }),
+            PinRef::Playlist(uid, kind) => json!({ "uid": uid, "kind": kind }),
+        }
+    }
+
+    pub fn matches(&self, pin: &Pin) -> bool {
+        let PinTarget::List(list) = &pin.target else { return false };
+        match self {
+            PinRef::Album(id) => list.source == Source::Album && list.kind == *id,
+            PinRef::Artist(id) => list.source == Source::Artist && list.kind == *id,
+            PinRef::Playlist(uid, kind) => list.source == Source::Playlist && list.owner == *uid && list.kind == *kind,
+        }
+    }
+}
+
+/// Закрепляет или открепляет: тело запроса одно, а метод разный.
+pub fn set_pinned(target: &PinRef, pinned: bool, token: &str) -> Result<(), String> {
+    let url = format!("{API}/{}", target.path());
+    let body = target.body().to_string();
+    let request = if pinned { agent().put(url) } else { agent().delete(url).force_send_body() };
+    let resp = request
+        .header("Authorization", &format!("OAuth {token}"))
+        .header("X-Yandex-Music-Client", CLIENT)
+        .header("Content-Type", "application/json")
+        .send(body)
+        .map_err(|e| format!("Не удалось связаться с Яндексом: {e}"))?;
+    match resp.status().as_u16() {
+        401 => Err(NEED_LOGIN.into()),
+        200..=299 => Ok(()),
+        status => Err(format!("Яндекс ответил {status}")),
+    }
+}
+
+/// Описание и приватность плейлиста: их нет в общем списке треков.
+pub fn playlist_meta(uid: &str, kind: &str, token: &str) -> Result<(String, String), String> {
+    let v = get(&format!("users/{uid}/playlists/{kind}"), &[("rich-tracks", "false")], token)?;
+    let v = result(&v);
+    Ok((v["description"].as_str().unwrap_or_default().to_string(), v["visibility"].as_str().unwrap_or("public").to_string()))
+}
+
+pub fn set_description(uid: &str, kind: &str, text: &str, token: &str) -> Result<(), String> {
+    post(&format!("users/{uid}/playlists/{kind}/description?value={}", encode(text)), "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
+}
+
+pub fn set_visibility(uid: &str, kind: &str, value: &str, token: &str) -> Result<(), String> {
+    post(&format!("users/{uid}/playlists/{kind}/visibility?value={value}"), "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
+}
+
+fn parse_liked_list(item: &Value) -> Option<Playlist> {
+    let v = if item["playlist"].is_object() { &item["playlist"] } else { item };
+    let owner = id_text(&v["uid"]).or_else(|| id_text(&v["owner"]["uid"]))?;
+    parse_playlist_loose(v, &owner)
+}
+
+pub fn liked_playlists(uid: &str, token: &str) -> Result<Vec<Playlist>, String> {
+    let v = get(&format!("users/{uid}/likes/playlists"), &[], token)?;
+    Ok(result(&v).as_array().into_iter().flatten().filter_map(parse_liked_list).collect())
+}
+
+pub fn set_playlist_liked(uid: &str, owner: &str, kind: &str, liked: bool, token: &str) -> Result<(), String> {
+    let path = if liked { format!("users/{uid}/likes/playlists/add?owner-uid={owner}&kind={kind}") } else { format!("users/{uid}/likes/playlists/{owner}-{kind}/remove") };
+    post(&path, "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
+}
+
+pub fn disliked_tracks(uid: &str, limit: usize, token: &str) -> Result<Vec<Track>, String> {
+    let mut ids = disliked_ids(uid, token)?;
+    ids.truncate(limit);
+    tracks_by_ids(&ids, token)
+}
+
 pub const MY_WAVE: &str = WAVE_SEED;
 
 pub fn wave_new(seeds: &[String], token: &str) -> Result<Wave, String> {
@@ -835,6 +924,20 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pin_reference_matches_its_target() {
+        let list = |source, owner: &str, kind: &str| Pin { target: PinTarget::List(Playlist { source, owner: owner.to_string(), kind: kind.to_string(), title: String::new(), count: 0, cover: None }), title: String::new(), subtitle: "", cover: None, round: false };
+        assert!(PinRef::Album("1".into()).matches(&list(Source::Album, "", "1")));
+        assert!(!PinRef::Album("1".into()).matches(&list(Source::Artist, "", "1")));
+        assert!(PinRef::Playlist("5".into(), "7".into()).matches(&list(Source::Playlist, "5", "7")));
+        assert!(!PinRef::Playlist("6".into(), "7".into()).matches(&list(Source::Playlist, "5", "7")));
+        assert_eq!(PinRef::Playlist("5".into(), "7".into()).body(), json!({"uid":"5","kind":"7"}));
+        let v = json!({"playlist":{"uid":5,"kind":7,"title":"П"}});
+        assert_eq!(parse_liked_list(&v).unwrap().owner, "5");
+        let v = json!({"owner":{"uid":6},"kind":"8","title":"Р"});
+        assert_eq!(parse_liked_list(&v).unwrap().kind, "8");
+    }
 
     #[test]
     fn encodes_titles_and_reads_history() {

@@ -25,7 +25,7 @@ use iced::widget::{button, canvas, column, container, image, mouse_area, operati
 use glow::glow;
 use iced::{event, mouse, time, window, Alignment, Event, Element, Length, Padding, Size, Subscription, Task};
 
-use api::{Album, Artist, Card, Found, Home, HomeBlock, HomeItem, Pin, PinTarget, Playlist, Profile, Source, Track, Wave, NEED_LOGIN};
+use api::{Album, Artist, Card, Found, Home, HomeBlock, HomeItem, Pin, PinRef, PinTarget, Playlist, Profile, Source, Track, Wave, NEED_LOGIN};
 use media::Media;
 use player::Player;
 use raw_window_handle::RawWindowHandle;
@@ -72,6 +72,8 @@ const HISTORY_LIMIT: usize = 200;
 const MENU_LISTS: usize = 8;
 /// Плейлист «Мне нравится»: его нельзя ни менять, ни удалять как обычный.
 const FAVORITES_KIND: &str = "3";
+/// Плейлист загруженных файлов создаёт сам Яндекс: его нельзя переименовать или удалить.
+const UPLOADS_TITLE: &str = "Загруженное";
 /// Сколько исполнителей проверить, когда страницу ищем по имени.
 const ARTIST_SEARCH: u32 = 5;
 /// Длительность появления страницы и выезда очереди, в секундах.
@@ -172,6 +174,7 @@ enum Section {
     Artists,
     Queue,
     History,
+    Dislikes,
     Search,
 }
 
@@ -180,6 +183,7 @@ enum Section {
 enum Dialog {
     Create,
     Rename(Playlist),
+    Describe(Playlist),
     Delete(Playlist),
 }
 
@@ -228,6 +232,7 @@ struct Place {
 /// Запуск с готовым разделом: первый трек показывается в плеере, но не играет.
 #[derive(Clone)]
 enum Preview {
+    Dislikes,
     History,
     Dialog,
     Home,
@@ -287,6 +292,10 @@ struct App {
     dialog_text: String,
     history_tracks: Vec<Track>,
     history_loading: bool,
+    disliked_list: Vec<Track>,
+    liked_lists: Vec<Playlist>,
+    /// Описание и приватность открытого плейлиста.
+    list_meta: Option<(String, String, String)>,
     notice: Option<(u64, String)>,
     liked: Vec<Track>,
     likes_loading: bool,
@@ -425,6 +434,15 @@ enum Message {
     TrackRemove(Track),
     TrackRemoved(Result<(), String>),
     HistoryLoaded(Result<Vec<Track>, String>),
+    DislikesLoaded(Result<Vec<Track>, String>),
+    LikedLists(Result<Vec<Playlist>, String>),
+    ListLike(Playlist),
+    ListMeta(String, Result<(String, String), String>),
+    Visibility(Playlist),
+    Pin(PinRef),
+    PinSaved(Result<(), String>),
+    CopyText(String),
+    SimpleSaved(Result<(), String>),
     Dislike(Track),
     DislikeSaved(String, bool, Result<(), String>),
     PlayNext(Track),
@@ -490,6 +508,9 @@ impl App {
             dialog_text: String::new(),
             history_tracks: Vec::new(),
             history_loading: false,
+            disliked_list: Vec::new(),
+            liked_lists: Vec::new(),
+            list_meta: None,
             notice: None,
             liked: Vec::new(),
             likes_loading: false,
@@ -666,6 +687,9 @@ impl App {
         self.profile = None;
         self.results.clear();
         self.history_tracks.clear();
+        self.disliked_list.clear();
+        self.liked_lists.clear();
+        self.list_meta = None;
         self.dialog = None;
         self.home = Home::default();
         self.home_pages.clear();
@@ -863,7 +887,9 @@ impl App {
 
     fn liked_pages_load(&self) -> Task<Message> {
         let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
-        Task::perform(background(move || api::liked_pages(&uid, &token)), Message::LikedPages)
+        let (list_uid, list_token) = (uid.clone(), token.clone());
+        let lists = Task::perform(background(move || api::liked_playlists(&list_uid, &list_token)), Message::LikedLists);
+        Task::batch([lists, Task::perform(background(move || api::liked_pages(&uid, &token)), Message::LikedPages)])
     }
 
     /// Включает новый список вместо очереди.
@@ -912,7 +938,15 @@ impl App {
         if playlist.source == Source::Album {
             return Task::perform(background(move || api::album(&playlist.kind, &token)), move |r| Message::AlbumLoaded(kind.clone(), r));
         }
-        Task::perform(background(move || api::playlist_tracks(&playlist, &token)), move |r| Message::PlaylistLoaded(kind.clone(), r))
+        self.list_meta = None;
+        let meta = if playlist.source == Source::Playlist {
+            let (owner, list_kind, meta_token) = (playlist.owner.clone(), kind.clone(), token.clone());
+            let wanted = kind.clone();
+            Task::perform(background(move || api::playlist_meta(&owner, &list_kind, &meta_token)), move |r| Message::ListMeta(wanted.clone(), r))
+        } else {
+            Task::none()
+        };
+        Task::batch([meta, Task::perform(background(move || api::playlist_tracks(&playlist, &token)), move |r| Message::PlaylistLoaded(kind.clone(), r))])
     }
 
     fn wave_load(&mut self, seeds: Vec<String>, autoplay: bool) -> Task<Message> {
@@ -972,6 +1006,7 @@ impl App {
             Section::Albums | Section::Artists | Section::Home => &[],
             // На странице очереди список — то, что будет после играющего трека.
             Section::History => &self.history_tracks,
+            Section::Dislikes => &self.disliked_list,
             Section::Queue => self.current.and_then(|i| self.queue.get(i + 1..)).unwrap_or(&[]),
             Section::Search => &self.results,
         }
@@ -1060,6 +1095,10 @@ impl App {
                     Some(Preview::Likes | Preview::LikesEnd | Preview::Menu | Preview::Panels) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
                     Some(Preview::Playlists | Preview::Playlist | Preview::PlaylistHome) => self.update(Message::Open(Section::Playlists)),
+                    Some(Preview::Dislikes) => {
+                        self.preview = None;
+                        self.update(Message::Open(Section::Dislikes))
+                    }
                     Some(Preview::History) => {
                         self.preview = None;
                         self.update(Message::Open(Section::History))
@@ -1101,6 +1140,7 @@ impl App {
             // Закрепления не должны мешать музыке.
             Message::PinsLoaded(Err(_)) => {}
             Message::PinOpen(index) => match self.pins.get(index).map(|p| p.target.clone()) {
+                Some(PinTarget::List(list)) if list.source == Source::Artist => return self.update(Message::ArtistOpen(list.kind)),
                 Some(PinTarget::List(list)) => {
                     let favorites = list.source == Source::Playlist && list.kind == "3" && self.uid.as_deref() == Some(list.owner.as_str());
                     if favorites {
@@ -1146,6 +1186,11 @@ impl App {
                 }
                 return match section {
                     Section::Home if self.home.blocks.is_empty() && !self.home_loading => self.home_load(self.home_tab),
+                    Section::Dislikes => {
+                        let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
+                        self.history_loading = true;
+                        Task::perform(background(move || api::disliked_tracks(&uid, HISTORY_LIMIT, &token)), Message::DislikesLoaded)
+                    }
                     Section::History => {
                         let Some(token) = self.token() else { return Task::none() };
                         self.history_loading = true;
@@ -1546,7 +1591,11 @@ impl App {
             }
             Message::DialogOpen(dialog) => {
                 self.menu = None;
-                self.dialog_text = if let Dialog::Rename(list) = &dialog { list.title.clone() } else { String::new() };
+                self.dialog_text = match &dialog {
+                    Dialog::Rename(list) => list.title.clone(),
+                    Dialog::Describe(_) => self.list_meta.as_ref().map_or_else(String::new, |meta| meta.1.clone()),
+                    _ => String::new(),
+                };
                 let focus = !matches!(dialog, Dialog::Delete(_));
                 self.dialog = Some(dialog);
                 if focus {
@@ -1557,7 +1606,7 @@ impl App {
             Message::DialogConfirm => {
                 let (Some(uid), Some(token), Some(dialog)) = (self.uid.clone(), self.token(), self.dialog.clone()) else { return Task::none() };
                 let title = self.dialog_text.trim().to_string();
-                if title.is_empty() && !matches!(dialog, Dialog::Delete(_)) {
+                if title.is_empty() && matches!(dialog, Dialog::Create | Dialog::Rename(_)) {
                     return Task::none();
                 }
                 self.dialog = None;
@@ -1567,6 +1616,12 @@ impl App {
                         let kind = list.kind;
                         let (wanted, name) = (kind.clone(), title.clone());
                         Task::perform(background(move || api::rename_playlist(&uid, &kind, &title, &token)), move |r| Message::PlaylistRenamed(wanted.clone(), name.clone(), r))
+                    }
+                    Dialog::Describe(list) => {
+                        if let Some(meta) = &mut self.list_meta {
+                            meta.1 = title.clone();
+                        }
+                        Task::perform(background(move || api::set_description(&uid, &list.kind, &title, &token)), Message::SimpleSaved)
                     }
                     Dialog::Delete(list) => {
                         let kind = list.kind;
@@ -1621,6 +1676,62 @@ impl App {
                 self.playlists_loading = false;
                 return self.playlists_load();
             }
+            Message::DislikesLoaded(result) => {
+                self.history_loading = false;
+                match result {
+                    Ok(tracks) => self.disliked_list = tracks,
+                    Err(e) => return self.fail_retry(e, Message::Open(Section::Dislikes)),
+                }
+            }
+            Message::LikedLists(Ok(lists)) => {
+                self.liked_lists = lists;
+                return self.fetch_card_covers(std::iter::empty(), std::iter::empty(), &self.liked_lists);
+            }
+            Message::LikedLists(Err(_)) => {}
+            Message::ListLike(list) => {
+                let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
+                let liked = !self.liked_lists.iter().any(|l| l.kind == list.kind && l.owner == list.owner);
+                if liked {
+                    self.liked_lists.insert(0, list.clone());
+                } else {
+                    self.liked_lists.retain(|l| l.kind != list.kind || l.owner != list.owner);
+                }
+                return Task::perform(background(move || api::set_playlist_liked(&uid, &list.owner, &list.kind, liked, &token)), Message::SimpleSaved);
+            }
+            Message::ListMeta(kind, Ok((description, visibility))) => {
+                if self.playlist.as_ref().is_some_and(|list| list.kind == kind) {
+                    self.list_meta = Some((kind, description, visibility));
+                }
+            }
+            // Без описания плейлист всё равно работает.
+            Message::ListMeta(_, Err(_)) => {}
+            Message::Visibility(list) => {
+                let (Some(uid), Some(token), Some(meta)) = (self.uid.clone(), self.token(), self.list_meta.as_mut()) else { return Task::none() };
+                let value = if meta.2 == "private" { "public" } else { "private" };
+                meta.2 = value.to_string();
+                return Task::perform(background(move || api::set_visibility(&uid, &list.kind, value, &token)), Message::SimpleSaved);
+            }
+            Message::Pin(target) => {
+                let Some(token) = self.token() else { return Task::none() };
+                let pinned = !self.pins.iter().any(|pin| target.matches(pin));
+                return Task::perform(background(move || api::set_pinned(&target, pinned, &token)), Message::PinSaved);
+            }
+            Message::PinSaved(result) => {
+                let reload = self.token().map_or(Task::none(), |token| Task::perform(background(move || api::pins(&token)), Message::PinsLoaded));
+                return match result {
+                    Ok(()) => reload,
+                    Err(e) => Task::batch([reload, self.fail(e)]),
+                };
+            }
+            Message::CopyText(link) => {
+                let notice = self.notify("Ссылка скопирована".to_string());
+                return Task::batch([iced::clipboard::write(link), notice]);
+            }
+            Message::SimpleSaved(Ok(())) => {}
+            Message::SimpleSaved(Err(e)) => {
+                let reload = self.liked_pages_load();
+                return Task::batch([reload, self.fail(e)]);
+            }
             Message::HistoryLoaded(result) => {
                 self.history_loading = false;
                 match result {
@@ -1665,6 +1776,7 @@ impl App {
                     self.disliked.insert(track.id.clone());
                 } else {
                     self.disliked.remove(&track.id);
+                    self.disliked_list.retain(|t| t.id != track.id);
                 }
                 if self.queue.iter().any(|t| t.id == track.id) {
                     self.feedback(if disliked { "dislike" } else { "undislike" }, Some(&track), None);
@@ -1768,6 +1880,7 @@ impl App {
                         Section::Search => "Поиск".to_string(),
                         Section::Artist => self.artist.as_ref().map_or_else(String::new, |a| a.name.clone()),
                         Section::History => "История".to_string(),
+                        Section::Dislikes => "Дизлайки".to_string(),
                         _ => "Мне нравится".to_string(),
                     };
                     return self.play_list(tracks, title, index);
@@ -1906,7 +2019,8 @@ impl App {
         let page: Element<'_, Message> = match self.section {
             Section::Home => self.view_home(),
             Section::Queue => self.view_queue(),
-            Section::History => self.view_history(),
+            Section::History => self.view_track_page("История", &self.history_tracks, "Здесь появятся треки, которые вы слушали", Section::History),
+            Section::Dislikes => self.view_track_page("Дизлайки", &self.disliked_list, "Здесь появятся треки, которые вам не понравились", Section::Dislikes),
             Section::Wave => self.view_wave(),
             Section::Collection => self.view_collection(),
             Section::Likes => self.view_likes(),
@@ -1974,11 +2088,12 @@ impl App {
         let (title, confirm, danger): (String, &str, bool) = match dialog {
             Dialog::Create => ("Новый плейлист".to_string(), "Создать", false),
             Dialog::Rename(_) => ("Название плейлиста".to_string(), "Сохранить", false),
+            Dialog::Describe(_) => ("Описание плейлиста".to_string(), "Сохранить", false),
             Dialog::Delete(list) => (format!("Удалить плейлист «{}»?", list.title), "Удалить", true),
         };
         let mut body = column![text(title).size(20).font(ui::font_medium()).color(ui::TEXT)].spacing(16);
         if !danger {
-            body = body.push(text_input("Название", &self.dialog_text).id(DIALOG_INPUT).on_input(Message::DialogInput).on_submit(Message::DialogConfirm).padding([10, 16]).style(ui::input));
+            body = body.push(text_input(if matches!(dialog, Dialog::Describe(_)) { "Описание" } else { "Название" }, &self.dialog_text).id(DIALOG_INPUT).on_input(Message::DialogInput).on_submit(Message::DialogConfirm).padding([10, 16]).style(ui::input));
         }
         let buttons = row![
             Space::new().width(Length::Fill),
@@ -2135,7 +2250,7 @@ impl App {
 
     fn view_sidebar(&self) -> Element<'_, Message> {
         let opened = match self.section {
-            Section::Likes | Section::Playlists | Section::Albums | Section::Artists | Section::History => Section::Collection,
+            Section::Likes | Section::Playlists | Section::Albums | Section::Artists | Section::History | Section::Dislikes => Section::Collection,
             section => section,
         };
         let item = |icon, label, section| {
@@ -2299,15 +2414,15 @@ impl App {
         line.into()
     }
 
-    fn view_history(&self) -> Element<'_, Message> {
+    fn view_track_page<'a>(&'a self, name: &'a str, tracks: &'a [Track], empty: &'a str, section: Section) -> Element<'a, Message> {
         let back = button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back);
-        let title = row![back, text("История").size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None)].spacing(12).align_y(Alignment::Center);
-        let center: Element<'_, Message> = if !self.history_tracks.is_empty() {
-            self.view_list(Section::History, None)
+        let title = row![back, text(name).size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None)].spacing(12).align_y(Alignment::Center);
+        let center: Element<'a, Message> = if !tracks.is_empty() {
+            self.view_list(section, None)
         } else if self.history_loading {
             skeleton_list()
         } else {
-            placeholder("Пока пусто", Some("Здесь появятся треки, которые вы слушали"))
+            placeholder("Пока пусто", Some(empty))
         };
         column![title, center].spacing(16).height(Length::Fill).into()
     }
@@ -2342,7 +2457,7 @@ impl App {
             })
         };
         let mut page = column![
-            row![text("Коллекция").size(36).font(ui::font_headline()).color(ui::TEXT), Space::new().width(Length::Fill), self.block_title("История", Section::History)].align_y(Alignment::Center),
+            row![text("Коллекция").size(36).font(ui::font_headline()).color(ui::TEXT), Space::new().width(Length::Fill), self.block_title("История", Section::History), self.block_title("Дизлайки", Section::Dislikes)].align_y(Alignment::Center),
             Space::new().height(16),
             likes,
             if self.main_width() >= COLLECTION_COLUMNS { Element::from(row![column_of(0..4), column_of(4..8)].spacing(24)) } else { column_of(0..8).into() },
@@ -2351,6 +2466,9 @@ impl App {
         .padding(Padding::ZERO.right(SCROLLBAR));
         if !self.playlists.is_empty() {
             page = page.push(Space::new().height(8)).push(self.block_title("Плейлисты", Section::Playlists)).push(self.view_playlist_cards(&self.playlists));
+        }
+        if !self.liked_lists.is_empty() {
+            page = page.push(Space::new().height(8)).push(text("Понравившиеся плейлисты").size(24).font(ui::font_headline()).color(ui::TEXT)).push(self.view_playlist_cards(&self.liked_lists));
         }
         if !self.liked_albums.is_empty() {
             let shown = &self.liked_albums[..self.liked_albums.len().min(COLLECTION_CARDS)];
@@ -2429,11 +2547,28 @@ impl App {
             ]
             .spacing(12)
             .align_y(Alignment::Center);
-            let mut title = title;
-            if self.is_own(playlist) {
+            let mut head = column![title].spacing(10);
+            if playlist.source == Source::Playlist {
+                let meta = self.list_meta.as_ref();
+                if let Some(description) = meta.map(|m| m.1.as_str()).filter(|d| !d.is_empty()) {
+                    head = head.push(text(description).color(ui::MUTED));
+                }
                 let tool = |label, message| button(text(label).color(ui::TEXT)).padding([6, 14]).style(ui::secondary).on_press(message);
-                title = title.push(Space::new().width(Length::Fill)).push(tool("Переименовать", Message::DialogOpen(Dialog::Rename(playlist.clone())))).push(tool("Удалить", Message::DialogOpen(Dialog::Delete(playlist.clone()))));
+                let mut tools = self.page_actions(Section::Playlists, format!("playlist:{}_{}", playlist.owner, playlist.kind));
+                if self.is_own(playlist) && playlist.title != UPLOADS_TITLE {
+                    tools = tools.push(tool("Переименовать", Message::DialogOpen(Dialog::Rename(playlist.clone())))).push(tool("Описание", Message::DialogOpen(Dialog::Describe(playlist.clone()))));
+                    if let Some(meta) = meta {
+                        tools = tools.push(tool(if meta.2 == "private" { "Сделать публичным" } else { "Сделать приватным" }, Message::Visibility(playlist.clone())));
+                    }
+                    tools = tools.push(tool("Удалить", Message::DialogOpen(Dialog::Delete(playlist.clone()))));
+                } else if !self.is_own(playlist) && playlist.kind != FAVORITES_KIND {
+                    let liked = self.liked_lists.iter().any(|l| l.kind == playlist.kind && l.owner == playlist.owner);
+                    tools = tools.push(self.page_like(liked, Message::ListLike(playlist.clone())));
+                }
+                tools = tools.push(self.page_tools(PinRef::Playlist(playlist.owner.clone(), playlist.kind.clone()), format!("https://music.yandex.ru/users/{}/playlists/{}", playlist.owner, playlist.kind)));
+                head = head.push(tools.wrap().vertical_spacing(8));
             }
+            let title = head;
             let center: Element<'_, Message> = if !self.playlist_tracks.is_empty() {
                 self.view_list(Section::Playlists, None)
             } else if playlist.count == 0 {
@@ -2577,6 +2712,13 @@ impl App {
         row![play, wave].spacing(8).align_y(Alignment::Center)
     }
 
+    /// Закрепление и ссылка: круглые кнопки рядом с лайком.
+    fn page_tools<'a>(&self, target: PinRef, link: String) -> iced::widget::Row<'a, Message> {
+        let pinned = self.pins.iter().any(|pin| target.matches(pin));
+        let round = |icon, tint, message| button(container(ui::icon(icon, 22.0, tint)).center(22)).padding(9).style(ui::secondary).on_press(message);
+        row![round(ui::PIN, if pinned { ui::ACCENT } else { ui::TEXT }, Message::Pin(target)), round(ui::LINK, ui::TEXT, Message::CopyText(link))].spacing(8)
+    }
+
     fn page_like<'a>(&self, liked: bool, message: Message) -> Element<'a, Message> {
         let icon = if liked { ui::HEART } else { ui::HEART_OUTLINE };
         button(container(ui::icon(icon, 22.0, ui::TEXT)).center(22)).padding(9).style(ui::secondary).on_press(message).into()
@@ -2592,7 +2734,7 @@ impl App {
         about.push(format!("{count} {}", tracks_word(count)));
         let actions = self.page_actions(Section::Playlists, format!("album:{}", album.id));
         let liked = self.liked_albums.iter().any(|c| c.id == album.id);
-        let actions = actions.push(self.page_like(liked, Message::AlbumLike));
+        let actions = actions.push(self.page_like(liked, Message::AlbumLike)).push(self.page_tools(PinRef::Album(album.id.clone()), format!("https://music.yandex.ru/album/{}", album.id)));
         let links = artist_links(&album.artists, 16.0, ui::font(), ui::link, ui::MUTED);
         let header = self.page_header("Альбом", playlist.title.clone(), format!("{ALBUM_COVER}{}", album.id), false, Some(links), about.join(" · "), actions);
         self.view_list(Section::Playlists, Some(header))
@@ -2621,7 +2763,7 @@ impl App {
         let about = if artist.listeners > 0 { format!("Слушателей в месяц: {}", grouped(artist.listeners)) } else { String::new() };
         let actions = self.page_actions(Section::Artist, format!("artist:{}", artist.id)).push(button(text("Все треки").color(ui::TEXT)).padding([8, 18]).style(ui::secondary).on_press(Message::ArtistTracks));
         let liked = self.liked_artists.iter().any(|c| c.id == artist.id);
-        let actions = actions.push(self.page_like(liked, Message::ArtistLike));
+        let actions = actions.push(self.page_like(liked, Message::ArtistLike)).push(self.page_tools(PinRef::Artist(artist.id.clone()), format!("https://music.yandex.ru/artist/{}", artist.id)));
         let block = |title| text(title).size(24).font(ui::font_headline()).color(ui::TEXT);
         let mut page = column![self.page_header("Исполнитель", artist.name.clone(), format!("{ARTIST_COVER}{}", artist.id), true, None, about, actions)].spacing(12).padding(Padding::ZERO.right(SCROLLBAR));
         if !artist.popular.is_empty() {
@@ -3072,10 +3214,26 @@ fn smoke_library(query: &str) -> Result<(), String> {
     let added = api::playlist_tracks(&list, &token)?.iter().any(|t| t.id == track.id);
     api::remove_from_playlist(&uid, &list.kind, &track, &token)?;
     let removed = api::playlist_tracks(&list, &token)?.is_empty();
+    api::set_description(&uid, &list.kind, "описание", &token)?;
+    api::set_visibility(&uid, &list.kind, "public", &token)?;
+    println!("Описание и приватность: {:?}", api::playlist_meta(&uid, &list.kind, &token)?);
+    let target = PinRef::Playlist(uid.clone(), list.kind.clone());
+    api::set_pinned(&target, true, &token)?;
+    let pinned = api::pins(&token)?.iter().any(|pin| target.matches(pin));
+    api::set_pinned(&target, false, &token)?;
+    println!("Закрепление: появилось {pinned}, убралось {}", !api::pins(&token)?.iter().any(|pin| target.matches(pin)));
     api::delete_playlist(&uid, &list.kind, &token)?;
     let gone = !api::playlists(&uid, &token)?.iter().any(|p| p.kind == list.kind);
     println!("Плейлист: название сменилось {checked}, трек добавился {added}, убрался {removed}, плейлист удалён {gone}");
     println!("История: {} треков", api::history(HISTORY_LIMIT, &token)?.len());
+    println!("Дизлайков показать: {}", api::disliked_tracks(&uid, HISTORY_LIMIT, &token)?.len());
+    let liked_before = api::liked_playlists(&uid, &token)?;
+    if let Some(other) = found.playlists.iter().find(|p| p.owner != uid && !liked_before.iter().any(|l| l.kind == p.kind && l.owner == p.owner)) {
+        api::set_playlist_liked(&uid, &other.owner, &other.kind, true, &token)?;
+        let added = api::liked_playlists(&uid, &token)?.iter().any(|l| l.kind == other.kind && l.owner == other.owner);
+        api::set_playlist_liked(&uid, &other.owner, &other.kind, false, &token)?;
+        println!("Лайк плейлиста: появился {added}, снялся {}", api::liked_playlists(&uid, &token)?.len() == liked_before.len());
+    }
     let pins = api::pins(&token)?;
     println!("Закреплено: {}", pins.iter().map(|p| p.title.as_str()).collect::<Vec<_>>().join(", "));
     let lists = api::playlists(&uid, &token)?;
@@ -3128,6 +3286,7 @@ fn main() -> iced::Result {
             "wave" => Preview::Wave,
             "home" => Preview::Home,
             "history" => Preview::History,
+            "dislikes" => Preview::Dislikes,
             "dialog" => Preview::Dialog,
             "wave-seek" => Preview::WaveSeek,
             "likes" => Preview::Likes,

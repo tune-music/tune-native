@@ -78,6 +78,7 @@ pub const HOME: &str = "M12 3 3 10.5V21h6v-6h6v6h6V10.5z";
 pub const LEFT: &str = "M15.4 6.4 14 5l-7 7 7 7 1.4-1.4L9.8 12z";
 pub const RIGHT: &str = "M8.6 6.4 10 5l7 7-7 7-1.4-1.4 5.6-5.6z";
 pub const PLUS: &str = "M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6z";
+pub const PIN: &str = "M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z";
 pub const CLOSE: &str = "M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z";
 pub const LOGOUT: &str = "M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z";
 
