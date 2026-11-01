@@ -1,0 +1,280 @@
+//! Воспроизведение. Файл качается во временный файл, а декодер читает его по мере загрузки:
+//! звук начинается сразу, а в памяти трек не лежит.
+
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use aes::cipher::{KeyIvInit, StreamCipher};
+use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink};
+
+use crate::api::FileInfo;
+
+type Ctr128 = ctr::Ctr128BE<aes::Aes128>;
+type Ctr256 = ctr::Ctr128BE<aes::Aes256>;
+
+const WAIT: Duration = Duration::from_millis(20);
+
+enum Cipher {
+    None,
+    Aes128(Box<Ctr128>),
+    Aes256(Box<Ctr256>),
+}
+
+impl Cipher {
+    /// Файл с transport=encraw зашифрован AES-CTR с нулевым счётчиком.
+    fn new(key: Option<&str>) -> Result<Self, String> {
+        let Some(hex) = key else { return Ok(Cipher::None) };
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|i| hex.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
+            .collect::<Option<Vec<u8>>>()
+            .ok_or("Неверный ключ файла")?;
+        let iv = [0u8; 16];
+        match bytes.len() {
+            16 => Ok(Cipher::Aes128(Box::new(Ctr128::new_from_slices(&bytes, &iv).map_err(|e| e.to_string())?))),
+            32 => Ok(Cipher::Aes256(Box::new(Ctr256::new_from_slices(&bytes, &iv).map_err(|e| e.to_string())?))),
+            _ => Err("Неверный ключ файла".into()),
+        }
+    }
+
+    fn apply(&mut self, buf: &mut [u8]) {
+        match self {
+            Cipher::None => {}
+            Cipher::Aes128(c) => c.apply_keystream(buf),
+            Cipher::Aes256(c) => c.apply_keystream(buf),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Progress {
+    written: AtomicU64,
+    /// Загрузка закончилась: успешно, с ошибкой или её отменили.
+    finished: AtomicBool,
+    cancelled: AtomicBool,
+}
+
+/// Читает временный файл, ожидая байты, которые ещё не докачались.
+struct Reader {
+    file: File,
+    pos: u64,
+    len: u64,
+    progress: Arc<Progress>,
+}
+
+impl Read for Reader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let written = self.progress.written.load(Ordering::Acquire);
+            if self.progress.cancelled.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+            if written > self.pos {
+                let max = buf.len().min((written - self.pos) as usize);
+                let n = self.file.read(&mut buf[..max])?;
+                self.pos += n as u64;
+                return Ok(n);
+            }
+            if self.pos >= self.len || self.progress.finished.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+            std::thread::sleep(WAIT);
+        }
+    }
+}
+
+impl Seek for Reader {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let pos = match from {
+            SeekFrom::Start(p) => p as i64,
+            SeekFrom::Current(d) => self.pos as i64 + d,
+            SeekFrom::End(d) => self.len as i64 + d,
+        };
+        let pos = u64::try_from(pos).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        self.pos = self.file.seek(SeekFrom::Start(pos))?;
+        Ok(self.pos)
+    }
+}
+
+fn hint(codec: &str) -> &'static str {
+    match codec {
+        "mp3" => "mp3",
+        "flac" => "flac",
+        "aac" | "he-aac" => "aac",
+        _ => "m4a",
+    }
+}
+
+/// Качает файл в фоне и возвращает его длину, когда известен ответ сервера.
+fn download(info: &FileInfo, path: &Path, progress: Arc<Progress>) -> Result<u64, String> {
+    let mut cipher = Cipher::new(info.key.as_deref())?;
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(20))).build().into();
+    let resp = agent.get(&info.url).call().map_err(|e| format!("Не удалось получить файл трека: {e}"))?;
+    let len = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .ok_or("Сервер не сообщил размер файла")?;
+    let mut out = File::create(path).map_err(|e| e.to_string())?;
+    std::thread::spawn(move || {
+        let mut body = resp.into_body().into_with_config().limit(1024 * 1024 * 1024).reader();
+        let mut buf = vec![0u8; 64 * 1024];
+        while !progress.cancelled.load(Ordering::Acquire) {
+            let Ok(n) = body.read(&mut buf) else { break };
+            if n == 0 {
+                break;
+            }
+            // Поток CTR непрерывный, поэтому кусок любой длины расшифровывается на месте.
+            cipher.apply(&mut buf[..n]);
+            if out.write_all(&buf[..n]).is_err() {
+                break;
+            }
+            progress.written.fetch_add(n as u64, Ordering::Release);
+        }
+        progress.finished.store(true, Ordering::Release);
+    });
+    Ok(len)
+}
+
+/// Устройство вывода и плеер. Клонируется в фоновые задачи.
+#[derive(Clone)]
+pub struct Player {
+    output: Arc<rodio::Player>,
+    current: Arc<Mutex<Option<Arc<Progress>>>>,
+    generation: Arc<AtomicU64>,
+    _device: Arc<SendDevice>,
+}
+
+/// Устройство только держим живым и из других потоков не трогаем.
+struct SendDevice(#[allow(dead_code)] MixerDeviceSink);
+unsafe impl Send for SendDevice {}
+unsafe impl Sync for SendDevice {}
+
+impl Player {
+    pub fn new() -> Result<Self, String> {
+        let mut device = DeviceSinkBuilder::open_default_sink().map_err(|e| format!("Нет устройства вывода звука: {e}"))?;
+        device.log_on_drop(false);
+        let output = rodio::Player::connect_new(device.mixer());
+        Ok(Self {
+            output: Arc::new(output),
+            current: Arc::default(),
+            generation: Arc::default(),
+            _device: Arc::new(SendDevice(device)),
+        })
+    }
+
+    fn temp_path(generation: u64) -> PathBuf {
+        std::env::temp_dir().join(format!("tune-native-{}-{generation}.part", std::process::id()))
+    }
+
+    /// Останавливает текущий трек и отменяет его загрузку. Вернёт номер нового запуска.
+    pub fn stop(&self) -> u64 {
+        self.output.clear();
+        if let Some(old) = self.current.lock().unwrap().take() {
+            old.cancelled.store(true, Ordering::Release);
+        }
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = std::fs::remove_file(Self::temp_path(generation - 1));
+        generation
+    }
+
+    /// Блокирует поток до начала звука, поэтому зовётся в фоне.
+    pub fn play(&self, generation: u64, info: &FileInfo) -> Result<(), String> {
+        let path = Self::temp_path(generation);
+        let progress = Arc::new(Progress::default());
+        *self.current.lock().unwrap() = Some(progress.clone());
+        let len = download(info, &path, progress.clone())?;
+        let reader = Reader { file: File::open(&path).map_err(|e| e.to_string())?, pos: 0, len, progress };
+        let decoder = Decoder::builder()
+            .with_data(reader)
+            .with_byte_len(len)
+            .with_seekable(true)
+            .with_hint(hint(&info.codec))
+            .build()
+            .map_err(|e| format!("Не удалось прочитать файл трека: {e}"))?;
+        // Пока декодер открывался, могли включить другой трек.
+        if self.generation.load(Ordering::Acquire) != generation {
+            return Ok(());
+        }
+        self.output.append(decoder);
+        self.output.play();
+        Ok(())
+    }
+
+    pub fn toggle(&self) {
+        if self.output.is_paused() {
+            self.output.play();
+        } else {
+            self.output.pause();
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.output.is_paused()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.output.empty()
+    }
+
+    pub fn position(&self) -> Duration {
+        self.output.get_pos()
+    }
+
+    pub fn set_volume(&self, volume: f32) {
+        self.output.set_volume(volume);
+    }
+
+    /// Ждёт, пока докачается нужное место, поэтому зовётся в фоне.
+    pub fn seek(&self, position: Duration) -> Result<(), String> {
+        self.output.try_seek(position).map_err(|e| format!("Не удалось перемотать: {e}"))
+    }
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        // Последняя копия: убираем временный файл.
+        if Arc::strong_count(&self.output) == 1 {
+            self.stop();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reader_waits_and_stops_on_cancel() {
+        let path = std::env::temp_dir().join(format!("tune-native-test-{}", std::process::id()));
+        std::fs::write(&path, b"abcdef").unwrap();
+        let progress = Arc::new(Progress::default());
+        progress.written.store(3, Ordering::Release);
+        let mut reader = Reader { file: File::open(&path).unwrap(), pos: 0, len: 6, progress: progress.clone() };
+        let mut buf = [0u8; 6];
+        assert_eq!(reader.read(&mut buf).unwrap(), 3);
+        assert_eq!(&buf[..3], b"abc");
+        progress.cancelled.store(true, Ordering::Release);
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+        drop(reader);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ctr_roundtrip() {
+        let key = "000102030405060708090a0b0c0d0e0f";
+        let mut data = b"hello tune native".to_vec();
+        let orig = data.clone();
+        let mut a = Cipher::new(Some(key)).unwrap();
+        a.apply(&mut data[..5]);
+        a.apply(&mut data[5..]);
+        assert_ne!(data, orig);
+        Cipher::new(Some(key)).unwrap().apply(&mut data);
+        assert_eq!(data, orig);
+    }
+}
