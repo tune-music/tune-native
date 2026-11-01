@@ -1,0 +1,79 @@
+//! Настройки, которые переживают перезапуск.
+
+use std::fs;
+
+use serde_json::{json, Value};
+
+use crate::api;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Repeat {
+    Off,
+    All,
+    One,
+}
+
+impl Repeat {
+    /// Порядок как у кнопки в оригинале.
+    pub fn next(self) -> Self {
+        match self {
+            Repeat::Off => Repeat::All,
+            Repeat::All => Repeat::One,
+            Repeat::One => Repeat::Off,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Settings {
+    pub volume: f32,
+    pub muted: bool,
+    pub repeat: Repeat,
+    pub shuffle: bool,
+}
+
+fn parse(v: &Value) -> Settings {
+    Settings {
+        volume: v["volume"].as_f64().map_or(0.8, |x| x.clamp(0.0, 1.0) as f32),
+        muted: v["muted"].as_bool().unwrap_or(false),
+        repeat: match v["repeat"].as_str() {
+            Some("all") => Repeat::All,
+            Some("one") => Repeat::One,
+            _ => Repeat::Off,
+        },
+        shuffle: v["shuffle"].as_bool().unwrap_or(false),
+    }
+}
+
+pub fn load() -> Settings {
+    let text = fs::read(api::data_dir().join("settings.json")).unwrap_or_default();
+    parse(&serde_json::from_slice(&text).unwrap_or(Value::Null))
+}
+
+/// Настройка не стоит того, чтобы мешать музыке: ошибку записи не показываем.
+pub fn save(settings: Settings) {
+    let repeat = match settings.repeat {
+        Repeat::Off => "off",
+        Repeat::All => "all",
+        Repeat::One => "one",
+    };
+    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle });
+    let dir = api::data_dir();
+    if fs::create_dir_all(&dir).is_ok() {
+        let _ = fs::write(dir.join("settings.json"), value.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_saved_and_broken_values() {
+        let saved = parse(&json!({ "volume": 0.25, "muted": true, "repeat": "one", "shuffle": true }));
+        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true });
+        let empty = parse(&Value::Null);
+        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false });
+        assert_eq!(parse(&json!({ "volume": 7 })).volume, 1.0);
+    }
+}
