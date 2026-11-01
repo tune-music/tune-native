@@ -175,6 +175,15 @@ pub fn menu_item(_: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// Фильтр поиска.
+pub fn chip(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| match (active, status) {
+        (true, _) => flat(Some(TEXT), BLACK, 18.0),
+        (false, button::Status::Hovered | button::Status::Pressed) => flat(Some(CONTROL_HOVER), TEXT, 18.0),
+        (false, _) => flat(Some(CONTROL), TEXT, 18.0),
+    }
+}
+
 /// Значок подписки.
 pub fn plus(_: &Theme) -> container::Style {
     container::Style { background: Some(Background::Color(color!(0xff5c4d))), text_color: Some(WHITE), border: border::rounded(10), ..container::Style::default() }

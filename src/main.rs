@@ -23,7 +23,7 @@ use iced::keyboard;
 use iced::widget::{button, canvas, column, container, image, mouse_area, operation, row, scrollable, slider, stack, text, text_input, Id, Space};
 use iced::{event, mouse, time, window, Alignment, Event, Element, Length, Padding, Size, Subscription, Task};
 
-use api::{Album, Artist, Card, Pin, PinTarget, Playlist, Profile, Source, Track, Wave, NEED_LOGIN};
+use api::{Album, Artist, Card, Found, Pin, PinTarget, Playlist, Profile, Source, Track, Wave, NEED_LOGIN};
 use media::Media;
 use player::Player;
 use raw_window_handle::RawWindowHandle;
@@ -62,6 +62,14 @@ const ROW: f32 = 58.0;
 /// Сколько строк держать готовыми за краем экрана.
 const ROW_MARGIN: usize = 6;
 const LIST: &str = "list";
+/// Сколько результатов просить: на вкладке «Всё» и на отдельной вкладке.
+const SEARCH_ALL: u32 = 30;
+const SEARCH_TAB: u32 = 100;
+/// Сколько треков показать на вкладке «Всё», а карточек — в блоках коллекции.
+const SEARCH_ALL_TRACKS: usize = 5;
+const COLLECTION_CARDS: usize = 5;
+/// Пауза после нажатия клавиши, прежде чем искать.
+const SEARCH_DELAY: Duration = Duration::from_millis(350);
 /// Высота шапки альбома и исполнителя: альбом считает видимые строки с её учётом.
 const PAGE_HEADER: f32 = 240.0;
 const PAGE_COVER: f32 = 200.0;
@@ -132,7 +140,43 @@ enum Section {
     Likes,
     Playlists,
     Artist,
+    Albums,
+    Artists,
     Search,
+}
+
+/// Вкладка поиска.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SearchTab {
+    All,
+    Tracks,
+    Albums,
+    Artists,
+    Playlists,
+}
+
+impl SearchTab {
+    const ALL: [SearchTab; 5] = [SearchTab::All, SearchTab::Tracks, SearchTab::Albums, SearchTab::Artists, SearchTab::Playlists];
+
+    fn label(self) -> &'static str {
+        match self {
+            SearchTab::All => "Всё",
+            SearchTab::Tracks => "Треки",
+            SearchTab::Albums => "Альбомы",
+            SearchTab::Artists => "Исполнители",
+            SearchTab::Playlists => "Плейлисты",
+        }
+    }
+
+    fn types(self) -> &'static str {
+        match self {
+            SearchTab::All => "album,artist,playlist,track",
+            SearchTab::Tracks => "track",
+            SearchTab::Albums => "album",
+            SearchTab::Artists => "artist",
+            SearchTab::Playlists => "playlist",
+        }
+    }
 }
 
 /// Куда возвращает кнопка «назад».
@@ -176,6 +220,12 @@ struct App {
     profile: Option<Profile>,
     query: String,
     results: Vec<Track>,
+    found: Found,
+    search_tab: SearchTab,
+    /// Что уже искали: для вкладок и подсказки.
+    searched: bool,
+    liked_albums: Vec<Card>,
+    liked_artists: Vec<Card>,
     searching: bool,
     search_id: u64,
     uid: Option<String>,
@@ -259,7 +309,14 @@ enum Message {
     Open(Section),
     Query(String),
     Search,
-    Found(u64, Result<Vec<Track>, String>),
+    Found(u64, Result<Found, String>),
+    SearchTyped(u64),
+    SearchTabSet(SearchTab),
+    ListOpen(Playlist),
+    LikedPages(Result<(Vec<Card>, Vec<Card>), String>),
+    AlbumLike,
+    ArtistLike,
+    PageLikeSaved(Result<(), String>),
     LikesMore,
     LikesPage(usize, Result<Vec<Track>, String>),
     Scrolled(f32),
@@ -337,6 +394,11 @@ impl App {
             profile: None,
             query: String::new(),
             results: Vec::new(),
+            found: Found::default(),
+            search_tab: SearchTab::All,
+            searched: false,
+            liked_albums: Vec::new(),
+            liked_artists: Vec::new(),
             searching: false,
             search_id: 0,
             uid: None,
@@ -428,6 +490,7 @@ impl App {
             Section::Wave => 0..0,
             Section::Collection => 0..self.liked.len().min(8),
             Section::Artist => 0..self.list(Section::Artist).len(),
+            Section::Search if self.search_tab == SearchTab::All => 0..self.results.len().min(SEARCH_ALL_TRACKS),
             Section::Playlists if self.playlist.as_ref().is_some_and(|p| p.source == Source::Album) => {
                 visible_rows(self.list_offset - PAGE_HEADER, WINDOW.lock().unwrap().1, self.row_count(Section::Playlists))
             }
@@ -493,6 +556,10 @@ impl App {
         self.history.clear();
         self.profile = None;
         self.results.clear();
+        self.found = Found::default();
+        self.searched = false;
+        self.liked_albums.clear();
+        self.liked_artists.clear();
         self.queue.clear();
         self.liked.clear();
         self.liked_ids.clear();
@@ -525,6 +592,33 @@ impl App {
         self.current = None;
         self.active = false;
         self.starting = false;
+    }
+
+    /// Обложки карточек и плейлистов из результатов поиска и коллекции.
+    fn fetch_card_covers<'a>(&self, albums: impl Iterator<Item = &'a Card>, artists: impl Iterator<Item = &'a Card>, playlists: &[Playlist]) -> Task<Message> {
+        let albums = albums.filter_map(|c| Some((format!("{ALBUM_COVER}{}", c.id), c.cover.clone()?)));
+        let artists = artists.filter_map(|c| Some((format!("{ARTIST_COVER}{}", c.id), c.cover.clone()?)));
+        let lists = playlists.iter().filter_map(|p| Some((playlist_cover_key(p), p.cover.clone()?)));
+        self.fetch_cover_jobs(albums.chain(artists).chain(lists).collect(), "300x300")
+    }
+
+    fn search_run(&mut self) -> Task<Message> {
+        let Some(token) = self.token() else { return Task::none() };
+        let text = self.query.trim().to_string();
+        self.search_id += 1;
+        if text.is_empty() {
+            self.searching = false;
+            self.searched = false;
+            self.results.clear();
+            self.found = Found::default();
+            return Task::none();
+        }
+        self.searching = true;
+        self.error = None;
+        let id = self.search_id;
+        let tab = self.search_tab;
+        let size = if tab == SearchTab::All { SEARCH_ALL } else { SEARCH_TAB };
+        Task::perform(background(move || api::search_mixed(&text, tab.types(), size, &token)), move |r| Message::Found(id, r))
     }
 
     /// Экран волны показывает обложку крупно.
@@ -564,8 +658,13 @@ impl App {
         let panel = self.queue_rows();
         let panel = self.queue.iter().skip(panel.start).take(panel.len());
         let keep: HashSet<String> = around.chain(queue).chain(panel).map(|t| t.id.clone()).collect();
-        let page = self.album.is_some() || self.artist.is_some();
-        self.covers.retain(|id, _| id.starts_with(PLAYLIST_COVER) || id.starts_with(PIN_COVER_PREFIX) || (page && (id.starts_with(ALBUM_COVER) || id.starts_with(ARTIST_COVER))) || keep.contains(id));
+        let mut cards: HashSet<String> = HashSet::new();
+        let page = self.artist.as_ref();
+        cards.extend(self.liked_albums.iter().chain(&self.found.albums).chain(page.into_iter().flat_map(|a| a.albums.iter().chain(&a.also))).map(|c| format!("{ALBUM_COVER}{}", c.id)));
+        cards.extend(self.liked_artists.iter().chain(&self.found.artists).chain(page.into_iter().flat_map(|a| &a.similar)).map(|c| format!("{ARTIST_COVER}{}", c.id)));
+        cards.extend(self.album.iter().map(|a| format!("{ALBUM_COVER}{}", a.id)));
+        cards.extend(page.iter().map(|a| format!("{ARTIST_COVER}{}", a.id)));
+        self.covers.retain(|id, _| id.starts_with(PLAYLIST_COVER) || id.starts_with(PIN_COVER_PREFIX) || cards.contains(id) || keep.contains(id));
         self.requested.borrow_mut().retain(|id| self.covers.contains_key(id));
     }
 
@@ -650,6 +749,11 @@ impl App {
         Task::perform(background(move || api::wave_more(&session, &shown, &token)), Message::WaveMore)
     }
 
+    fn liked_pages_load(&self) -> Task<Message> {
+        let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
+        Task::perform(background(move || api::liked_pages(&uid, &token)), Message::LikedPages)
+    }
+
     fn remember(&mut self) {
         self.history.push(Place { section: self.section, playlist: self.playlist.clone(), artist: self.artist.clone() });
     }
@@ -727,6 +831,7 @@ impl App {
             Section::Likes | Section::Collection => &self.liked,
             Section::Playlists => &self.playlist_tracks,
             Section::Artist => self.artist.as_ref().map_or(&[], |a| a.popular.as_slice()),
+            Section::Albums | Section::Artists => &[],
             Section::Search => &self.results,
         }
     }
@@ -801,6 +906,7 @@ impl App {
                 self.liked_set = ids.iter().cloned().collect();
                 self.liked_ids = ids;
                 let pins = self.token().map_or(Task::none(), |token| Task::perform(background(move || api::pins(&token)), Message::PinsLoaded));
+                let pins = Task::batch([pins, self.liked_pages_load()]);
                 let page = match self.preview.clone() {
                     Some(Preview::Wave | Preview::WaveSeek) => self.wave_load(vec![api::MY_WAVE.to_string()], false),
                     Some(Preview::Likes | Preview::LikesEnd | Preview::Menu | Preview::Panels) => self.update(Message::Open(Section::Likes)),
@@ -889,18 +995,61 @@ impl App {
                     _ => Task::none(),
                 };
             }
-            Message::Query(query) => self.query = query,
-            Message::Search => {
-                let Some(token) = self.token() else { return Task::none() };
-                let text = self.query.trim().to_string();
-                if text.is_empty() {
-                    return Task::none();
-                }
-                self.searching = true;
-                self.error = None;
+            Message::Query(query) => {
+                self.query = query;
+                // Новая буква отменяет поиск, который ещё ждёт паузы.
                 self.search_id += 1;
                 let id = self.search_id;
-                return Task::perform(background(move || api::search(&text, &token)), move |r| Message::Found(id, r));
+                return Task::perform(background(|| std::thread::sleep(SEARCH_DELAY)), move |()| Message::SearchTyped(id));
+            }
+            Message::SearchTyped(id) => {
+                if id == self.search_id {
+                    return self.search_run();
+                }
+            }
+            Message::Search => return self.search_run(),
+            Message::SearchTabSet(tab) => {
+                if self.search_tab != tab {
+                    self.search_tab = tab;
+                    self.list_offset = 0.0;
+                    let snap = operation::snap_to(Id::new(LIST), scrollable::RelativeOffset::START);
+                    return Task::batch([snap, self.search_run()]);
+                }
+            }
+            Message::ListOpen(playlist) => return self.open_list(playlist),
+            Message::LikedPages(Ok((albums, artists))) => {
+                self.liked_albums = albums;
+                self.liked_artists = artists;
+                return self.fetch_card_covers(self.liked_albums.iter(), self.liked_artists.iter(), &[]);
+            }
+            // Коллекция покажется без этих блоков; музыке это не мешает.
+            Message::LikedPages(Err(_)) => {}
+            Message::AlbumLike => {
+                let (Some(uid), Some(token), Some(album)) = (self.uid.clone(), self.token(), self.album.clone()) else { return Task::none() };
+                let liked = !self.liked_albums.iter().any(|c| c.id == album.id);
+                if liked {
+                    let subtitle = album.year.map_or_else(|| "Альбом".to_string(), |year| year.to_string());
+                    self.liked_albums.insert(0, Card { id: album.id.clone(), title: album.title.clone(), subtitle, cover: album.cover.clone() });
+                } else {
+                    self.liked_albums.retain(|c| c.id != album.id);
+                }
+                return Task::perform(background(move || api::set_album_liked(&uid, &album.id, liked, &token)), Message::PageLikeSaved);
+            }
+            Message::ArtistLike => {
+                let (Some(uid), Some(token), Some(artist)) = (self.uid.clone(), self.token(), self.artist.clone()) else { return Task::none() };
+                let liked = !self.liked_artists.iter().any(|c| c.id == artist.id);
+                if liked {
+                    self.liked_artists.insert(0, Card { id: artist.id.clone(), title: artist.name.clone(), subtitle: "Исполнитель".to_string(), cover: artist.cover.clone() });
+                } else {
+                    self.liked_artists.retain(|c| c.id != artist.id);
+                }
+                return Task::perform(background(move || api::set_artist_liked(&uid, &artist.id, liked, &token)), Message::PageLikeSaved);
+            }
+            Message::PageLikeSaved(Ok(())) => {}
+            Message::PageLikeSaved(Err(e)) => {
+                // Яндекс не сохранил: показываем то, что у него на самом деле.
+                let reload = self.liked_pages_load();
+                return Task::batch([reload, self.fail(e)]);
             }
             Message::Found(id, result) => {
                 if id != self.search_id {
@@ -908,13 +1057,16 @@ impl App {
                 }
                 self.searching = false;
                 match result {
-                    Ok(tracks) => {
-                        self.results = tracks;
+                    Ok(found) => {
+                        self.results = found.tracks.clone();
+                        self.found = found;
+                        self.searched = true;
                         self.prune_covers();
                         if matches!(self.preview.take(), Some(Preview::Search(_))) {
                             self.queue = self.results.clone();
                             self.current = Some(0).filter(|_| !self.queue.is_empty());
                         }
+                        return self.fetch_card_covers(self.found.albums.iter(), self.found.artists.iter(), &self.found.playlists);
                     }
                     Err(e) => return self.fail_retry(e, Message::Search),
                 }
@@ -1123,7 +1275,7 @@ impl App {
                 match result {
                     Ok(playlists) => {
                         self.playlists = playlists;
-                        let jobs = self.playlists.iter().filter_map(|p| Some((format!("{PLAYLIST_COVER}{}", p.kind), p.cover.clone()?))).collect();
+                        let jobs = self.playlists.iter().filter_map(|p| Some((playlist_cover_key(p), p.cover.clone()?))).collect();
                         let covers = self.fetch_cover_jobs(jobs, "200x200");
                         if matches!(self.preview, Some(Preview::Playlists)) {
                             self.preview = None;
@@ -1465,6 +1617,8 @@ impl App {
             Section::Likes => self.view_likes(),
             Section::Playlists => self.view_playlists(),
             Section::Artist => self.view_artist(),
+            Section::Albums => self.view_card_page("Альбомы", &self.liked_albums, ALBUM_COVER, false, "Здесь появятся альбомы, которые вам понравились"),
+            Section::Artists => self.view_card_page("Исполнители", &self.liked_artists, ARTIST_COVER, true, "Здесь появятся исполнители, которые вам понравились"),
             Section::Search => self.view_search(),
         };
         let mut page = column![page].spacing(12).height(Length::Fill);
@@ -1613,7 +1767,7 @@ impl App {
 
     fn view_sidebar(&self) -> Element<'_, Message> {
         let opened = match self.section {
-            Section::Likes | Section::Playlists => Section::Collection,
+            Section::Likes | Section::Playlists | Section::Albums | Section::Artists => Section::Collection,
             section => section,
         };
         let item = |icon, label, section| {
@@ -1804,14 +1958,34 @@ impl App {
         .spacing(16)
         .padding(Padding::ZERO.right(SCROLLBAR));
         if !self.playlists.is_empty() {
-            page = page.push(Space::new().height(8)).push(self.block_title("Плейлисты", Section::Playlists)).push(self.view_playlist_cards());
+            page = page.push(Space::new().height(8)).push(self.block_title("Плейлисты", Section::Playlists)).push(self.view_playlist_cards(&self.playlists));
+        }
+        if !self.liked_albums.is_empty() {
+            let shown = &self.liked_albums[..self.liked_albums.len().min(COLLECTION_CARDS)];
+            page = page.push(Space::new().height(8)).push(self.block_title("Альбомы", Section::Albums)).push(self.view_cards(shown, ALBUM_COVER, false, open_album));
+        }
+        if !self.liked_artists.is_empty() {
+            let shown = &self.liked_artists[..self.liked_artists.len().min(COLLECTION_CARDS)];
+            page = page.push(Space::new().height(8)).push(self.block_title("Исполнители", Section::Artists)).push(self.view_cards(shown, ARTIST_COVER, true, open_artist));
         }
         scrollable(page).height(Length::Fill).into()
     }
 
-    fn view_playlist_cards(&self) -> Element<'_, Message> {
-        let cards = self.playlists.iter().enumerate().fold(row![].spacing(16), |cards, (index, playlist)| {
-            let cover: Element<'_, Message> = match self.covers.get(&format!("{PLAYLIST_COVER}{}", playlist.kind)) {
+    fn view_card_page<'a>(&'a self, title: &'a str, cards: &'a [Card], prefix: &str, round: bool, empty: &'a str) -> Element<'a, Message> {
+        let back = button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back);
+        let head = row![back, text(title).size(36).font(ui::font_headline()).color(ui::TEXT)].spacing(12).align_y(Alignment::Center);
+        let center: Element<'a, Message> = if cards.is_empty() {
+            placeholder("Пока пусто", Some(empty))
+        } else {
+            let open = if round { open_artist } else { open_album };
+            scrollable(container(self.view_cards(cards, prefix, round, open)).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).height(Length::Fill).into()
+        };
+        column![head, center].spacing(16).height(Length::Fill).into()
+    }
+
+    fn view_playlist_cards<'a>(&self, playlists: &'a [Playlist]) -> Element<'a, Message> {
+        let cards = playlists.iter().fold(row![].spacing(16), |cards, playlist| {
+            let cover: Element<'a, Message> = match self.covers.get(&playlist_cover_key(playlist)) {
                 Some(handle) => image(handle.clone()).width(CARD).height(CARD).border_radius(8).into(),
                 None => container(ui::icon(ui::PLAY, 48.0, ui::MUTED)).center(CARD).style(ui::tile).into(),
             };
@@ -1823,7 +1997,7 @@ impl App {
             .spacing(6)
             .width(CARD)
             .clip(true);
-            cards.push(button(card).padding(0).style(button::text).on_press(Message::PlaylistOpen(index)))
+            cards.push(button(card).padding(0).style(button::text).on_press(Message::ListOpen(playlist.clone())))
         });
         cards.wrap().into()
     }
@@ -1874,7 +2048,7 @@ impl App {
         }
         let title = row![back, text("Плейлисты").size(36).font(ui::font_headline()).color(ui::TEXT)].spacing(12).align_y(Alignment::Center);
         let center: Element<'_, Message> = if !self.playlists.is_empty() {
-            scrollable(container(self.view_playlist_cards()).padding(Padding::ZERO.right(SCROLLBAR))).height(Length::Fill).into()
+            scrollable(container(self.view_playlist_cards(&self.playlists)).padding(Padding::ZERO.right(SCROLLBAR))).height(Length::Fill).into()
         } else if self.playlists_loading || self.uid.is_none() {
             skeleton_cards()
         } else {
@@ -1891,14 +2065,44 @@ impl App {
             .padding([11, 20])
             .size(15)
             .style(ui::input);
+        let mut page = column![input].spacing(16).height(Length::Fill);
+        if !self.searched && !self.searching {
+            return page.push(placeholder("Что послушаем?", Some("Начните вводить название трека, альбома или исполнителя"))).into();
+        }
+        let tabs = SearchTab::ALL.into_iter().fold(row![].spacing(8), |tabs, tab| {
+            tabs.push(button(text(tab.label())).padding([7, 16]).style(ui::chip(tab == self.search_tab)).on_press(Message::SearchTabSet(tab)))
+        });
+        page = page.push(tabs);
+        if let Some(corrected) = &self.found.corrected {
+            page = page.push(text(format!("Показаны результаты по запросу «{corrected}»")).color(ui::MUTED));
+        }
+        let found = &self.found;
+        let nothing = found.tracks.is_empty() && found.albums.is_empty() && found.artists.is_empty() && found.playlists.is_empty();
         let center: Element<'_, Message> = if self.searching {
             skeleton_list()
-        } else if self.results.is_empty() {
-            placeholder("Что послушаем?", Some("Введите название трека или исполнителя и нажмите Enter"))
-        } else {
+        } else if nothing {
+            placeholder("Ничего не нашлось", Some("Попробуйте написать иначе"))
+        } else if self.search_tab == SearchTab::Tracks {
             self.view_list(Section::Search, None)
+        } else {
+            let block = |title| text(title).size(24).font(ui::font_headline()).color(ui::TEXT);
+            let mut blocks = column![].spacing(12).padding(Padding::ZERO.right(SCROLLBAR));
+            if !found.artists.is_empty() {
+                blocks = blocks.push(block("Исполнители")).push(self.view_cards(&found.artists, ARTIST_COVER, true, open_artist)).push(Space::new().height(8));
+            }
+            if !found.tracks.is_empty() {
+                let shown = found.tracks.iter().take(SEARCH_ALL_TRACKS).enumerate();
+                blocks = blocks.push(block("Треки")).push(shown.fold(column![], |list, (index, track)| list.push(self.view_track(Section::Search, index, track)))).push(Space::new().height(8));
+            }
+            if !found.albums.is_empty() {
+                blocks = blocks.push(block("Альбомы")).push(self.view_cards(&found.albums, ALBUM_COVER, false, open_album)).push(Space::new().height(8));
+            }
+            if !found.playlists.is_empty() {
+                blocks = blocks.push(block("Плейлисты")).push(self.view_playlist_cards(&found.playlists));
+            }
+            scrollable(blocks).id(LIST).height(Length::Fill).into()
         };
-        column![input, center].spacing(24).height(Length::Fill).into()
+        page.push(center).into()
     }
 
     /// Шапка альбома и исполнителя: обложка, название, подписи и кнопки.
@@ -1935,6 +2139,11 @@ impl App {
         row![play, wave].spacing(8).align_y(Alignment::Center)
     }
 
+    fn page_like<'a>(&self, liked: bool, message: Message) -> Element<'a, Message> {
+        let icon = if liked { ui::HEART } else { ui::HEART_OUTLINE };
+        button(container(ui::icon(icon, 22.0, ui::TEXT)).center(22)).padding(9).style(ui::secondary).on_press(message).into()
+    }
+
     fn view_album<'a>(&'a self, playlist: &'a Playlist) -> Element<'a, Message> {
         let Some(album) = &self.album else {
             let back = button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back);
@@ -1948,11 +2157,13 @@ impl App {
         if let Some(artist) = &album.artist_id {
             actions = actions.push(button(text("К исполнителю").color(ui::TEXT)).padding([8, 18]).style(ui::secondary).on_press(Message::ArtistOpen(artist.clone())));
         }
+        let liked = self.liked_albums.iter().any(|c| c.id == album.id);
+        actions = actions.push(self.page_like(liked, Message::AlbumLike));
         let header = self.page_header("Альбом", playlist.title.clone(), format!("{ALBUM_COVER}{}", album.id), false, about.join(" · "), actions);
         self.view_list(Section::Playlists, Some(header))
     }
 
-    fn view_cards<'a>(&self, cards: &'a [Card], prefix: &str, round: bool, open: impl Fn(&'a Card) -> Message) -> Element<'a, Message> {
+    fn view_cards<'a>(&self, cards: &'a [Card], prefix: &str, round: bool, open: fn(&Card) -> Message) -> Element<'a, Message> {
         cards
             .iter()
             .fold(row![].spacing(16), |line, card| {
@@ -1974,6 +2185,8 @@ impl App {
         };
         let about = if artist.listeners > 0 { format!("Слушателей в месяц: {}", grouped(artist.listeners)) } else { String::new() };
         let actions = self.page_actions(Section::Artist, format!("artist:{}", artist.id)).push(button(text("Все треки").color(ui::TEXT)).padding([8, 18]).style(ui::secondary).on_press(Message::ArtistTracks));
+        let liked = self.liked_artists.iter().any(|c| c.id == artist.id);
+        let actions = actions.push(self.page_like(liked, Message::ArtistLike));
         let block = |title| text(title).size(24).font(ui::font_headline()).color(ui::TEXT);
         let mut page = column![self.page_header("Исполнитель", artist.name.clone(), format!("{ARTIST_COVER}{}", artist.id), true, about, actions)].spacing(12).padding(Padding::ZERO.right(SCROLLBAR));
         if !artist.popular.is_empty() {
@@ -1982,13 +2195,13 @@ impl App {
         }
         let albums = |cards: &'_ [Card]| !cards.is_empty();
         if albums(&artist.albums) {
-            page = page.push(Space::new().height(8)).push(block("Альбомы")).push(self.view_cards(&artist.albums, ALBUM_COVER, false, |c| Message::AlbumOpen(c.id.clone(), c.title.clone())));
+            page = page.push(Space::new().height(8)).push(block("Альбомы")).push(self.view_cards(&artist.albums, ALBUM_COVER, false, open_album));
         }
         if albums(&artist.also) {
-            page = page.push(Space::new().height(8)).push(block("Сборники")).push(self.view_cards(&artist.also, ALBUM_COVER, false, |c| Message::AlbumOpen(c.id.clone(), c.title.clone())));
+            page = page.push(Space::new().height(8)).push(block("Сборники")).push(self.view_cards(&artist.also, ALBUM_COVER, false, open_album));
         }
         if albums(&artist.similar) {
-            page = page.push(Space::new().height(8)).push(block("Похожие исполнители")).push(self.view_cards(&artist.similar, ARTIST_COVER, true, |c| Message::ArtistOpen(c.id.clone())));
+            page = page.push(Space::new().height(8)).push(block("Похожие исполнители")).push(self.view_cards(&artist.similar, ARTIST_COVER, true, open_artist));
         }
         scrollable(page).id(LIST).height(Length::Fill).into()
     }
@@ -2122,6 +2335,19 @@ fn popup<'a>(content: Element<'a, Message>, x: f32, y: f32, width: f32, height: 
         .height(Length::Fill)
         .padding(Padding::new(0.0).left(x).top(y))
         .into()
+}
+
+fn open_album(card: &Card) -> Message {
+    Message::AlbumOpen(card.id.clone(), card.title.clone())
+}
+
+fn open_artist(card: &Card) -> Message {
+    Message::ArtistOpen(card.id.clone())
+}
+
+/// У разных владельцев номера плейлистов совпадают, поэтому в ключе есть и владелец.
+fn playlist_cover_key(playlist: &Playlist) -> String {
+    format!("{PLAYLIST_COVER}{}:{}", playlist.owner, playlist.kind)
 }
 
 fn preload_key(id: &str, quality: Quality) -> String {
@@ -2336,6 +2562,24 @@ fn smoke_library(query: &str) -> Result<(), String> {
     api::set_liked(&uid, &track.id, false, &token)?;
     let after = api::liked_ids(&uid, &token)?;
     println!("Лайк появился: {added}, снялся: {}, список как был: {}", !after.contains(&track.id), after == ids);
+    let (albums, artists) = api::liked_pages(&uid, &token)?;
+    println!("Альбомов в коллекции: {}, исполнителей: {}", albums.len(), artists.len());
+    let found = api::search_mixed(query, SearchTab::All.types(), SEARCH_ALL, &token)?;
+    println!("Смешанный поиск: треков {}, альбомов {}, исполнителей {}, плейлистов {}", found.tracks.len(), found.albums.len(), found.artists.len(), found.playlists.len());
+    if let Some(album) = found.albums.iter().find(|c| !albums.iter().any(|a| a.id == c.id)) {
+        api::set_album_liked(&uid, &album.id, true, &token)?;
+        let added = api::liked_pages(&uid, &token)?.0.iter().any(|a| a.id == album.id);
+        api::set_album_liked(&uid, &album.id, false, &token)?;
+        let after = api::liked_pages(&uid, &token)?.0;
+        println!("Альбом добавился: {added}, убрался: {}, порядок прежний: {}", !after.iter().any(|a| a.id == album.id), after.iter().map(|a| &a.id).eq(albums.iter().map(|a| &a.id)));
+    }
+    if let Some(artist) = found.artists.iter().find(|c| !artists.iter().any(|a| a.id == c.id)) {
+        api::set_artist_liked(&uid, &artist.id, true, &token)?;
+        let added = api::liked_pages(&uid, &token)?.1.iter().any(|a| a.id == artist.id);
+        api::set_artist_liked(&uid, &artist.id, false, &token)?;
+        let after = api::liked_pages(&uid, &token)?.1;
+        println!("Исполнитель добавился: {added}, убрался: {}, порядок прежний: {}", !after.iter().any(|a| a.id == artist.id), after.iter().map(|a| &a.id).eq(artists.iter().map(|a| &a.id)));
+    }
     let pins = api::pins(&token)?;
     println!("Закреплено: {}", pins.iter().map(|p| p.title.as_str()).collect::<Vec<_>>().join(", "));
     let lists = api::playlists(&uid, &token)?;

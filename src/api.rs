@@ -490,6 +490,62 @@ pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
     parse_artist(result(&v)).ok_or_else(|| "Яндекс не прислал исполнителя".to_string())
 }
 
+/// Что нашёл смешанный поиск.
+#[derive(Clone, Debug, Default)]
+pub struct Found {
+    pub tracks: Vec<Track>,
+    pub albums: Vec<Card>,
+    pub artists: Vec<Card>,
+    pub playlists: Vec<Playlist>,
+    /// Яндекс исправил опечатку и искал вот это.
+    pub corrected: Option<String>,
+}
+
+fn parse_found(v: &Value) -> Found {
+    let mut found = Found { corrected: v["text"].as_str().filter(|_| v["misspellCorrected"].as_bool() == Some(true)).map(str::to_string), ..Found::default() };
+    for item in v["results"].as_array().into_iter().flatten() {
+        match item["type"].as_str() {
+            Some("track") => found.tracks.extend(parse_track(&item["track"])),
+            Some("album") => found.albums.extend(album_card(&item["album"])),
+            Some("artist") => found.artists.extend(artist_card(&item["artist"])),
+            Some("playlist") => {
+                let owner = id_text(&item["playlist"]["uid"]).unwrap_or_default();
+                found.playlists.extend(parse_playlist(&item["playlist"], &owner));
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// `types` — что искать через запятую: track, album, artist, playlist.
+pub fn search_mixed(text: &str, types: &str, page_size: u32, token: &str) -> Result<Found, String> {
+    let size = page_size.to_string();
+    let v = get("search/instant/mixed", &[("text", text), ("type", types), ("page", "0"), ("pageSize", &size)], token)?;
+    Ok(parse_found(result(&v)))
+}
+
+/// Альбомы и исполнители, которые нравятся пользователю.
+pub fn liked_pages(uid: &str, token: &str) -> Result<(Vec<Card>, Vec<Card>), String> {
+    let albums = get(&format!("users/{uid}/likes/albums"), &[("rich", "true")], token)?;
+    let artists = get(&format!("users/{uid}/likes/artists"), &[("with-timestamps", "false")], token)?;
+    Ok((parse_cards(result(&albums), |item| album_card(&item["album"])), parse_cards(result(&artists), artist_card)))
+}
+
+/// `kind` — albums или artists, `param` — album-id или artist-id.
+fn set_page_liked(uid: &str, kind: &str, param: &str, id: &str, liked: bool, token: &str) -> Result<(), String> {
+    let path = if liked { format!("users/{uid}/likes/{kind}/add?{param}={id}") } else { format!("users/{uid}/likes/{kind}/{id}/remove") };
+    post(&path, "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
+}
+
+pub fn set_album_liked(uid: &str, id: &str, liked: bool, token: &str) -> Result<(), String> {
+    set_page_liked(uid, "albums", "album-id", id, liked, token)
+}
+
+pub fn set_artist_liked(uid: &str, id: &str, liked: bool, token: &str) -> Result<(), String> {
+    set_page_liked(uid, "artists", "artist-id", id, liked, token)
+}
+
 pub const MY_WAVE: &str = WAVE_SEED;
 
 pub fn wave_new(seeds: &[String], token: &str) -> Result<Wave, String> {
@@ -588,6 +644,21 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_mixed_search() {
+        let v: Value = serde_json::from_str(r#"{"misspellCorrected":true,"text":"нойз","results":[
+            {"type":"artist","artist":{"id":"1","name":"Имя"}},
+            {"type":"track","track":{"id":"2","title":"Т","durationMs":1000}},
+            {"type":"album","album":{"id":3,"title":"А"}},
+            {"type":"playlist","playlist":{"uid":7,"kind":8,"title":"П","trackCount":2}},
+            {"type":"clip","clip":{}}]}"#).unwrap();
+        let found = parse_found(&v);
+        assert_eq!((found.tracks.len(), found.albums.len(), found.artists.len()), (1, 1, 1));
+        assert_eq!((found.playlists[0].owner.as_str(), found.playlists[0].kind.as_str()), ("7", "8"));
+        assert_eq!(found.corrected.as_deref(), Some("нойз"));
+        assert!(parse_found(&serde_json::json!({"misspellCorrected":false,"text":"а"})).corrected.is_none());
+    }
 
     #[test]
     fn parses_artist_page_and_album() {
