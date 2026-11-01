@@ -3,6 +3,7 @@
 //! Те же запросы делает оригинальный клиент. Данные приложения общеизвестны, их используют
 //! открытые клиенты (MarshalX/yandex-music-api).
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -666,6 +667,76 @@ pub fn home(tab: usize, token: &str) -> Result<Home, String> {
     Ok(Home { tabs: names, blocks })
 }
 
+/// Значение для адреса или формы.
+fn encode(text: &str) -> String {
+    text.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+pub fn create_playlist(uid: &str, title: &str, token: &str) -> Result<Playlist, String> {
+    let v = post(&format!("users/{uid}/playlists/create?visibility=private&title={}", encode(title)), "application/x-www-form-urlencoded", String::new(), token)?;
+    parse_playlist(result(&v), uid).ok_or_else(|| "Яндекс не создал плейлист".to_string())
+}
+
+pub fn rename_playlist(uid: &str, kind: &str, title: &str, token: &str) -> Result<(), String> {
+    post(&format!("users/{uid}/playlists/{kind}/name?value={}", encode(title)), "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
+}
+
+pub fn delete_playlist(uid: &str, kind: &str, token: &str) -> Result<(), String> {
+    post(&format!("users/{uid}/playlists/{kind}/delete"), "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
+}
+
+fn change_playlist(uid: &str, kind: &str, diff: &Value, revision: u64, token: &str) -> Result<(), String> {
+    let body = format!("diff={}&revision={revision}", encode(&diff.to_string()));
+    post(&format!("users/{uid}/playlists/{kind}/change-relative"), "application/x-www-form-urlencoded", body, token).map(|_| ())
+}
+
+fn track_ref(id: &str, album: Option<&str>) -> Value {
+    match album {
+        Some(album) => json!({ "id": id, "albumId": album }),
+        None => json!({ "id": id }),
+    }
+}
+
+/// Плейлист меняют от его последней версии, поэтому она читается перед каждым изменением.
+fn playlist_state(uid: &str, kind: &str, token: &str) -> Result<Value, String> {
+    let v = get(&format!("users/{uid}/playlists/{kind}"), &[("rich-tracks", "true")], token)?;
+    Ok(result(&v).clone())
+}
+
+pub fn add_to_playlist(uid: &str, kind: &str, track: &Track, token: &str) -> Result<(), String> {
+    let state = playlist_state(uid, kind, token)?;
+    let diff = json!([{ "op": "insert", "at": 0, "tracks": [track_ref(&track.id, track.album.as_deref())] }]);
+    change_playlist(uid, kind, &diff, state["revision"].as_u64().unwrap_or(0), token)
+}
+
+pub fn remove_from_playlist(uid: &str, kind: &str, track: &Track, token: &str) -> Result<(), String> {
+    let state = playlist_state(uid, kind, token)?;
+    let position = state["tracks"].as_array().into_iter().flatten().position(|item| id_text(&item["track"]["id"]).or_else(|| id_text(&item["id"])).as_deref() == Some(track.id.as_str())).ok_or("Трека уже нет в плейлисте")?;
+    let diff = json!([{ "op": "delete", "from": position, "to": position + 1, "tracks": [track_ref(&track.id, track.album.as_deref())] }]);
+    change_playlist(uid, kind, &diff, state["revision"].as_u64().unwrap_or(0), token)
+}
+
+/// Последние прослушанные треки, новые сначала и без повторов.
+fn parse_history(v: &Value) -> Vec<String> {
+    let mut seen = HashSet::new();
+    v["historyTabs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|tab| tab["items"].as_array().into_iter().flatten())
+        .flat_map(|item| item["tracks"].as_array().into_iter().flatten())
+        .filter_map(|track| id_text(&track["data"]["itemId"]["trackId"]))
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
+}
+
+pub fn history(limit: usize, token: &str) -> Result<Vec<Track>, String> {
+    let v = get("music-history", &[("fullModelsCount", "0")], token)?;
+    let mut ids = parse_history(result(&v));
+    ids.truncate(limit);
+    tracks_by_ids(&ids, token)
+}
+
 pub const MY_WAVE: &str = WAVE_SEED;
 
 pub fn wave_new(seeds: &[String], token: &str) -> Result<Wave, String> {
@@ -764,6 +835,15 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encodes_titles_and_reads_history() {
+        assert_eq!(encode("а b&c"), "%D0%B0%20b%26c");
+        let v = json!({"historyTabs":[
+            {"items":[{"tracks":[{"data":{"itemId":{"trackId":"1"}}},{"data":{"itemId":{"trackId":"2"}}}]}]},
+            {"items":[{"tracks":[{"data":{"itemId":{"trackId":"1"}}},{"data":{}},{"data":{"itemId":{"trackId":"3"}}}]}]}]});
+        assert_eq!(parse_history(&v), ["1", "2", "3"]);
+    }
 
     #[test]
     fn splits_artists_of_uploaded_tracks() {
