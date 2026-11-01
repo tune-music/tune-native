@@ -107,17 +107,16 @@ pub fn ghost(_: &Theme, status: button::Status) -> button::Style {
 /// Пункт боковой панели: в оригинале это текст без подложки.
 pub fn nav(_: &Theme, status: button::Status) -> button::Style {
     match status {
-        button::Status::Hovered | button::Status::Pressed => flat(Some(CONTROL), TEXT, 24.0),
-        button::Status::Active | button::Status::Disabled => flat(None, TEXT, 24.0),
+        button::Status::Pressed => flat(Some(CONTROL), TEXT, 24.0),
+        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(None, TEXT, 24.0),
     }
 }
 
 /// Строка трека, карточка и другие большие области.
 pub fn row(_: &Theme, status: button::Status) -> button::Style {
     match status {
-        button::Status::Hovered => flat(Some(CONTROL), TEXT, 8.0),
-        button::Status::Pressed => flat(Some(CONTROL_HOVER), TEXT, 8.0),
-        button::Status::Active | button::Status::Disabled => flat(None, TEXT, 8.0),
+        button::Status::Pressed => flat(Some(CONTROL), TEXT, 8.0),
+        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(None, TEXT, 8.0),
     }
 }
 
@@ -190,9 +189,8 @@ pub fn chip(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
 /// Карточка альбома, исполнителя, плейлиста: подсвечивается при наведении.
 pub fn card(_: &Theme, status: button::Status) -> button::Style {
     match status {
-        button::Status::Hovered => flat(Some(CONTROL), TEXT, 12.0),
-        button::Status::Pressed => flat(Some(CONTROL_HOVER), TEXT, 12.0),
-        button::Status::Active | button::Status::Disabled => flat(None, TEXT, 12.0),
+        button::Status::Pressed => flat(Some(CONTROL), TEXT, 12.0),
+        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(None, TEXT, 12.0),
     }
 }
 

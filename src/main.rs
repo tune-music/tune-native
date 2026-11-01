@@ -2,6 +2,7 @@
 
 mod api;
 mod fonts;
+mod glow;
 mod login;
 mod media;
 mod player;
@@ -15,12 +16,13 @@ use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::ops::Range;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iced::futures::channel::{mpsc, oneshot};
 use iced::widget::text::Wrapping;
 use iced::keyboard;
 use iced::widget::{button, canvas, column, container, image, mouse_area, operation, row, scrollable, slider, stack, text, text_input, Id, Space};
+use glow::glow;
 use iced::{event, mouse, time, window, Alignment, Event, Element, Length, Padding, Size, Subscription, Task};
 
 use api::{Album, Artist, Card, Found, Home, HomeBlock, HomeItem, Pin, PinTarget, Playlist, Profile, Source, Track, Wave, NEED_LOGIN};
@@ -62,6 +64,11 @@ const ROW: f32 = 58.0;
 /// Сколько строк держать готовыми за краем экрана.
 const ROW_MARGIN: usize = 6;
 const LIST: &str = "list";
+/// Сколько исполнителей проверить, когда страницу ищем по имени.
+const ARTIST_SEARCH: u32 = 5;
+/// Длительность появления страницы и выезда очереди, в секундах.
+const PAGE_FADE: f32 = 0.16;
+const QUEUE_SLIDE: f32 = 0.18;
 const WAVE_CARD: &str = "wave:";
 /// Сколько треков показать в блоке главной.
 const HOME_TRACKS: usize = 5;
@@ -319,6 +326,11 @@ struct App {
     /// Выбор качества открыт в этой точке.
     quality_menu: Option<(f32, f32)>,
     queue_open: bool,
+    /// Насколько выехала панель очереди, от 0 до 1.
+    queue_shown: f32,
+    /// Что ещё закрывает новую страницу, от 1 до 0.
+    page_veil: f32,
+    last_frame: Option<Instant>,
     queue_offset: f32,
     error: Option<String>,
     preview: Option<Preview>,
@@ -356,6 +368,8 @@ enum Message {
     AlbumOpen(String, String),
     AlbumLoaded(String, Result<(Album, Vec<Track>), String>),
     ArtistOpen(String),
+    ArtistByName(String),
+    ArtistFound(String, Result<Found, String>),
     ArtistLoad(String),
     ArtistLoaded(String, Result<Artist, String>),
     ArtistTracks,
@@ -365,6 +379,7 @@ enum Message {
     QualityOpen,
     QualitySet(Quality),
     QueueToggle,
+    Frame(Instant),
     QueueScrolled(f32),
     QueuePlay(usize),
     QueueRemove(usize),
@@ -389,7 +404,6 @@ enum Message {
     PlayLast(Track),
     TrackWave(Track),
     OpenAlbum(Track),
-    OpenArtist(Track),
     CopyLink(Track),
     NoticeClear(u64),
     WindowReady(Option<isize>),
@@ -486,12 +500,24 @@ impl App {
             codec: None,
             quality_menu: None,
             queue_open: false,
+            queue_shown: 0.0,
+            page_veil: 0.0,
+            last_frame: None,
             queue_offset: 0.0,
             error,
             preview,
         };
         app.apply_volume();
         (app, Task::batch([task, window_handle(), window::latest().then(|id| id.map_or(Task::none(), window::size)).map(Message::WindowSize)]))
+    }
+
+    /// Выезд панели: быстро в начале и мягко в конце.
+    fn queue_slide(&self) -> f32 {
+        1.0 - (1.0 - self.queue_shown).powi(2)
+    }
+
+    fn animating(&self) -> bool {
+        self.page_veil > 0.0 || self.queue_shown != if self.queue_open { 1.0 } else { 0.0 }
     }
 
     fn queue_width(&self) -> f32 {
@@ -502,7 +528,7 @@ impl App {
     /// Сколько места занимает основная часть окна между панелью и очередью.
     fn main_width(&self) -> f32 {
         let (width, _) = *WINDOW.lock().unwrap();
-        width - SIDEBAR - 12.0 - if self.queue_open { self.queue_width() + 12.0 } else { 0.0 }
+        width - SIDEBAR - 12.0 - self.queue_slide() * (self.queue_width() + 12.0)
     }
 
     fn apply_volume(&self) {
@@ -549,7 +575,7 @@ impl App {
 
     /// Какие строки панели очереди сейчас строятся.
     fn queue_rows(&self) -> Range<usize> {
-        if self.queue_open {
+        if self.queue_shown > 0.0 {
             visible_rows(self.queue_offset, WINDOW.lock().unwrap().1, self.queue.len())
         } else {
             0..0
@@ -653,6 +679,7 @@ impl App {
         self.retry = None;
         self.unshuffled = None;
         self.queue_open = false;
+        self.queue_shown = 0.0;
         self.quality_menu = None;
         self.codec = None;
         self.uid = None;
@@ -937,6 +964,21 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if let Message::Frame(now) = message {
+            let elapsed = self.last_frame.map_or(0.0, |last| now.duration_since(last).as_secs_f32());
+            self.last_frame = Some(now).filter(|_| self.animating());
+            self.page_veil = (self.page_veil - elapsed / PAGE_FADE).max(0.0);
+            let delta = elapsed / QUEUE_SLIDE;
+            let sliding = self.queue_shown < 1.0;
+            self.queue_shown = if self.queue_open { (self.queue_shown + delta).min(1.0) } else { (self.queue_shown - delta).max(0.0) };
+            // Панель доехала: список появился, теперь его можно прокрутить к играющему.
+            let scroll = if sliding && self.queue_shown >= 1.0 {
+                operation::scroll_to(Id::new(QUEUE_LIST), scrollable::AbsoluteOffset { x: 0.0, y: self.queue_offset })
+            } else {
+                Task::none()
+            };
+            return Task::batch([scroll, self.visible_covers()]);
+        }
         let place = self.list_place();
         let task = self.handle(message);
         // Другой список открывается с начала.
@@ -944,6 +986,7 @@ impl App {
             Task::none()
         } else {
             self.list_offset = 0.0;
+            self.page_veil = 1.0;
             operation::snap_to(Id::new(LIST), scrollable::RelativeOffset::START)
         };
         // Лайки догружаются, когда до конца загруженного остаётся немного.
@@ -1241,6 +1284,19 @@ impl App {
                 self.artist = None;
                 return self.handle(Message::ArtistLoad(id));
             }
+            Message::ArtistByName(name) => {
+                self.menu = None;
+                let Some(token) = self.token() else { return Task::none() };
+                let wanted = name.clone();
+                return Task::perform(background(move || api::search_mixed(&name, SearchTab::Artists.types(), ARTIST_SEARCH, &token)), move |r| Message::ArtistFound(wanted.clone(), r));
+            }
+            Message::ArtistFound(name, result) => match result {
+                Ok(found) => match pick_artist(&found.artists, &name) {
+                    Some(id) => return self.update(Message::ArtistOpen(id)),
+                    None => return self.notify(format!("Исполнитель {name} не найден")),
+                },
+                Err(e) => return self.fail(e),
+            },
             Message::ArtistLoad(id) => {
                 let Some(token) = self.token() else { return Task::none() };
                 self.error = None;
@@ -1382,6 +1438,7 @@ impl App {
                         }
                         if matches!(self.preview, Some(Preview::WaveQueue)) {
                             self.queue_open = true;
+                            self.queue_shown = 1.0;
                         }
                         if matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveQueue)) {
                             self.preview = None;
@@ -1475,7 +1532,6 @@ impl App {
                 self.queue_open = !self.queue_open;
                 if self.queue_open {
                     self.queue_offset = (self.current.unwrap_or(0) as f32 * ROW - QUEUE_ABOVE).max(0.0);
-                    return operation::scroll_to(Id::new(QUEUE_LIST), scrollable::AbsoluteOffset { x: 0.0, y: self.queue_offset });
                 }
             }
             Message::QueueScrolled(offset) => self.queue_offset = offset,
@@ -1559,12 +1615,6 @@ impl App {
                 self.menu = None;
                 if let Some(album) = &track.album {
                     return self.open_list(Playlist::album(album, &track.album_title));
-                }
-            }
-            Message::OpenArtist(track) => {
-                self.menu = None;
-                if let Some(artist) = track.artist_id.clone() {
-                    return self.update(Message::ArtistOpen(artist));
                 }
             }
             Message::CopyLink(track) => {
@@ -1697,6 +1747,8 @@ impl App {
             }
             Message::Seeked(Err(e)) => self.error = Some(e),
             Message::Seeked(Ok(())) => {}
+            // Кадры обрабатывает update.
+            Message::Frame(_) => {}
             Message::Volume(volume) => {
                 self.volume = volume;
                 self.muted = false;
@@ -1714,11 +1766,12 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        match &self.screen {
+        let ticks = match &self.screen {
             Screen::Main(_) if self.active => time::every(TICK).map(|_| Message::Tick),
             _ => Subscription::none(),
-        }
-        .pipe_media()
+        };
+        let frames = if self.animating() { window::frames().map(Message::Frame) } else { Subscription::none() };
+        Subscription::batch([ticks, frames]).pipe_media()
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -1755,6 +1808,14 @@ impl App {
             Section::Artists => self.view_card_page("Исполнители", &self.liked_artists, ARTIST_COVER, true, "Здесь появятся исполнители, которые вам понравились"),
             Section::Search => self.view_search(),
         };
+        // Вместо затухания самой страницы её на миг закрывает фон и плавно уходит.
+        let page: Element<'_, Message> = if self.page_veil > 0.0 {
+            let back = if self.section == Section::Wave { ui::BLACK } else { ui::CONTENT };
+            let veil = iced::Color { a: self.page_veil, ..back };
+            stack![page, container(Space::new()).width(Length::Fill).height(Length::Fill).style(move |_| container::Style::default().background(veil))].into()
+        } else {
+            page
+        };
         let mut page = column![page].spacing(12).height(Length::Fill);
         if let Some(error) = &self.error {
             let mut line = row![text(error).color(ui::DANGER)].spacing(12).align_y(Alignment::Center);
@@ -1774,8 +1835,11 @@ impl App {
             container(main).padding(Padding::ZERO.right(12).bottom(12)).width(Length::Fill).height(Length::Fill).into()
         };
         let mut columns = row![self.view_sidebar(), main];
-        if self.queue_open {
-            columns = columns.push(container(self.view_queue()).padding(Padding::ZERO.right(12).bottom(12)));
+        if self.queue_shown > 0.0 {
+            let width = self.queue_slide() * (self.queue_width() + 12.0);
+            // Пока панель едет, в ней пусто: текст нельзя раскладывать в почти нулевую ширину.
+            let panel: Element<'_, Message> = if self.queue_shown >= 1.0 { self.view_queue() } else { container(Space::new()).width(Length::Fill).height(Length::Fill).style(ui::content).into() };
+            columns = columns.push(container(container(panel).padding(Padding::ZERO.right(12).bottom(12))).width(width).height(Length::Fill).clip(true));
         }
         let base = container(columns).width(Length::Fill).height(Length::Fill).style(ui::root);
         let mut layers = stack![base];
@@ -1811,7 +1875,7 @@ impl App {
                 .on_press(message)
         };
         if self.menu_artists {
-            let items = track.artist_list.iter().fold(column![], |items, (name, id)| items.push(item(ui::ARTIST, name.as_str(), Message::ArtistOpen(id.clone()))));
+            let items = track.artist_list.iter().fold(column![], |items, (name, id)| items.push(item(ui::ARTIST, name.as_str(), artist_message(name, id))));
             return popup(items.into(), x, y, MENU_WIDTH, track.artist_list.len() as f32 * MENU_ITEM);
         }
         let liked = self.liked_set.contains(&track.id);
@@ -1828,11 +1892,11 @@ impl App {
             items = items.push(item(ui::ALBUM, "Перейти к альбому", Message::OpenAlbum(track.clone())));
             count += 1.0;
         }
-        if track.artist_id.is_some() {
+        if let Some((name, id)) = track.artist_list.first() {
             items = items.push(if track.artist_list.len() > 1 {
                 item(ui::ARTIST, "Перейти к исполнителям", Message::MenuArtists)
             } else {
-                item(ui::ARTIST, "Перейти к исполнителю", Message::OpenArtist(track.clone()))
+                item(ui::ARTIST, "Перейти к исполнителю", artist_message(name, id))
             });
             count += 1.0;
         }
@@ -1890,7 +1954,7 @@ impl App {
             if !current {
                 line = line.push(button(ui::icon(ui::CLOSE, 16.0, ui::MUTED)).padding(6).style(ui::ghost).on_press(Message::QueueRemove(index)));
             }
-            list = list.push(mouse_area(button(line).width(Length::Fill).height(ROW).padding([8, 8]).style(ui::row).on_press(Message::QueuePlay(index))).on_right_press(Message::MenuOpen(track.clone())));
+            list = list.push(mouse_area(glow(button(line).width(Length::Fill).height(ROW).padding([8, 8]).style(ui::row).on_press(Message::QueuePlay(index)), 8.0)).on_right_press(Message::MenuOpen(track.clone())));
         }
         list = list.push(Space::new().height((self.queue.len() - range.end) as f32 * ROW));
         let list = scrollable(list).id(QUEUE_LIST).on_scroll(|viewport| Message::QueueScrolled(viewport.absolute_offset().y)).height(Length::Fill);
@@ -1918,11 +1982,14 @@ impl App {
         };
         let item = |icon, label, section| {
             let tint = if opened == section { ui::TEXT } else { ui::MUTED };
-            button(row![ui::icon(icon, 24.0, tint), text(label).color(tint)].spacing(12).align_y(Alignment::Center))
-                .width(Length::Fill)
-                .padding(Padding::new(12.0).right(24))
-                .style(ui::nav)
-                .on_press(Message::Open(section))
+            glow(
+                button(row![ui::icon(icon, 24.0, tint), text(label).color(tint)].spacing(12).align_y(Alignment::Center))
+                    .width(Length::Fill)
+                    .padding(Padding::new(12.0).right(24))
+                    .style(ui::nav)
+                    .on_press(Message::Open(section)),
+                24.0,
+            )
         };
         let mut account = column![text(self.profile.as_ref().map_or("", |p| p.name.as_str())).size(14).font(ui::font_medium()).color(ui::TEXT).wrapping(Wrapping::None)].clip(true).width(Length::Fill);
         if self.profile.as_ref().is_some_and(|p| p.plus) {
@@ -1982,7 +2049,7 @@ impl App {
                 ]
                 .spacing(10)
                 .align_y(Alignment::Center);
-                list.push(button(line).width(Length::Fill).padding(6).style(ui::row).on_press(Message::PinOpen(index)))
+                list.push(glow(button(line).width(Length::Fill).padding(6).style(ui::row).on_press(Message::PinOpen(index)), 8.0))
             })
             .into()
     }
@@ -1991,7 +2058,7 @@ impl App {
     fn block_title<'a>(&self, title: &'a str, section: Section) -> Element<'a, Message> {
         button(row![text(title).size(24).font(ui::font_headline()).color(ui::TEXT), ui::icon(ui::CHEVRON, 24.0, ui::MUTED)].spacing(6).align_y(Alignment::Center))
             .padding([4, 8])
-            .style(ui::card)
+            .style(ui::ghost)
             .on_press(Message::Open(section))
             .into()
     }
@@ -2094,6 +2161,7 @@ impl App {
         .padding(8)
         .style(ui::card)
         .on_press(Message::Open(Section::Likes));
+        let likes = glow(likes, 12.0);
 
         // Первые восемь треков в две колонки.
         let column_of = |range: std::ops::Range<usize>| {
@@ -2150,7 +2218,7 @@ impl App {
             .spacing(6)
             .width(CARD)
             .clip(true);
-            cards.push(button(card).padding(8).style(ui::card).on_press(Message::ListOpen(playlist.clone())))
+            cards.push(glow(button(card).padding(8).style(ui::card).on_press(Message::ListOpen(playlist.clone())), 12.0))
         });
         cards.wrap().into()
     }
@@ -2299,7 +2367,7 @@ impl App {
             None => container(Space::new()).width(CARD).height(CARD).style(if round { ui::avatar } else { ui::tile }).into(),
         };
         let body = column![cover, text(title).font(ui::font_medium()).color(ui::TEXT).wrapping(Wrapping::None), text(subtitle).size(13).color(ui::MUTED).wrapping(Wrapping::None)].spacing(6).width(CARD).clip(true);
-        button(body).padding(8).style(ui::card).on_press(Message::HomeOpen(item.clone())).into()
+        glow(button(body).padding(8).style(ui::card).on_press(Message::HomeOpen(item.clone())), 12.0)
     }
 
     /// Шапка альбома и исполнителя: обложка, название, подписи и кнопки.
@@ -2362,7 +2430,7 @@ impl App {
                     None => container(Space::new()).width(CARD).height(CARD).style(if round { ui::avatar } else { ui::tile }).into(),
                 };
                 let body = column![cover, text(&card.title).font(ui::font_medium()).color(ui::TEXT).wrapping(Wrapping::None), text(&card.subtitle).size(13).color(ui::MUTED)].spacing(6).width(CARD).clip(true);
-                line.push(button(body).padding(8).style(ui::card).on_press(open(card)))
+                line.push(glow(button(body).padding(8).style(ui::card).on_press(open(card)), 12.0))
             })
             .wrap()
             .into()
@@ -2444,7 +2512,7 @@ impl App {
             line = line.push(text(clock(track.duration)).color(ui::MUTED));
         }
         let line = line.push(self.more_button(track, 18.0));
-        mouse_area(button(line).width(Length::Fill).height(ROW).padding([8, 8]).style(ui::row).on_press(play)).on_right_press(Message::MenuOpen(track.clone())).into()
+        mouse_area(glow(button(line).width(Length::Fill).height(ROW).padding([8, 8]).style(ui::row).on_press(play), 8.0)).on_right_press(Message::MenuOpen(track.clone())).into()
     }
 
     fn like_button<'a>(&self, track: &Track, size: f32) -> Element<'a, Message> {
@@ -2587,11 +2655,25 @@ fn grouped(n: u64) -> String {
     out
 }
 
+/// Без номера страницу исполнителя придётся искать по имени.
+fn artist_message(name: &str, id: &str) -> Message {
+    if id.is_empty() {
+        Message::ArtistByName(name.to_string())
+    } else {
+        Message::ArtistOpen(id.to_string())
+    }
+}
+
+/// Сначала точное совпадение имени, иначе первый результат поиска.
+fn pick_artist(artists: &[Card], name: &str) -> Option<String> {
+    artists.iter().find(|a| a.title.to_lowercase() == name.to_lowercase()).or(artists.first()).map(|a| a.id.clone())
+}
+
 /// Все исполнители через запятую, каждый ведёт на свою страницу.
 fn artist_links<'a>(artists: &[(String, String)], size: f32, font: iced::Font, style: fn(&iced::Theme, button::Status) -> button::Style, comma: iced::Color) -> iced::widget::Row<'a, Message> {
     artists.iter().enumerate().fold(row![], |line, (index, (name, id))| {
-        let name = if index + 1 < artists.len() { format!("{name},") } else { name.clone() };
-        let line = line.push(button(text(name).size(size).font(font).wrapping(Wrapping::None)).padding(0).style(style).on_press(Message::ArtistOpen(id.clone())));
+        let label = if index + 1 < artists.len() { format!("{name},") } else { name.clone() };
+        let line = line.push(button(text(label).size(size).font(font).wrapping(Wrapping::None)).padding(0).style(style).on_press(artist_message(name, id)));
         if index + 1 < artists.len() {
             line.push(text(" ").size(size).color(comma))
         } else {
@@ -2888,6 +2970,15 @@ fn main() -> iced::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picks_artist_by_name() {
+        let card = |id: &str, title: &str| Card { id: id.to_string(), title: title.to_string(), subtitle: String::new(), cover: None };
+        let found = [card("1", "Lida Band"), card("2", "LIDA")];
+        assert_eq!(pick_artist(&found, "lida").as_deref(), Some("2"));
+        assert_eq!(pick_artist(&found, "другой").as_deref(), Some("1"));
+        assert_eq!(pick_artist(&[], "lida"), None);
+    }
 
     #[test]
     fn groups_digits() {

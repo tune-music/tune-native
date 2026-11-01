@@ -31,7 +31,6 @@ pub struct Track {
     pub cover: Option<String>,
     pub album: Option<String>,
     pub album_title: String,
-    pub artist_id: Option<String>,
     /// Имя и номер каждого исполнителя.
     pub artist_list: Vec<(String, String)>,
     /// Пачка волны, из которой пришёл трек.
@@ -208,6 +207,18 @@ fn parse_artist_list(v: &Value) -> Vec<(String, String)> {
     v.as_array().into_iter().flatten().filter_map(|a| Some((a["name"].as_str()?.to_string(), id_text(&a["id"])?))).collect()
 }
 
+/// У загруженных пользователем треков исполнители — одна строка «А, Б, В», а номер
+/// один на всех или его нет. Таких разбиваем по именам; пустой номер значит «искать по имени».
+fn parse_track_artists(v: &Value) -> Vec<(String, String)> {
+    if v["trackSource"].as_str() != Some("UGC") {
+        return parse_artist_list(&v["artists"]);
+    }
+    let line = v["artists"].as_array().into_iter().flatten().filter_map(|a| a["name"].as_str()).collect::<Vec<_>>().join(", ");
+    let names: Vec<&str> = line.split(", ").filter(|name| !name.is_empty()).collect();
+    let single = id_text(&v["artists"][0]["id"]).filter(|_| names.len() == 1);
+    names.into_iter().map(|name| (name.to_string(), single.clone().unwrap_or_default())).collect()
+}
+
 fn parse_track(v: &Value) -> Option<Track> {
     let id = match &v["id"] {
         Value::String(s) => s.clone(),
@@ -223,8 +234,7 @@ fn parse_track(v: &Value) -> Option<Track> {
         cover: v["coverUri"].as_str().filter(|c| !c.is_empty()).map(str::to_string),
         album: v["albums"][0]["id"].as_u64().map(|a| a.to_string()),
         album_title: v["albums"][0]["title"].as_str().unwrap_or_default().to_string(),
-        artist_id: id_text(&v["artists"][0]["id"]),
-        artist_list: parse_artist_list(&v["artists"]),
+        artist_list: parse_track_artists(v),
         batch: None,
     })
 }
@@ -754,6 +764,18 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_artists_of_uploaded_tracks() {
+        let track = |json: &str| parse_track_artists(&serde_json::from_str(json).unwrap());
+        let names = |list: Vec<(String, String)>| list.into_iter().map(|(name, id)| format!("{name}={id}")).collect::<Vec<_>>();
+        assert_eq!(names(track(r#"{"trackSource":"UGC","artists":[{"id":"1","name":"А, Б"}]}"#)), ["А=", "Б="]);
+        assert_eq!(names(track(r#"{"trackSource":"UGC","artists":[{"name":"А, Б, В"}]}"#)), ["А=", "Б=", "В="]);
+        assert_eq!(names(track(r#"{"trackSource":"UGC","artists":[{"id":"1","name":"А"}]}"#)), ["А=1"]);
+        assert_eq!(names(track(r#"{"trackSource":"UGC","artists":[{"name":"А"}]}"#)), ["А="]);
+        // Обычный исполнитель с запятой в имени остаётся целым.
+        assert_eq!(names(track(r#"{"artists":[{"id":5,"name":"Tyler, The Creator"}]}"#)), ["Tyler, The Creator=5"]);
+    }
 
     #[test]
     fn parses_home_blocks() {
