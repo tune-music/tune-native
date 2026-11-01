@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::Sha256;
 
 const API: &str = "https://api.music.yandex.net";
@@ -19,6 +19,8 @@ const SIGN_KEY: &[u8] = b"kzqU4XhfCaY6B6JTHODeq5";
 const QUALITY: &str = "nq";
 const CODECS: [&str; 5] = ["mp3", "aac", "aac-mp4", "he-aac", "he-aac-mp4"];
 const TRANSPORT: &str = "encraw";
+const WAVE_SEED: &str = "user:onyourwave";
+const FROM: &str = "tune-native";
 
 /// Ошибка: токен отозвали или он истёк.
 pub const NEED_LOGIN: &str = "NEED_LOGIN";
@@ -30,6 +32,25 @@ pub struct Track {
     pub artists: String,
     pub duration: Duration,
     pub cover: Option<String>,
+    pub album: Option<String>,
+    /// Пачка волны, из которой пришёл трек.
+    pub batch: Option<String>,
+}
+
+impl Track {
+    /// Так трек называют обратная связь и очередь волны: id:альбом.
+    pub fn full_id(&self) -> String {
+        match &self.album {
+            Some(album) => format!("{}:{album}", self.id),
+            None => self.id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Wave {
+    pub session: String,
+    pub tracks: Vec<Track>,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +149,36 @@ fn get(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, String>
     Ok(v)
 }
 
+fn post(path: &str, content_type: &str, body: String, token: &str) -> Result<Value, String> {
+    let resp = agent()
+        .post(format!("{API}/{path}"))
+        .header("Authorization", &format!("OAuth {token}"))
+        .header("X-Yandex-Music-Client", CLIENT)
+        .header("Content-Type", content_type)
+        .send(body)
+        .map_err(|e| format!("Не удалось связаться с Яндексом: {e}"))?;
+    let status = resp.status().as_u16();
+    if status == 401 {
+        return Err(NEED_LOGIN.into());
+    }
+    let body = resp.into_body().read_to_string().map_err(|e| e.to_string())?;
+    let v: Value = serde_json::from_str(&body).map_err(|_| format!("Яндекс ответил {status}"))?;
+    if status != 200 {
+        let name = v["error"]["name"].as_str().or(v["result"]["message"].as_str()).unwrap_or("ошибка");
+        return Err(format!("Яндекс ответил {status}: {name}"));
+    }
+    Ok(v)
+}
+
+/// Часть ответов лежит в result, часть — сразу в корне.
+fn result(v: &Value) -> &Value {
+    if v["result"].is_object() || v["result"].is_array() {
+        &v["result"]
+    } else {
+        v
+    }
+}
+
 fn parse_track(v: &Value) -> Option<Track> {
     let id = match &v["id"] {
         Value::String(s) => s.clone(),
@@ -141,12 +192,122 @@ fn parse_track(v: &Value) -> Option<Track> {
         artists,
         duration: Duration::from_millis(v["durationMs"].as_u64().unwrap_or(0)),
         cover: v["coverUri"].as_str().filter(|c| !c.is_empty()).map(str::to_string),
+        album: v["albums"][0]["id"].as_u64().map(|a| a.to_string()),
+        batch: None,
     })
 }
 
 pub fn search(text: &str, token: &str) -> Result<Vec<Track>, String> {
     let v = get("search", &[("text", text), ("type", "track"), ("page", "0")], token)?;
     Ok(v["result"]["tracks"]["results"].as_array().into_iter().flatten().filter_map(parse_track).collect())
+}
+
+pub fn account_uid(token: &str) -> Result<String, String> {
+    let v = get("account/status", &[], token)?;
+    let uid = &result(&v)["account"]["uid"];
+    uid.as_u64().map(|u| u.to_string()).ok_or("Яндекс не сообщил номер аккаунта".into())
+}
+
+/// Номера треков из «Мне нравится», сначала новые.
+pub fn liked_ids(uid: &str, token: &str) -> Result<Vec<String>, String> {
+    let v = get(&format!("users/{uid}/likes/tracks"), &[], token)?;
+    let tracks = result(&v)["library"]["tracks"].as_array().cloned().unwrap_or_default();
+    Ok(tracks
+        .iter()
+        .filter_map(|t| match &t["id"] {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Сведения о треках в том же порядке, что и номера.
+pub fn tracks_by_ids(ids: &[String], token: &str) -> Result<Vec<Track>, String> {
+    let body = format!("track-ids={}", ids.join("%2C"));
+    let v = post("tracks", "application/x-www-form-urlencoded", body, token)?;
+    let found: Vec<Track> = v["result"].as_array().into_iter().flatten().filter_map(parse_track).collect();
+    Ok(ids.iter().filter_map(|id| found.iter().find(|t| t.id == *id).cloned()).collect())
+}
+
+pub fn set_liked(uid: &str, track_id: &str, liked: bool, token: &str) -> Result<(), String> {
+    let path = if liked {
+        format!("users/{uid}/likes/tracks/add?track-id={track_id}")
+    } else {
+        format!("users/{uid}/likes/tracks/{track_id}/remove")
+    };
+    let v = post(&path, "application/x-www-form-urlencoded", String::new(), token)?;
+    if result(&v)["revision"].is_null() {
+        return Err("Яндекс не сохранил лайк".into());
+    }
+    Ok(())
+}
+
+fn parse_sequence(v: &Value) -> Vec<Track> {
+    let batch = v["batchId"].as_str().map(str::to_string);
+    v["sequence"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| parse_track(&item["track"]))
+        .map(|track| Track { batch: batch.clone(), ..track })
+        .collect()
+}
+
+pub fn wave_new(token: &str) -> Result<Wave, String> {
+    let body = json!({ "seeds": [WAVE_SEED], "includeTracksInResponse": true, "allowExplicit": true }).to_string();
+    let v = post("rotor/session/new", "application/json", body, token)?;
+    let v = result(&v);
+    let session = v["radioSessionId"].as_str().ok_or("Яндекс не запустил волну")?;
+    Ok(Wave { session: session.to_string(), tracks: parse_sequence(v) })
+}
+
+/// Следующая пачка волны; `queue` — уже показанные треки.
+pub fn wave_more(session: &str, queue: &[String], token: &str) -> Result<Vec<Track>, String> {
+    let body = json!({ "queue": queue, "allowExplicit": true }).to_string();
+    let v = post(&format!("rotor/session/{session}/tracks"), "application/json", body, token)?;
+    Ok(parse_sequence(result(&v)))
+}
+
+/// Время в UTC, как у toISOString в оригинале.
+fn timestamp(unix_ms: u64) -> String {
+    let (secs, ms) = (unix_ms / 1000, unix_ms % 1000);
+    // Дни от 1970 в дату: алгоритм civil_from_days.
+    let z = (secs / 86400) as i64 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let rest = secs % 86400;
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{ms:03}Z", rest / 3600, rest / 60 % 60, rest % 60)
+}
+
+fn now() -> String {
+    timestamp(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64))
+}
+
+/// Что волна узнаёт о вкусе: запуск, начало, конец, пропуск, лайк.
+pub fn wave_feedback(session: &str, kind: &str, track: Option<&Track>, played: Option<f32>, token: &str) -> Result<(), String> {
+    let mut event = json!({ "type": kind, "timestamp": now() });
+    let mut body = json!({ "from": FROM });
+    match track {
+        Some(track) => {
+            event["trackId"] = json!(track.full_id());
+            if let Some(batch) = &track.batch {
+                body["batchId"] = json!(batch);
+            }
+            if let Some(played) = played {
+                event["totalPlayedSeconds"] = json!(played);
+            }
+        }
+        None => event["from"] = json!(FROM),
+    }
+    body["event"] = event;
+    post(&format!("rotor/session/{session}/feedback/"), "application/json", body.to_string(), token).map(|_| ())
 }
 
 fn sign(data: &str) -> String {
@@ -189,6 +350,20 @@ pub fn cover(uri: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_is_iso() {
+        assert_eq!(timestamp(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(timestamp(1_709_210_096_789), "2024-02-29T12:34:56.789Z");
+    }
+
+    #[test]
+    fn sequence_keeps_batch_and_album() {
+        let v: Value = serde_json::from_str(r#"{"batchId":"b","sequence":[{"track":{"id":"7","title":"T","albums":[{"id":9}]}}]}"#).unwrap();
+        let tracks = parse_sequence(&v);
+        assert_eq!(tracks[0].full_id(), "7:9");
+        assert_eq!(tracks[0].batch.as_deref(), Some("b"));
+    }
 
     #[test]
     fn sign_drops_last_char() {

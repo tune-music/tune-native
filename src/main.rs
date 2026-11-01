@@ -4,16 +4,17 @@ mod api;
 mod player;
 mod ui;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iced::futures::channel::oneshot;
+use iced::futures::channel::{mpsc, oneshot};
 use iced::widget::text::Wrapping;
 use iced::widget::{button, column, container, image, operation, row, scrollable, slider, text, text_input, Id, Space};
-use iced::{time, window, Alignment, Element, Length, Size, Subscription, Task};
+use iced::{time, window, Alignment, Element, Length, Padding, Size, Subscription, Task};
 
-use api::{DeviceCode, Track, NEED_LOGIN};
+use api::{DeviceCode, Track, Wave, NEED_LOGIN};
 use player::Player;
 
 const LOGIN_POLL: Duration = Duration::from_secs(5);
@@ -22,9 +23,17 @@ const COVER: f32 = 40.0;
 const BAR_COVER: f32 = 56.0;
 const SIDEBAR: f32 = 200.0;
 const NUMBER: f32 = 28.0;
-/// Место под полосу прокрутки, чтобы колонка времени в заголовке совпала со строками.
-const LIST_GUTTER: f32 = 5.0;
+const LIKE: f32 = 30.0;
+/// Постоянное место под полосу прокрутки: колонка времени не прыгает на коротких списках.
+const SCROLLBAR: f32 = 14.0;
+/// Сдвиг заголовка, чтобы «Время» совпало с колонкой в строках.
+const LIST_GUTTER: f32 = 2.0;
 const SEARCH_INPUT: &str = "search";
+const COVER_WORKERS: usize = 6;
+const LIKES_PAGE: usize = 100;
+/// Сколько треков до конца очереди оставить, прежде чем просить у волны новые.
+const WAVE_MARGIN: usize = 2;
+const WAVE_HISTORY: usize = 50;
 
 /// Блокирующая работа в отдельном потоке, чтобы не останавливать интерфейс.
 fn background<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> impl Future<Output = T> {
@@ -40,17 +49,44 @@ enum Screen {
     Main(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Section {
+    Wave,
+    Likes,
+    Search,
+}
+
+/// Запуск с готовым разделом: первый трек показывается в плеере, но не играет.
+#[derive(Clone)]
+enum Preview {
+    Wave,
+    Likes,
+    Search(String),
+}
+
 struct App {
     screen: Screen,
+    section: Section,
     query: String,
-    tracks: Vec<Track>,
-    /// Что играет: новый поиск не прерывает музыку.
-    queue: Vec<Track>,
-    play_id: u64,
-    covers: HashMap<String, image::Handle>,
+    results: Vec<Track>,
     searching: bool,
     search_id: u64,
+    uid: Option<String>,
+    liked_ids: Vec<String>,
+    liked_set: HashSet<String>,
+    liked: Vec<Track>,
+    likes_loading: bool,
+    covers: HashMap<String, image::Handle>,
     player: Option<Player>,
+    /// Что играет: смена раздела и новый поиск не прерывают музыку.
+    queue: Vec<Track>,
+    /// Сессия волны, если очередь — это волна.
+    wave: Option<String>,
+    /// В очереди треки волны. В режиме просмотра они есть и без сессии.
+    wave_queue: bool,
+    wave_loading: bool,
+    wave_fetching: bool,
+    play_id: u64,
     current: Option<usize>,
     /// Трек запущен и ещё не доиграл.
     active: bool,
@@ -60,8 +96,7 @@ struct App {
     seeking: Option<f32>,
     volume: f32,
     error: Option<String>,
-    /// Запуск с готовым поиском: первый трек показывается в плеере, но не играет.
-    preview: bool,
+    preview: Option<Preview>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,12 +107,20 @@ enum Message {
     LoginChecked(Result<Option<String>, String>),
     LoginAgain,
     Logout,
-    FocusSearch,
+    Account(Result<(String, Vec<String>), String>),
+    Open(Section),
     Query(String),
     Search,
     Found(u64, Result<Vec<Track>, String>),
-    Cover(String, Option<Vec<u8>>),
-    Play(usize),
+    LikesMore,
+    LikesPage(Result<Vec<Track>, String>),
+    Like(Track),
+    LikeSaved(Track, bool, Result<(), String>),
+    WaveStart,
+    WaveStarted(Result<Wave, String>),
+    WaveMore(Result<Vec<Track>, String>),
+    Cover(String, Vec<u8>),
+    Play(Section, usize),
     Started(u64, Result<(), String>),
     Toggle,
     Next,
@@ -90,23 +133,36 @@ enum Message {
 }
 
 impl App {
-    fn new(preview: Option<String>) -> (Self, Task<Message>) {
+    fn new(preview: Option<Preview>) -> (Self, Task<Message>) {
         let (player, error) = match Player::new() {
             Ok(p) => (Some(p), None),
             Err(e) => (None, Some(e)),
         };
         let token = api::load_token();
-        let task = if token.is_none() { start_login() } else { Task::none() };
-        let mut app = Self {
+        let task = match &token {
+            Some(token) => load_account(token.clone()),
+            None => start_login(),
+        };
+        let app = Self {
             screen: token.map_or(Screen::Login(None), Screen::Main),
+            section: Section::Wave,
             query: String::new(),
-            tracks: Vec::new(),
-            queue: Vec::new(),
-            play_id: 0,
-            covers: HashMap::new(),
+            results: Vec::new(),
             searching: false,
             search_id: 0,
+            uid: None,
+            liked_ids: Vec::new(),
+            liked_set: HashSet::new(),
+            liked: Vec::new(),
+            likes_loading: false,
+            covers: HashMap::new(),
             player,
+            queue: Vec::new(),
+            wave: None,
+            wave_queue: false,
+            wave_loading: false,
+            wave_fetching: false,
+            play_id: 0,
             current: None,
             active: false,
             starting: false,
@@ -114,15 +170,10 @@ impl App {
             seeking: None,
             volume: 0.8,
             error,
-            preview: preview.is_some(),
+            preview,
         };
         if let Some(p) = &app.player {
             p.set_volume(app.volume);
-        }
-        if let Some(query) = preview {
-            app.query = query;
-            let search = app.update(Message::Search);
-            return (app, search);
         }
         (app, task)
     }
@@ -136,8 +187,7 @@ impl App {
 
     fn fail(&mut self, error: String) -> Task<Message> {
         if error == NEED_LOGIN {
-            api::logout();
-            self.screen = Screen::Login(None);
+            self.reset();
             self.error = Some("Вход устарел, войдите ещё раз".into());
             return start_login();
         }
@@ -145,11 +195,74 @@ impl App {
         Task::none()
     }
 
+    /// Выход из аккаунта: чужих данных в окне оставаться не должно.
+    fn reset(&mut self) {
+        if let Some(p) = &self.player {
+            p.stop();
+        }
+        api::logout();
+        self.screen = Screen::Login(None);
+        self.section = Section::Wave;
+        self.results.clear();
+        self.queue.clear();
+        self.liked.clear();
+        self.liked_ids.clear();
+        self.liked_set.clear();
+        self.covers.clear();
+        self.uid = None;
+        self.wave = None;
+        self.wave_queue = false;
+        self.current = None;
+        self.active = false;
+        self.starting = false;
+    }
+
+    /// Загружает обложки в несколько потоков, а не по потоку на трек: лайков бывают сотни.
+    fn fetch_covers(&self, tracks: &[Track]) -> Task<Message> {
+        let jobs: Vec<(String, String)> =
+            tracks.iter().filter(|t| !self.covers.contains_key(&t.id)).filter_map(|t| Some((t.id.clone(), t.cover.clone()?))).collect();
+        if jobs.is_empty() {
+            return Task::none();
+        }
+        let (tx, rx) = mpsc::unbounded();
+        let jobs = Arc::new(Mutex::new(jobs));
+        for _ in 0..COVER_WORKERS {
+            let (tx, jobs) = (tx.clone(), jobs.clone());
+            std::thread::spawn(move || loop {
+                let Some((id, uri)) = jobs.lock().unwrap().pop() else { break };
+                if let Some(bytes) = api::cover(&uri) {
+                    if tx.unbounded_send((id, bytes)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        Task::stream(rx).map(|(id, bytes)| Message::Cover(id, bytes))
+    }
+
+    /// Обложки остаются только у треков, которые видны или в очереди.
+    fn prune_covers(&mut self) {
+        let keep: HashSet<&str> = self.queue.iter().chain(&self.liked).chain(&self.results).map(|t| t.id.as_str()).collect();
+        self.covers.retain(|id, _| keep.contains(id.as_str()));
+    }
+
+    /// Волне важно знать, что с треком стало. Ошибка здесь музыке не мешает.
+    fn feedback(&self, kind: &'static str, track: Option<&Track>, played: Option<f32>) {
+        let (Some(session), Some(token)) = (self.wave.clone(), self.token()) else { return };
+        let track = track.cloned();
+        std::thread::spawn(move || {
+            let _ = api::wave_feedback(&session, kind, track.as_ref(), played, &token);
+        });
+    }
+
+    fn current_track(&self) -> Option<&Track> {
+        self.queue.get(self.current?)
+    }
+
     fn play(&mut self, index: usize) -> Task<Message> {
-        let (Some(player), Some(token), Some(track)) = (self.player.clone(), self.token(), self.queue.get(index)) else {
+        let (Some(player), Some(token), Some(track)) = (self.player.clone(), self.token(), self.queue.get(index).cloned()) else {
             return Task::none();
         };
-        let id = track.id.clone();
         let generation = player.stop();
         self.play_id = generation;
         self.current = Some(index);
@@ -158,13 +271,62 @@ impl App {
         self.position = Duration::ZERO;
         self.seeking = None;
         self.error = None;
-        Task::perform(
+        self.feedback("trackStarted", Some(&track), None);
+        let id = track.id.clone();
+        let start = Task::perform(
             background(move || {
                 let info = api::file_info(&id, &token)?;
                 player.play(generation, &info)
             }),
             move |result| Message::Started(generation, result),
-        )
+        );
+        Task::batch([start, self.wave_refill()])
+    }
+
+    /// Перед концом очереди просит у волны следующую пачку.
+    fn wave_refill(&mut self) -> Task<Message> {
+        let (Some(session), Some(token), Some(index)) = (self.wave.clone(), self.token(), self.current) else { return Task::none() };
+        if self.wave_fetching || self.queue.len() - index > WAVE_MARGIN + 1 {
+            return Task::none();
+        }
+        self.wave_fetching = true;
+        let start = self.queue.len().saturating_sub(WAVE_HISTORY);
+        let shown: Vec<String> = self.queue[start..].iter().map(Track::full_id).collect();
+        Task::perform(background(move || api::wave_more(&session, &shown, &token)), Message::WaveMore)
+    }
+
+    fn likes_more(&mut self) -> Task<Message> {
+        let Some(token) = self.token() else { return Task::none() };
+        let from = self.liked.len();
+        if self.likes_loading || from >= self.liked_ids.len() {
+            return Task::none();
+        }
+        self.likes_loading = true;
+        let page = self.liked_ids[from..(from + LIKES_PAGE).min(self.liked_ids.len())].to_vec();
+        Task::perform(background(move || api::tracks_by_ids(&page, &token)), Message::LikesPage)
+    }
+
+    fn apply_like(&mut self, track: &Track, liked: bool) {
+        if liked {
+            self.liked_set.insert(track.id.clone());
+            self.liked_ids.insert(0, track.id.clone());
+            // Пока список не загружали, трек придёт вместе с первой страницей.
+            if !self.liked.is_empty() {
+                self.liked.insert(0, track.clone());
+            }
+        } else {
+            self.liked_set.remove(&track.id);
+            self.liked_ids.retain(|id| *id != track.id);
+            self.liked.retain(|t| t.id != track.id);
+        }
+    }
+
+    fn list(&self, section: Section) -> &[Track] {
+        match section {
+            Section::Wave => &self.queue,
+            Section::Likes => &self.liked,
+            Section::Search => &self.results,
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -190,7 +352,8 @@ impl App {
             }
             Message::LoginChecked(Ok(Some(token))) => {
                 self.error = None;
-                self.screen = Screen::Main(token);
+                self.screen = Screen::Main(token.clone());
+                return load_account(token);
             }
             Message::LoginChecked(Ok(None)) => {}
             Message::LoginChecked(Err(e)) => {
@@ -202,19 +365,35 @@ impl App {
                 return start_login();
             }
             Message::Logout => {
-                if let Some(p) = &self.player {
-                    p.stop();
-                }
-                api::logout();
-                self.current = None;
-                self.active = false;
-                self.tracks.clear();
-                self.queue.clear();
-                self.covers.clear();
-                self.screen = Screen::Login(None);
+                self.reset();
                 return start_login();
             }
-            Message::FocusSearch => return operation::focus(Id::new(SEARCH_INPUT)),
+            Message::Account(Ok((uid, ids))) => {
+                self.uid = Some(uid);
+                self.liked_set = ids.iter().cloned().collect();
+                self.liked_ids = ids;
+                return match self.preview.clone() {
+                    Some(Preview::Wave) => self.update(Message::WaveStart),
+                    Some(Preview::Likes) => self.update(Message::Open(Section::Likes)),
+                    Some(Preview::Search(query)) => {
+                        self.section = Section::Search;
+                        self.query = query;
+                        self.update(Message::Search)
+                    }
+                    None if self.section == Section::Likes => self.likes_more(),
+                    None => Task::none(),
+                };
+            }
+            Message::Account(Err(e)) => return self.fail(e),
+            Message::Open(section) => {
+                self.section = section;
+                self.error = None;
+                return match section {
+                    Section::Likes if self.liked.is_empty() => self.likes_more(),
+                    Section::Search => operation::focus(Id::new(SEARCH_INPUT)),
+                    _ => Task::none(),
+                };
+            }
             Message::Query(query) => self.query = query,
             Message::Search => {
                 let Some(token) = self.token() else { return Task::none() };
@@ -235,29 +414,104 @@ impl App {
                 self.searching = false;
                 match result {
                     Ok(tracks) => {
-                        self.tracks = tracks;
-                        // Обложка играющего трека нужна нижней панели и после нового поиска.
-                        let queue = &self.queue;
-                        self.covers.retain(|id, _| queue.iter().any(|t| t.id == *id));
-                        if std::mem::take(&mut self.preview) {
-                            self.queue = self.tracks.clone();
+                        self.results = tracks;
+                        self.prune_covers();
+                        if matches!(self.preview.take(), Some(Preview::Search(_))) {
+                            self.queue = self.results.clone();
                             self.current = Some(0).filter(|_| !self.queue.is_empty());
                         }
-                        return Task::batch(self.tracks.iter().filter_map(|t| {
-                            let id = t.id.clone();
-                            let uri = t.cover.clone()?;
-                            Some(Task::perform(background(move || api::cover(&uri)), move |bytes| Message::Cover(id.clone(), bytes)))
-                        }));
+                        return self.fetch_covers(&self.results);
                     }
                     Err(e) => return self.fail(e),
                 }
             }
-            Message::Cover(id, Some(bytes)) => {
+            Message::LikesMore => return self.likes_more(),
+            Message::LikesPage(result) => {
+                self.likes_loading = false;
+                match result {
+                    Ok(page) => {
+                        let task = self.fetch_covers(&page);
+                        self.liked.extend(page);
+                        if matches!(self.preview.take(), Some(Preview::Likes)) {
+                            self.queue = self.liked.clone();
+                            self.current = Some(0).filter(|_| !self.queue.is_empty());
+                        }
+                        return task;
+                    }
+                    Err(e) => return self.fail(e),
+                }
+            }
+            Message::Like(track) => {
+                let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
+                let liked = !self.liked_set.contains(&track.id);
+                self.apply_like(&track, liked);
+                if self.queue.iter().any(|t| t.id == track.id) {
+                    self.feedback(if liked { "like" } else { "unlike" }, Some(&track), None);
+                }
+                let id = track.id.clone();
+                return Task::perform(background(move || api::set_liked(&uid, &id, liked, &token)), move |r| Message::LikeSaved(track.clone(), liked, r));
+            }
+            Message::LikeSaved(_, _, Ok(())) => {}
+            Message::LikeSaved(track, liked, Err(e)) => {
+                // Яндекс не сохранил: возвращаем как было.
+                self.apply_like(&track, !liked);
+                return self.fail(e);
+            }
+            Message::WaveStart => {
+                let Some(token) = self.token() else { return Task::none() };
+                self.section = Section::Wave;
+                self.wave_loading = true;
+                self.error = None;
+                return Task::perform(background(move || api::wave_new(&token)), Message::WaveStarted);
+            }
+            Message::WaveStarted(result) => {
+                self.wave_loading = false;
+                match result {
+                    Ok(wave) => {
+                        self.wave = Some(wave.session);
+                        self.queue = wave.tracks;
+                        self.wave_queue = true;
+                        self.wave_fetching = false;
+                        self.prune_covers();
+                        let covers = self.fetch_covers(&self.queue);
+                        if matches!(self.preview.take(), Some(Preview::Wave)) {
+                            // Просмотр без звука: волна не должна считать трек услышанным.
+                            self.wave = None;
+                            self.current = Some(0).filter(|_| !self.queue.is_empty());
+                            return covers;
+                        }
+                        self.feedback("radioStarted", None, None);
+                        return Task::batch([covers, self.play(0)]);
+                    }
+                    Err(e) => return self.fail(e),
+                }
+            }
+            Message::WaveMore(result) => {
+                self.wave_fetching = false;
+                match result {
+                    Ok(tracks) if self.wave.is_some() => {
+                        let known: HashSet<String> = self.queue.iter().map(|t| t.id.clone()).collect();
+                        let fresh: Vec<Track> = tracks.into_iter().filter(|t| !known.contains(&t.id)).collect();
+                        let task = self.fetch_covers(&fresh);
+                        self.queue.extend(fresh);
+                        return task;
+                    }
+                    Ok(_) => {}
+                    Err(e) => return self.fail(e),
+                }
+            }
+            Message::Cover(id, bytes) => {
                 self.covers.insert(id, image::Handle::from_bytes(bytes));
             }
-            Message::Cover(_, None) => {}
-            Message::Play(index) => {
-                self.queue = self.tracks.clone();
+            Message::Play(section, index) => {
+                if section == Section::Wave {
+                    // Выбрали трек в очереди волны: сессия продолжается.
+                    self.skip_feedback();
+                } else {
+                    self.queue = self.list(section).to_vec();
+                    self.wave = None;
+                    self.wave_queue = false;
+                }
                 return self.play(index);
             }
             Message::Started(generation, result) => {
@@ -282,11 +536,13 @@ impl App {
             }
             Message::Next => {
                 if let Some(i) = self.current.filter(|i| i + 1 < self.queue.len()) {
+                    self.skip_feedback();
                     return self.play(i + 1);
                 }
             }
             Message::Previous => {
                 if let Some(i) = self.current.filter(|i| *i > 0) {
+                    self.skip_feedback();
                     return self.play(i - 1);
                 }
             }
@@ -295,7 +551,12 @@ impl App {
                     self.position = p.position();
                     if p.is_empty() {
                         self.active = false;
-                        return self.update(Message::Next);
+                        if let Some(track) = self.current_track().cloned() {
+                            self.feedback("trackFinished", Some(&track), Some(track.duration.as_secs_f32()));
+                        }
+                        if let Some(i) = self.current.filter(|i| i + 1 < self.queue.len()) {
+                            return self.play(i + 1);
+                        }
                     }
                 }
             }
@@ -317,6 +578,12 @@ impl App {
             }
         }
         Task::none()
+    }
+
+    fn skip_feedback(&self) {
+        if let (true, Some(track), Some(p)) = (self.active, self.current_track(), &self.player) {
+            self.feedback("skip", Some(track), Some(p.position().as_secs_f32()));
+        }
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -356,7 +623,16 @@ impl App {
     }
 
     fn view_main(&self) -> Element<'_, Message> {
-        let body = row![self.view_sidebar(), self.view_search()];
+        let page = match self.section {
+            Section::Wave => self.view_wave(),
+            Section::Likes => self.view_likes(),
+            Section::Search => self.view_search(),
+        };
+        let mut page = column![page].spacing(12).height(Length::Fill);
+        if let Some(error) = &self.error {
+            page = page.push(text(error).color(ui::DANGER));
+        }
+        let body = row![self.view_sidebar(), container(page).padding([20, 24]).width(Length::Fill).height(Length::Fill).style(ui::page)];
         let mut layout = column![container(body).height(Length::Fill)];
         if let Some(bar) = self.view_bar() {
             layout = layout.push(container(Space::new()).width(Length::Fill).height(1).style(ui::line)).push(bar);
@@ -365,11 +641,16 @@ impl App {
     }
 
     fn view_sidebar(&self) -> Element<'_, Message> {
-        let search = button(row![ui::icon(ui::SEARCH, 20.0, ui::TEXT), text("Поиск").font(ui::FONT_BOLD)].spacing(12).align_y(Alignment::Center))
-            .width(Length::Fill)
-            .padding([9, 12])
-            .style(ui::selected)
-            .on_press(Message::FocusSearch);
+        let item = |icon, label, section| {
+            let open = self.section == section;
+            let style = if open { ui::selected } else { ui::ghost };
+            let tint = if open { ui::TEXT } else { ui::MUTED };
+            button(row![ui::icon(icon, 20.0, tint), text(label).font(ui::FONT_BOLD).color(tint)].spacing(12).align_y(Alignment::Center))
+                .width(Length::Fill)
+                .padding([9, 12])
+                .style(style)
+                .on_press(Message::Open(section))
+        };
         let logout = button(row![ui::icon(ui::LOGOUT, 20.0, ui::MUTED), text("Выйти").color(ui::MUTED)].spacing(12).align_y(Alignment::Center))
             .width(Length::Fill)
             .padding([9, 12])
@@ -378,7 +659,12 @@ impl App {
         container(
             column![
                 container(text("Tune").size(22).font(ui::FONT_BOLD)).padding([6, 12]),
-                search,
+                column![
+                    item(ui::WAVE, "Моя волна", Section::Wave),
+                    item(ui::HEART, "Мне нравится", Section::Likes),
+                    item(ui::SEARCH, "Поиск", Section::Search),
+                ]
+                .spacing(4),
                 Space::new().height(Length::Fill),
                 logout,
             ]
@@ -391,6 +677,60 @@ impl App {
         .into()
     }
 
+    fn view_wave(&self) -> Element<'_, Message> {
+        let title = text("Моя волна").size(26).font(ui::FONT_BOLD);
+        let center: Element<'_, Message> = if self.wave_loading {
+            placeholder("Настраиваем волну…", None)
+        } else if !self.wave_queue && self.queue.is_empty() {
+            container(
+                column![
+                    text("Музыка под ваш вкус").size(22).font(ui::FONT_BOLD),
+                    text("Треки подбирает Яндекс, волна не заканчивается").color(ui::MUTED),
+                    button(text("Запустить волну").font(ui::FONT_BOLD)).padding([10, 20]).style(ui::accent).on_press(Message::WaveStart),
+                ]
+                .spacing(10)
+                .align_x(Alignment::Center),
+            )
+            .center(Length::Fill)
+            .into()
+        } else if !self.wave_queue {
+            container(
+                column![
+                    text("Сейчас играет другой список").color(ui::MUTED),
+                    button(text("Запустить волну").font(ui::FONT_BOLD)).padding([10, 20]).style(ui::accent).on_press(Message::WaveStart),
+                ]
+                .spacing(10)
+                .align_x(Alignment::Center),
+            )
+            .center(Length::Fill)
+            .into()
+        } else {
+            self.view_list(Section::Wave, None)
+        };
+        column![title, center].spacing(16).height(Length::Fill).into()
+    }
+
+    fn view_likes(&self) -> Element<'_, Message> {
+        let count = match self.liked_ids.len() {
+            0 => String::new(),
+            n => format!("{n} {}", tracks_word(n)),
+        };
+        let title = row![text("Мне нравится").size(26).font(ui::FONT_BOLD), text(count).color(ui::MUTED)].spacing(12).align_y(Alignment::Center);
+        let center: Element<'_, Message> = if !self.liked.is_empty() {
+            let more = (self.liked.len() < self.liked_ids.len()).then(|| {
+                let label = if self.likes_loading { "Загружаем…" } else { "Показать ещё" };
+                let press = (!self.likes_loading).then_some(Message::LikesMore);
+                container(button(text(label)).padding([8, 16]).style(ui::ghost).on_press_maybe(press)).center_x(Length::Fill).into()
+            });
+            self.view_list(Section::Likes, more)
+        } else if self.likes_loading || self.uid.is_none() {
+            placeholder("Загружаем…", None)
+        } else {
+            placeholder("Пока пусто", Some("Нажмите на сердце у трека, и он появится здесь"))
+        };
+        column![title, center].spacing(16).height(Length::Fill).into()
+    }
+
     fn view_search(&self) -> Element<'_, Message> {
         let input = text_input("Трек или исполнитель", &self.query)
             .id(SEARCH_INPUT)
@@ -399,51 +739,26 @@ impl App {
             .padding([10, 14])
             .size(15)
             .style(ui::input);
-
         let center: Element<'_, Message> = if self.searching {
-            container(text("Ищем…").color(ui::MUTED)).center(Length::Fill).into()
-        } else if self.tracks.is_empty() {
-            container(
-                column![
-                    text("Что послушаем?").size(22).font(ui::FONT_BOLD),
-                    text("Введите название трека или исполнителя и нажмите Enter").color(ui::MUTED),
-                ]
-                .spacing(6)
-                .align_x(Alignment::Center),
-            )
-            .center(Length::Fill)
-            .into()
+            placeholder("Ищем…", None)
+        } else if self.results.is_empty() {
+            placeholder("Что послушаем?", Some("Введите название трека или исполнителя и нажмите Enter"))
         } else {
-            let list = self.tracks.iter().enumerate().fold(column![].spacing(2), |list, (index, track)| list.push(self.view_track(index, track)));
-            column![self.view_header(), scrollable(list).spacing(8).height(Length::Fill)].spacing(8).into()
+            self.view_list(Section::Search, None)
         };
+        column![text("Поиск").size(26).font(ui::FONT_BOLD), input, center].spacing(16).height(Length::Fill).into()
+    }
 
-        let mut page = column![text("Поиск").size(26).font(ui::FONT_BOLD), input, center].spacing(16);
-        if let Some(error) = &self.error {
-            page = page.push(text(error).color(ui::DANGER));
+    fn view_list<'a>(&'a self, section: Section, footer: Option<Element<'a, Message>>) -> Element<'a, Message> {
+        let mut list = self.list(section).iter().enumerate().fold(column![].spacing(2), |list, (index, track)| list.push(self.view_track(section, index, track))).padding(Padding::ZERO.right(SCROLLBAR));
+        if let Some(footer) = footer {
+            list = list.push(footer);
         }
-        container(page).padding([20, 24]).width(Length::Fill).height(Length::Fill).style(ui::page).into()
+        column![view_header(), scrollable(list).height(Length::Fill)].spacing(8).into()
     }
 
-    fn view_header(&self) -> Element<'_, Message> {
-        let label = |s| text(s).size(12).color(ui::MUTED);
-        column![
-            row![
-                container(label("#")).width(NUMBER).center_x(NUMBER),
-                container(label("Название")).width(Length::Fill),
-                label("Время"),
-                Space::new().width(LIST_GUTTER),
-            ]
-            .spacing(12)
-            .padding([0, 8]),
-            container(Space::new()).width(Length::Fill).height(1).style(ui::line),
-        ]
-        .spacing(8)
-        .into()
-    }
-
-    fn view_track<'a>(&'a self, index: usize, track: &'a Track) -> Element<'a, Message> {
-        let playing = self.current.and_then(|i| self.queue.get(i)).is_some_and(|t| t.id == track.id);
+    fn view_track<'a>(&'a self, section: Section, index: usize, track: &'a Track) -> Element<'a, Message> {
+        let playing = self.current_track().is_some_and(|t| t.id == track.id);
         let number: Element<'_, Message> = if playing {
             ui::icon(ui::PLAY, 16.0, ui::ACCENT)
         } else {
@@ -458,11 +773,18 @@ impl App {
             ]
             .width(Length::Fill)
             .clip(true),
+            self.like_button(track, 16.0),
             text(clock(track.duration)).size(13).color(ui::MUTED),
         ]
         .spacing(12)
         .align_y(Alignment::Center);
-        button(line).width(Length::Fill).padding([6, 8]).style(ui::ghost).on_press(Message::Play(index)).into()
+        button(line).width(Length::Fill).padding([6, 8]).style(ui::ghost).on_press(Message::Play(section, index)).into()
+    }
+
+    fn like_button<'a>(&self, track: &Track, size: f32) -> Element<'a, Message> {
+        let liked = self.liked_set.contains(&track.id);
+        let icon = if liked { ui::icon(ui::HEART, size, ui::ACCENT) } else { ui::icon(ui::HEART_OUTLINE, size, ui::MUTED) };
+        button(container(icon).center(LIKE)).padding(0).style(ui::ghost).on_press(Message::Like(track.clone())).into()
     }
 
     fn cover<'a>(&'a self, track: &Track, size: f32) -> Element<'a, Message> {
@@ -473,7 +795,7 @@ impl App {
     }
 
     fn view_bar(&self) -> Option<Element<'_, Message>> {
-        let track = self.queue.get(self.current?)?;
+        let track = self.current_track()?;
         let total = track.duration.as_secs_f32().max(1.0);
         let shown = self.seeking.unwrap_or(self.position.as_secs_f32()).min(total);
         let playing = self.starting || (self.active && !self.player.as_ref().is_none_or(Player::is_paused));
@@ -489,6 +811,7 @@ impl App {
                 text(status).size(13).color(ui::MUTED).wrapping(Wrapping::None),
             ]
             .clip(true),
+            self.like_button(track, 20.0),
         ]
         .spacing(12)
         .align_y(Alignment::Center)
@@ -525,13 +848,59 @@ impl App {
     }
 }
 
+fn view_header<'a>() -> Element<'a, Message> {
+    let label = |s| text(s).size(12).color(ui::MUTED);
+    column![
+        row![
+            container(label("#")).width(NUMBER).center_x(NUMBER),
+            container(label("Название")).width(Length::Fill),
+            label("Время"),
+            Space::new().width(LIST_GUTTER),
+        ]
+        .spacing(12)
+        .padding([0, 8]),
+        container(Space::new()).width(Length::Fill).height(1).style(ui::line),
+    ]
+    .spacing(8)
+    .into()
+}
+
+fn placeholder<'a>(title: &'a str, hint: Option<&'a str>) -> Element<'a, Message> {
+    let mut content = column![].spacing(6).align_x(Alignment::Center);
+    match hint {
+        Some(hint) => content = content.push(text(title).size(22).font(ui::FONT_BOLD)).push(text(hint).color(ui::MUTED)),
+        None => content = content.push(text(title).color(ui::MUTED)),
+    }
+    container(content).center(Length::Fill).into()
+}
+
 fn start_login() -> Task<Message> {
     Task::perform(background(api::login_start), Message::LoginStarted)
+}
+
+fn load_account(token: String) -> Task<Message> {
+    Task::perform(
+        background(move || {
+            let uid = api::account_uid(&token)?;
+            let ids = api::liked_ids(&uid, &token)?;
+            Ok((uid, ids))
+        }),
+        Message::Account,
+    )
 }
 
 fn clock(d: Duration) -> String {
     let s = d.as_secs();
     format!("{}:{:02}", s / 60, s % 60)
+}
+
+fn tracks_word(n: usize) -> &'static str {
+    match (n % 10, n % 100) {
+        (_, 11..=14) => "треков",
+        (1, _) => "трек",
+        (2..=4, _) => "трека",
+        _ => "треков",
+    }
 }
 
 /// Проверка без окна: поиск, ссылка на файл и несколько секунд звука.
@@ -555,19 +924,45 @@ fn smoke(query: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Проверка без окна: лайки, волна и её обратная связь. Лайк ставится и сразу снимается,
+/// список «Мне нравится» остаётся прежним; из обратной связи волне уходит только запуск.
+fn smoke_library(query: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let uid = api::account_uid(&token)?;
+    let ids = api::liked_ids(&uid, &token)?;
+    println!("Лайков: {}", ids.len());
+    let page = api::tracks_by_ids(&ids[..ids.len().min(LIKES_PAGE)], &token)?;
+    println!("Загружено сведений: {}, порядок совпал: {}", page.len(), page.iter().zip(&ids).all(|(t, id)| t.id == *id));
+    let wave = api::wave_new(&token)?;
+    println!("Волна: треков в первой пачке {}", wave.tracks.len());
+    println!("Обратная связь: {:?}", api::wave_feedback(&wave.session, "radioStarted", None, None, &token));
+    let shown: Vec<String> = wave.tracks.iter().map(Track::full_id).collect();
+    println!("Следующая пачка: {:?}", api::wave_more(&wave.session, &shown, &token).map(|t| t.len()));
+    let track = api::search(query, &token)?.into_iter().find(|t| !ids.contains(&t.id)).ok_or("Нет трека без лайка")?;
+    api::set_liked(&uid, &track.id, true, &token)?;
+    let added = api::liked_ids(&uid, &token)?.contains(&track.id);
+    api::set_liked(&uid, &track.id, false, &token)?;
+    let after = api::liked_ids(&uid, &token)?;
+    println!("Лайк появился: {added}, снялся: {}, список как был: {}", !after.contains(&track.id), after == ids);
+    Ok(())
+}
+
 fn main() -> iced::Result {
     let args: Vec<String> = std::env::args().collect();
-    if let [_, flag, query] = args.as_slice() {
-        if flag == "--smoke" {
-            if let Err(e) = smoke(query) {
+    let preview = match args.as_slice() {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" => {
+            let result = if flag == "--smoke" { smoke(query) } else { smoke_library(query) };
+            if let Err(e) = result {
                 println!("Ошибка: {e}");
                 std::process::exit(1);
             }
             return Ok(());
         }
-    }
-    let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--preview" => Some(query.clone()),
+        [_, flag, what] if flag == "--preview" => Some(match what.as_str() {
+            "wave" => Preview::Wave,
+            "likes" => Preview::Likes,
+            query => Preview::Search(query.to_string()),
+        }),
         _ => None,
     };
     iced::application(move || App::new(preview.clone()), App::update, App::view)
