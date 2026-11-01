@@ -23,7 +23,7 @@ const FROM: &str = "tune-native";
 /// Ошибка: токен отозвали или он истёк.
 pub const NEED_LOGIN: &str = "NEED_LOGIN";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Track {
     pub id: String,
     pub title: String,
@@ -80,7 +80,7 @@ pub enum Source {
     Artist,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Playlist {
     pub source: Source,
     pub owner: String,

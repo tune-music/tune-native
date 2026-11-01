@@ -100,9 +100,8 @@ fn flat(background: Option<Color>, text_color: Color, radius: f32) -> button::St
 /// Кнопка без фона: значки плеера.
 pub fn ghost(_: &Theme, status: button::Status) -> button::Style {
     match status {
-        button::Status::Hovered => flat(Some(CONTROL), TEXT, 20.0),
-        button::Status::Pressed => flat(Some(CONTROL_HOVER), TEXT, 20.0),
-        button::Status::Active | button::Status::Disabled => flat(None, TEXT, 20.0),
+        button::Status::Pressed => flat(Some(CONTROL), TEXT, 20.0),
+        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(None, TEXT, 20.0),
     }
 }
 
@@ -123,22 +122,19 @@ pub fn row(_: &Theme, status: button::Status) -> button::Style {
 }
 
 pub fn accent(_: &Theme, status: button::Status) -> button::Style {
-    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-    flat(Some(if hovered { ACCENT_HOVER } else { ACCENT }), ON_ACCENT, 24.0)
+    flat(Some(if status == button::Status::Pressed { ACCENT_HOVER } else { ACCENT }), ON_ACCENT, 24.0)
 }
 
 pub fn secondary(_: &Theme, status: button::Status) -> button::Style {
     match status {
-        button::Status::Hovered => flat(Some(CONTROL_HOVER), TEXT, 24.0),
         button::Status::Pressed => flat(Some(CONTROL_PRESSED), TEXT, 24.0),
-        button::Status::Active | button::Status::Disabled => flat(Some(CONTROL), TEXT, 24.0),
+        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(Some(CONTROL), TEXT, 24.0),
     }
 }
 
 /// Круглая кнопка запуска и паузы.
 pub fn round(_: &Theme, status: button::Status) -> button::Style {
-    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-    flat(Some(if hovered { ACCENT_HOVER } else { ACCENT }), ON_ACCENT, 40.0)
+    flat(Some(if status == button::Status::Pressed { ACCENT_HOVER } else { ACCENT }), ON_ACCENT, 40.0)
 }
 
 fn fill(color: Color) -> container::Style {
@@ -166,6 +162,41 @@ pub fn popover(_: &Theme) -> container::Style {
     container::Style { border: Border { color: CONTROL, width: 1.0, radius: 12.0.into() }, ..fill(color!(0x1a1a1a)) }
 }
 
+/// Всплывающее окно посреди появления.
+pub fn popover_faded(alpha: f32) -> impl Fn(&Theme) -> container::Style {
+    move |theme| {
+        let style = popover(theme);
+        container::Style {
+            background: style.background.map(|back| back.scale_alpha(alpha)),
+            border: Border { color: style.border.color.scale_alpha(alpha), ..style.border },
+            ..style
+        }
+    }
+}
+
+/// Кнопка всплывающего окна посреди появления.
+pub fn button_faded(style: fn(&Theme, button::Status) -> button::Style, alpha: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let base = style(theme, status);
+        button::Style { background: base.background.map(|back| back.scale_alpha(alpha)), text_color: base.text_color.scale_alpha(alpha), ..base }
+    }
+}
+
+/// Поле ввода всплывающего окна посреди появления.
+pub fn input_faded(alpha: f32) -> impl Fn(&Theme, text_input::Status) -> text_input::Style {
+    move |theme, status| {
+        let base = input(theme, status);
+        text_input::Style {
+            background: base.background.scale_alpha(alpha),
+            border: Border { color: base.border.color.scale_alpha(alpha), ..base.border },
+            icon: base.icon.scale_alpha(alpha),
+            placeholder: base.placeholder.scale_alpha(alpha),
+            value: base.value.scale_alpha(alpha),
+            selection: base.selection.scale_alpha(alpha),
+        }
+    }
+}
+
 pub fn avatar(_: &Theme) -> container::Style {
     container::Style { border: border::rounded(24), ..fill(TILE) }
 }
@@ -173,9 +204,8 @@ pub fn avatar(_: &Theme) -> container::Style {
 /// Пункт всплывающего меню.
 pub fn menu_item(_: &Theme, status: button::Status) -> button::Style {
     match status {
-        button::Status::Hovered => flat(Some(CONTROL), TEXT, 6.0),
-        button::Status::Pressed => flat(Some(CONTROL_HOVER), TEXT, 6.0),
-        button::Status::Active | button::Status::Disabled => flat(None, TEXT, 6.0),
+        button::Status::Pressed => flat(Some(CONTROL), TEXT, 6.0),
+        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(None, TEXT, 6.0),
     }
 }
 
@@ -183,7 +213,7 @@ pub fn menu_item(_: &Theme, status: button::Status) -> button::Style {
 pub fn chip(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, status| match (active, status) {
         (true, _) => flat(Some(TEXT), BLACK, 18.0),
-        (false, button::Status::Hovered | button::Status::Pressed) => flat(Some(CONTROL_HOVER), TEXT, 18.0),
+        (false, button::Status::Pressed) => flat(Some(CONTROL_HOVER), TEXT, 18.0),
         (false, _) => flat(Some(CONTROL), TEXT, 18.0),
     }
 }

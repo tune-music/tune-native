@@ -7,18 +7,26 @@ use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer;
 use iced::advanced::widget::{tree, Operation, Tree, Widget};
 use iced::advanced::{overlay, Clipboard, Renderer as _, Shell};
-use iced::{border, mouse, window, Element, Event, Length, Rectangle, Renderer, Size, Theme, Vector};
+use iced::{border, mouse, window, Color, Element, Event, Length, Rectangle, Renderer, Size, Theme, Vector};
 
-use crate::{ui, Message};
+use crate::{anim, ui, Message};
 
 /// За сколько секунд подсветка загорается полностью.
 const FADE: f32 = 0.14;
+/// За сколько секунд кнопка проседает при нажатии и на сколько точек с каждой стороны.
+const PRESS: f32 = 0.07;
+const PRESS_INSET: f32 = 1.5;
+/// Осветление кнопок, у которых есть свой фон.
+const SHINE: f32 = 0.1;
 
 #[derive(Clone, Copy)]
 struct State {
     /// От 0 до 1.
     level: f32,
     hovered: bool,
+    /// Насколько кнопка нажата, от 0 до 1.
+    press: f32,
+    pressed: bool,
     last: Option<Instant>,
 }
 
@@ -35,10 +43,17 @@ fn step(level: f32, hovered: bool, elapsed: f32) -> f32 {
 pub struct Glow<'a> {
     content: Element<'a, Message>,
     radius: f32,
+    /// Осветлять поверх своего фона вместо подложки.
+    shine: bool,
 }
 
 pub fn glow<'a>(content: impl Into<Element<'a, Message>>, radius: f32) -> Element<'a, Message> {
-    Element::new(Glow { content: content.into(), radius })
+    Element::new(Glow { content: content.into(), radius, shine: false })
+}
+
+/// Для кнопок со своим фоном.
+pub fn shine<'a>(content: impl Into<Element<'a, Message>>, radius: f32) -> Element<'a, Message> {
+    Element::new(Glow { content: content.into(), radius, shine: true })
 }
 
 impl Widget<Message, Theme, Renderer> for Glow<'_> {
@@ -47,7 +62,7 @@ impl Widget<Message, Theme, Renderer> for Glow<'_> {
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(State { level: 0.0, hovered: false, last: None })
+        tree::State::new(State { level: 0.0, hovered: false, press: 0.0, pressed: false, last: None })
     }
 
     fn children(&self) -> Vec<Tree> {
@@ -79,11 +94,20 @@ impl Widget<Message, Theme, Renderer> for Glow<'_> {
                 let elapsed = state.last.map_or(0.0, |last| now.duration_since(last).as_secs_f32());
                 state.hovered = hovered;
                 state.level = step(state.level, hovered, elapsed);
-                let target = if hovered { 1.0 } else { 0.0 };
-                state.last = (state.level != target).then_some(*now);
-                if state.level != target {
+                state.press = (state.press + if state.pressed { elapsed } else { -elapsed } / PRESS).clamp(0.0, 1.0);
+                let moving = state.level != if hovered { 1.0 } else { 0.0 } || state.press != if state.pressed { 1.0 } else { 0.0 };
+                state.last = moving.then_some(*now);
+                if moving {
                     shell.request_redraw();
                 }
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if hovered => {
+                state.pressed = true;
+                shell.request_redraw();
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.pressed => {
+                state.pressed = false;
+                shell.request_redraw();
             }
             _ if hovered != state.hovered => {
                 state.hovered = hovered;
@@ -98,12 +122,26 @@ impl Widget<Message, Theme, Renderer> for Glow<'_> {
     }
 
     fn draw(&self, tree: &Tree, renderer: &mut Renderer, theme: &Theme, style: &renderer::Style, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle) {
-        let level = tree.state.downcast_ref::<State>().level;
-        if level > 0.0 {
-            let color = iced::Color { a: ui::CONTROL.a * level, ..ui::CONTROL };
-            renderer.fill_quad(renderer::Quad { bounds: layout.bounds(), border: border::rounded(self.radius), ..renderer::Quad::default() }, color);
+        let state = tree.state.downcast_ref::<State>();
+        let bounds = layout.bounds();
+        let quad = renderer::Quad { bounds, border: border::rounded(self.radius), ..renderer::Quad::default() };
+        let paint = |renderer: &mut Renderer| {
+            if state.level > 0.0 && !self.shine {
+                renderer.fill_quad(quad, Color { a: ui::CONTROL.a * state.level, ..ui::CONTROL });
+            }
+            self.content.as_widget().draw(&tree.children[0], renderer, theme, style, layout, cursor, viewport);
+            // Фон рисуется раньше текста, поэтому осветление ложится между ними.
+            if state.level > 0.0 && self.shine {
+                renderer.fill_quad(quad, Color { a: SHINE * state.level, ..Color::WHITE });
+            }
+        };
+        if state.press > 0.0 {
+            let side = bounds.width.max(bounds.height).max(1.0);
+            let scale = 1.0 - 2.0 * PRESS_INSET / side * anim::ease_out(state.press);
+            renderer.with_transformation(anim::scale_around(bounds, 0.5, 0.5, scale), paint);
+        } else {
+            paint(renderer);
         }
-        self.content.as_widget().draw(&tree.children[0], renderer, theme, style, layout, cursor, viewport);
     }
 
     fn overlay<'b>(&'b mut self, tree: &'b mut Tree, layout: Layout<'b>, renderer: &Renderer, viewport: &Rectangle, translation: Vector) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
