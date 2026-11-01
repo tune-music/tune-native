@@ -74,6 +74,9 @@ pub const VOLUME_OFF: &str = "M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c
 pub const QUEUE: &str = "M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18c-.31-.11-.65-.18-1-.18-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V8h3V6h-5z";
 pub const TUNE: &str = "M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z";
 pub const CHECK: &str = "M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z";
+pub const HOME: &str = "M12 3 3 10.5V21h6v-6h6v6h6V10.5z";
+pub const LEFT: &str = "M15.4 6.4 14 5l-7 7 7 7 1.4-1.4L9.8 12z";
+pub const RIGHT: &str = "M8.6 6.4 10 5l7 7-7 7-1.4-1.4 5.6-5.6z";
 pub const CLOSE: &str = "M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z";
 pub const LOGOUT: &str = "M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z";
 
@@ -181,6 +184,31 @@ pub fn chip(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
         (true, _) => flat(Some(TEXT), BLACK, 18.0),
         (false, button::Status::Hovered | button::Status::Pressed) => flat(Some(CONTROL_HOVER), TEXT, 18.0),
         (false, _) => flat(Some(CONTROL), TEXT, 18.0),
+    }
+}
+
+/// Карточка альбома, исполнителя, плейлиста: подсвечивается при наведении.
+pub fn card(_: &Theme, status: button::Status) -> button::Style {
+    match status {
+        button::Status::Hovered => flat(Some(CONTROL), TEXT, 12.0),
+        button::Status::Pressed => flat(Some(CONTROL_HOVER), TEXT, 12.0),
+        button::Status::Active | button::Status::Disabled => flat(None, TEXT, 12.0),
+    }
+}
+
+/// Ссылка в подписи: светлеет при наведении.
+pub fn link(_: &Theme, status: button::Status) -> button::Style {
+    match status {
+        button::Status::Hovered | button::Status::Pressed => flat(None, WHITE, 0.0),
+        button::Status::Active | button::Status::Disabled => flat(None, MUTED, 0.0),
+    }
+}
+
+/// Крупная ссылка: тускнеет при наведении.
+pub fn link_big(_: &Theme, status: button::Status) -> button::Style {
+    match status {
+        button::Status::Hovered | button::Status::Pressed => flat(None, TEXT, 0.0),
+        button::Status::Active | button::Status::Disabled => flat(None, WHITE, 0.0),
     }
 }
 

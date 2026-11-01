@@ -32,6 +32,8 @@ pub struct Track {
     pub album: Option<String>,
     pub album_title: String,
     pub artist_id: Option<String>,
+    /// Имя и номер каждого исполнителя.
+    pub artist_list: Vec<(String, String)>,
     /// Пачка волны, из которой пришёл трек.
     pub batch: Option<String>,
 }
@@ -202,6 +204,10 @@ fn result(v: &Value) -> &Value {
     }
 }
 
+fn parse_artist_list(v: &Value) -> Vec<(String, String)> {
+    v.as_array().into_iter().flatten().filter_map(|a| Some((a["name"].as_str()?.to_string(), id_text(&a["id"])?))).collect()
+}
+
 fn parse_track(v: &Value) -> Option<Track> {
     let id = match &v["id"] {
         Value::String(s) => s.clone(),
@@ -218,6 +224,7 @@ fn parse_track(v: &Value) -> Option<Track> {
         album: v["albums"][0]["id"].as_u64().map(|a| a.to_string()),
         album_title: v["albums"][0]["title"].as_str().unwrap_or_default().to_string(),
         artist_id: id_text(&v["artists"][0]["id"]),
+        artist_list: parse_artist_list(&v["artists"]),
         batch: None,
     })
 }
@@ -405,8 +412,7 @@ pub struct Album {
     pub id: String,
     pub title: String,
     pub year: Option<u64>,
-    pub artists: String,
-    pub artist_id: Option<String>,
+    pub artists: Vec<(String, String)>,
     pub cover: Option<String>,
 }
 
@@ -436,13 +442,11 @@ fn cover_uri(v: &Value) -> Option<String> {
 }
 
 fn parse_album(v: &Value) -> Option<Album> {
-    let artists = v["artists"].as_array().into_iter().flatten().filter_map(|a| a["name"].as_str()).collect::<Vec<_>>().join(", ");
     Some(Album {
         id: id_text(&v["id"])?,
         title: v["title"].as_str().unwrap_or_default().to_string(),
         year: v["year"].as_u64(),
-        artists,
-        artist_id: id_text(&v["artists"][0]["id"]),
+        artists: parse_artist_list(&v["artists"]),
         cover: cover_uri(v),
     })
 }
@@ -546,6 +550,112 @@ pub fn set_artist_liked(uid: &str, id: &str, liked: bool, token: &str) -> Result
     set_page_liked(uid, "artists", "artist-id", id, liked, token)
 }
 
+/// Элемент блока главной.
+#[derive(Clone, Debug)]
+pub enum HomeItem {
+    Album(Card),
+    Artist(Card),
+    Playlist(Playlist),
+    Wave { title: String, seeds: Vec<String>, cover: Option<String> },
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HomeBlock {
+    pub title: String,
+    pub items: Vec<HomeItem>,
+    pub tracks: Vec<Track>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Home {
+    pub tabs: Vec<String>,
+    pub blocks: Vec<HomeBlock>,
+}
+
+fn parse_release(v: &Value) -> Option<HomeItem> {
+    let album = &v["album"];
+    let names = v["artists"].as_array().into_iter().flatten().filter_map(|a| a["name"].as_str()).collect::<Vec<_>>().join(", ");
+    let cover = cover_uri(album).or_else(|| cover_uri(v));
+    Some(HomeItem::Album(Card { id: id_text(&album["id"])?, title: album["title"].as_str()?.to_string(), subtitle: names, cover }))
+}
+
+fn parse_home_playlist(v: &Value) -> Option<HomeItem> {
+    let owner = id_text(&v["uid"]).or_else(|| id_text(&v["owner"]["uid"]))?;
+    let mut list = parse_playlist_loose(v, &owner)?;
+    list.owner = owner;
+    Some(HomeItem::Playlist(list))
+}
+
+/// На главной номер плейлиста приходит и числом, и строкой.
+fn parse_playlist_loose(v: &Value, owner: &str) -> Option<Playlist> {
+    Some(Playlist {
+        source: Source::Playlist,
+        owner: owner.to_string(),
+        kind: id_text(&v["kind"])?,
+        title: v["title"].as_str()?.to_string(),
+        count: v["trackCount"].as_u64().unwrap_or(0),
+        cover: cover_uri(v).or(v["ogImage"].as_str().filter(|c| !c.is_empty()).map(str::to_string)),
+    })
+}
+
+fn parse_home_item(v: &Value) -> Option<HomeItem> {
+    let data = &v["data"];
+    if data["playlist"].is_object() {
+        return parse_home_playlist(&data["playlist"]);
+    }
+    if data["artist"].is_object() {
+        return artist_card(&data["artist"]).map(HomeItem::Artist);
+    }
+    if data["album"].is_object() {
+        return album_card(&data["album"]).map(HomeItem::Album);
+    }
+    let seeds: Vec<String> = data["seeds"].as_array()?.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+    if seeds.is_empty() {
+        return None;
+    }
+    let cover = data["backgroundImageUrl"].as_str().or(data["imageUrl"].as_str()).map(str::to_string).or_else(|| cover_uri(data));
+    Some(HomeItem::Wave { title: data["title"].as_str()?.to_string(), seeds, cover })
+}
+
+/// У блоков главной разные ответы, но элементы в них одни и те же.
+fn parse_home_block(title: &str, v: &Value) -> HomeBlock {
+    let mut items = Vec::new();
+    items.extend(v["newReleases"].as_array().into_iter().flatten().filter_map(parse_release));
+    items.extend(v["items"].as_array().into_iter().flatten().filter_map(parse_home_item));
+    for group in ["waves", "inStyleTabs"] {
+        // Вкладки блока пока не показываем: берём первую.
+        items.extend(v[group][0]["items"].as_array().into_iter().flatten().filter_map(parse_home_item));
+    }
+    if v["playlist"].is_object() {
+        items.extend(parse_home_playlist(&v["playlist"]));
+    }
+    let tracks = v["tracks"].as_array().into_iter().flatten().filter_map(|t| parse_track(if t["track"].is_object() { &t["track"] } else { t })).collect();
+    HomeBlock { title: title.to_string(), items, tracks }
+}
+
+/// Главная: скелет страницы и все её блоки. Блоки грузятся одновременно, порядок сохраняется.
+pub fn home(tab: usize, token: &str) -> Result<Home, String> {
+    let skeleton = get("landing/skeleton/main", &[], token)?;
+    let skeleton = result(&skeleton);
+    let tabs = &skeleton["blocks"][0]["data"]["tabs"];
+    let names = tabs.as_array().into_iter().flatten().filter_map(|t| t["title"].as_str().map(str::to_string)).collect();
+    let sources: Vec<(String, String)> = tabs[tab]["blocks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|b| Some((b["data"]["title"].as_str().unwrap_or_default().to_string(), b["data"]["source"]["uri"].as_str()?.trim_start_matches('/').to_string())))
+        .collect();
+    let handles: Vec<_> = sources
+        .into_iter()
+        .map(|(title, uri)| {
+            let token = token.to_string();
+            std::thread::spawn(move || get(&uri, &[], &token).ok().map(|v| parse_home_block(&title, result(&v))))
+        })
+        .collect();
+    let blocks = handles.into_iter().filter_map(|h| h.join().ok().flatten()).filter(|b| !b.title.is_empty() && (!b.items.is_empty() || !b.tracks.is_empty())).collect();
+    Ok(Home { tabs: names, blocks })
+}
+
 pub const MY_WAVE: &str = WAVE_SEED;
 
 pub fn wave_new(seeds: &[String], token: &str) -> Result<Wave, String> {
@@ -633,7 +743,7 @@ pub fn file_info(track_id: &str, quality: &str, token: &str) -> Result<FileInfo,
 
 /// Обложка нужного размера, например 100x100. Нет сети — останется заглушка.
 pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
-    let url = format!("https://{}", uri.replace("%%", size));
+    let url = format!("https://{}", uri.trim_start_matches("https://").replace("%%", size));
     let resp = agent().get(url).call().ok()?;
     if resp.status().as_u16() != 200 {
         return None;
@@ -644,6 +754,24 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_home_blocks() {
+        let v: Value = serde_json::from_str(r#"{"newReleases":[{"album":{"id":"1","title":"А","coverUri":"a/%%"},"artists":[{"name":"Имя"}]}]}"#).unwrap();
+        assert!(matches!(&parse_home_block("Новое", &v).items[0], HomeItem::Album(card) if card.subtitle == "Имя"));
+        let v: Value = serde_json::from_str(r#"{"items":[
+            {"type":"liked_playlist_item","data":{"playlist":{"uid":"5","kind":"7","title":"П"}}},
+            {"type":"artist_item","data":{"artist":{"id":"8","name":"Х"}}},
+            {"type":"wave_item","data":{"seeds":["genre:rock"],"title":"Рок"}},
+            {"type":"mix_card_item","data":{"id":"x","title":"М"}}]}"#).unwrap();
+        let block = parse_home_block("Смесь", &v);
+        assert_eq!(block.items.len(), 3);
+        assert!(matches!(&block.items[0], HomeItem::Playlist(list) if list.owner == "5" && list.kind == "7"));
+        let v: Value = serde_json::from_str(r#"{"waves":[{"items":[{"data":{"seeds":["a"],"title":"В"}}]},{"items":[{"data":{"seeds":["b"],"title":"Г"}}]}],
+            "tracks":[{"track":{"id":"1","title":"Т","durationMs":1}},{"id":"2","title":"У","durationMs":1}]}"#).unwrap();
+        let block = parse_home_block("Волны", &v);
+        assert_eq!((block.items.len(), block.tracks.len()), (1, 2));
+    }
 
     #[test]
     fn parses_mixed_search() {
@@ -675,7 +803,8 @@ mod tests {
 
         let v: Value = serde_json::from_str(r#"{"id":7,"title":"Альбом","year":2020,"coverUri":"c/%%","artists":[{"id":1,"name":"А"},{"id":2,"name":"Б"}]}"#).unwrap();
         let album = parse_album(&v).unwrap();
-        assert_eq!((album.artists.as_str(), album.artist_id.as_deref(), album.year), ("А, Б", Some("1"), Some(2020)));
+        assert_eq!(album.artists, [("А".to_string(), "1".to_string()), ("Б".to_string(), "2".to_string())]);
+        assert_eq!(album.year, Some(2020));
     }
 
     #[test]
