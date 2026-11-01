@@ -141,11 +141,30 @@ fn download(info: &FileInfo, path: &Path, progress: Arc<Progress>) -> Result<u64
     Ok(len)
 }
 
+/// Следующий трек, который уже начал качаться.
+struct Prepared {
+    key: String,
+    codec: String,
+    path: PathBuf,
+    progress: Arc<Progress>,
+    len: u64,
+}
+
+impl Prepared {
+    fn discard(self) {
+        self.progress.cancelled.store(true, Ordering::Release);
+        let _ = std::fs::remove_file(self.path);
+    }
+}
+
 /// Устройство вывода и плеер. Клонируется в фоновые задачи.
 #[derive(Clone)]
 pub struct Player {
     output: Arc<rodio::Player>,
     current: Arc<Mutex<Option<Arc<Progress>>>>,
+    /// Файл играющего трека, если он был подготовлен заранее.
+    current_file: Arc<Mutex<Option<PathBuf>>>,
+    prepared: Arc<Mutex<Option<Prepared>>>,
     generation: Arc<AtomicU64>,
     _device: Arc<SendDevice>,
 }
@@ -163,6 +182,8 @@ impl Player {
         Ok(Self {
             output: Arc::new(output),
             current: Arc::default(),
+            current_file: Arc::default(),
+            prepared: Arc::default(),
             generation: Arc::default(),
             _device: Arc::new(SendDevice(device)),
         })
@@ -180,6 +201,9 @@ impl Player {
         }
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let _ = std::fs::remove_file(Self::temp_path(generation - 1));
+        if let Some(file) = self.current_file.lock().unwrap().take() {
+            let _ = std::fs::remove_file(file);
+        }
         generation
     }
 
@@ -189,12 +213,42 @@ impl Player {
         let progress = Arc::new(Progress::default());
         *self.current.lock().unwrap() = Some(progress.clone());
         let len = download(info, &path, progress.clone())?;
-        let reader = Reader { file: File::open(&path).map_err(|e| e.to_string())?, pos: 0, len, progress };
+        self.start(generation, &path, progress, len, &info.codec)
+    }
+
+    /// Начинает качать следующий трек заранее, чтобы он зазвучал без паузы.
+    pub fn preload(&self, key: &str, info: &FileInfo) -> Result<(), String> {
+        let path = std::env::temp_dir().join(format!("tune-native-{}-next-{}.part", std::process::id(), key.replace(':', "-")));
+        let progress = Arc::new(Progress::default());
+        let len = download(info, &path, progress.clone())?;
+        let new = Prepared { key: key.to_string(), codec: info.codec.clone(), path, progress, len };
+        if let Some(old) = self.prepared.lock().unwrap().replace(new) {
+            old.discard();
+        }
+        Ok(())
+    }
+
+    /// Запускает подготовленный файл. `None` — такого нет, файл надо запросить обычным путём.
+    pub fn play_prepared(&self, generation: u64, key: &str) -> Option<Result<String, String>> {
+        let prepared = {
+            let mut slot = self.prepared.lock().unwrap();
+            if slot.as_ref().is_none_or(|p| p.key != key) {
+                return None;
+            }
+            slot.take()?
+        };
+        *self.current.lock().unwrap() = Some(prepared.progress.clone());
+        *self.current_file.lock().unwrap() = Some(prepared.path.clone());
+        Some(self.start(generation, &prepared.path, prepared.progress, prepared.len, &prepared.codec).map(|()| prepared.codec))
+    }
+
+    fn start(&self, generation: u64, path: &Path, progress: Arc<Progress>, len: u64, codec: &str) -> Result<(), String> {
+        let reader = Reader { file: File::open(path).map_err(|e| e.to_string())?, pos: 0, len, progress };
         let decoder = Decoder::builder()
             .with_data(reader)
             .with_byte_len(len)
             .with_seekable(true)
-            .with_hint(hint(&info.codec))
+            .with_hint(hint(codec))
             .build()
             .map_err(|e| format!("Не удалось прочитать файл трека: {e}"))?;
         // Пока декодер открывался, могли включить другой трек.
@@ -241,6 +295,9 @@ impl Drop for Player {
         // Последняя копия: убираем временный файл.
         if Arc::strong_count(&self.output) == 1 {
             self.stop();
+            if let Some(prepared) = self.prepared.lock().unwrap().take() {
+                prepared.discard();
+            }
         }
     }
 }

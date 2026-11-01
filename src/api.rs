@@ -399,6 +399,97 @@ fn parse_sequence(v: &Value) -> Vec<Track> {
         .collect()
 }
 
+/// Шапка альбома.
+#[derive(Clone, Debug)]
+pub struct Album {
+    pub id: String,
+    pub title: String,
+    pub year: Option<u64>,
+    pub artists: String,
+    pub artist_id: Option<String>,
+    pub cover: Option<String>,
+}
+
+/// Альбом или исполнитель в сетке обложек.
+#[derive(Clone, Debug)]
+pub struct Card {
+    pub id: String,
+    pub title: String,
+    pub subtitle: String,
+    pub cover: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Artist {
+    pub id: String,
+    pub name: String,
+    pub cover: Option<String>,
+    pub listeners: u64,
+    pub popular: Vec<Track>,
+    pub albums: Vec<Card>,
+    pub also: Vec<Card>,
+    pub similar: Vec<Card>,
+}
+
+fn cover_uri(v: &Value) -> Option<String> {
+    v["coverUri"].as_str().or(v["cover"]["uri"].as_str()).filter(|u| !u.is_empty()).map(str::to_string)
+}
+
+fn parse_album(v: &Value) -> Option<Album> {
+    let artists = v["artists"].as_array().into_iter().flatten().filter_map(|a| a["name"].as_str()).collect::<Vec<_>>().join(", ");
+    Some(Album {
+        id: id_text(&v["id"])?,
+        title: v["title"].as_str().unwrap_or_default().to_string(),
+        year: v["year"].as_u64(),
+        artists,
+        artist_id: id_text(&v["artists"][0]["id"]),
+        cover: cover_uri(v),
+    })
+}
+
+fn parse_cards(v: &Value, card: impl Fn(&Value) -> Option<Card>) -> Vec<Card> {
+    v.as_array().into_iter().flatten().filter_map(card).collect()
+}
+
+fn album_card(v: &Value) -> Option<Card> {
+    Some(Card {
+        id: id_text(&v["id"])?,
+        title: v["title"].as_str()?.to_string(),
+        subtitle: v["year"].as_u64().map_or_else(|| "Альбом".to_string(), |year| year.to_string()),
+        cover: cover_uri(v),
+    })
+}
+
+fn artist_card(v: &Value) -> Option<Card> {
+    Some(Card { id: id_text(&v["id"])?, title: v["name"].as_str()?.to_string(), subtitle: "Исполнитель".to_string(), cover: cover_uri(v) })
+}
+
+fn parse_artist(v: &Value) -> Option<Artist> {
+    let artist = &v["artist"];
+    Some(Artist {
+        id: id_text(&artist["id"])?,
+        name: artist["name"].as_str().unwrap_or_default().to_string(),
+        cover: cover_uri(artist),
+        listeners: v["stats"]["lastMonthListeners"].as_u64().unwrap_or(0),
+        popular: v["popularTracks"].as_array().into_iter().flatten().filter_map(parse_track).collect(),
+        albums: parse_cards(&v["albums"], album_card),
+        also: parse_cards(&v["alsoAlbums"], album_card),
+        similar: parse_cards(&v["similarArtists"], artist_card),
+    })
+}
+
+pub fn album(id: &str, token: &str) -> Result<(Album, Vec<Track>), String> {
+    let v = get(&format!("albums/{id}/with-tracks"), &[], token)?;
+    let v = result(&v);
+    let tracks = v["volumes"].as_array().into_iter().flatten().flat_map(|disk| disk.as_array().into_iter().flatten()).filter_map(parse_track).collect();
+    Ok((parse_album(v).ok_or("Яндекс не прислал альбом")?, tracks))
+}
+
+pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
+    let v = get(&format!("artists/{id}/brief-info"), &[], token)?;
+    parse_artist(result(&v)).ok_or_else(|| "Яндекс не прислал исполнителя".to_string())
+}
+
 pub const MY_WAVE: &str = WAVE_SEED;
 
 pub fn wave_new(seeds: &[String], token: &str) -> Result<Wave, String> {
@@ -497,6 +588,24 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_artist_page_and_album() {
+        let v: Value = serde_json::from_str(r#"{"artist":{"id":1,"name":"Имя","cover":{"uri":"a/%%"}},"stats":{"lastMonthListeners":5},
+            "popularTracks":[{"id":"9","title":"Т","durationMs":1000,"artists":[{"id":1,"name":"Имя"}]}],
+            "albums":[{"id":2,"title":"А","year":2012,"coverUri":"b/%%"},{"id":3}],
+            "alsoAlbums":[{"id":4,"title":"Б"}],"similarArtists":[{"id":5,"name":"Другой"}]}"#).unwrap();
+        let artist = parse_artist(&v).unwrap();
+        assert_eq!((artist.id.as_str(), artist.listeners, artist.popular.len(), artist.albums.len()), ("1", 5, 1, 1));
+        assert_eq!(artist.albums[0].subtitle, "2012");
+        assert_eq!(artist.also[0].subtitle, "Альбом");
+        assert_eq!(artist.similar[0].title, "Другой");
+        assert!(parse_artist(&Value::Null).is_none());
+
+        let v: Value = serde_json::from_str(r#"{"id":7,"title":"Альбом","year":2020,"coverUri":"c/%%","artists":[{"id":1,"name":"А"},{"id":2,"name":"Б"}]}"#).unwrap();
+        let album = parse_album(&v).unwrap();
+        assert_eq!((album.artists.as_str(), album.artist_id.as_deref(), album.year), ("А, Б", Some("1"), Some(2020)));
+    }
 
     #[test]
     fn parses_pins_of_each_type() {
