@@ -1059,7 +1059,7 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         if let Message::Frame(now) = message {
-            let elapsed = self.last_frame.map_or(0.0, |last| now.duration_since(last).as_secs_f32()).min(FRAME_LIMIT) * std::env::var("TUNE_SLOW").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
+            let elapsed = self.last_frame.map_or(0.0, |last| now.duration_since(last).as_secs_f32()).min(FRAME_LIMIT);
             self.page_veil = (self.page_veil - elapsed / PAGE_FADE).max(0.0);
             self.track_veil = (self.track_veil - elapsed / TRACK_FADE).max(0.0);
             self.menu_fade.step(elapsed);
@@ -1190,7 +1190,7 @@ impl App {
                 let pins = Task::batch([pins, self.liked_pages_load()]);
                 let page = match self.preview.clone() {
                     Some(Preview::Wave | Preview::WaveSeek) => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
-                    Some(Preview::WaveSeeded) => self.wave_load(vec!["artist:3121".to_string()], Some(wave_label("artist:3121", "Scorpions")), false),
+                    Some(Preview::WaveSeeded) => self.wave_load(vec!["artist:3121".to_string()], Some(wave_label("artist:3121", "Metallica")), false),
                     Some(Preview::Likes | Preview::LikesEnd | Preview::Menu | Preview::Panels) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
                     Some(Preview::Playlists | Preview::Playlist | Preview::PlaylistHome) => self.update(Message::Open(Section::Playlists)),
