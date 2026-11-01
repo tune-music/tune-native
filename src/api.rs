@@ -14,8 +14,7 @@ use sha2::Sha256;
 const API: &str = "https://api.music.yandex.net";
 const CLIENT: &str = "YandexMusicDesktopAppWindows/5.120.0";
 const SIGN_KEY: &[u8] = b"kzqU4XhfCaY6B6JTHODeq5";
-const QUALITY: &str = "nq";
-const CODECS: [&str; 5] = ["mp3", "aac", "aac-mp4", "he-aac", "he-aac-mp4"];
+const CODECS: [&str; 7] = ["flac", "flac-mp4", "mp3", "aac", "aac-mp4", "he-aac", "he-aac-mp4"];
 const TRANSPORT: &str = "encraw";
 const WAVE_SEED: &str = "user:onyourwave";
 const FROM: &str = "tune-native";
@@ -467,13 +466,13 @@ fn sign(data: &str) -> String {
     s
 }
 
-pub fn file_info(track_id: &str, token: &str) -> Result<FileInfo, String> {
+pub fn file_info(track_id: &str, quality: &str, token: &str) -> Result<FileInfo, String> {
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs().to_string();
-    let signature = sign(&format!("{ts}{track_id}{QUALITY}{}{TRANSPORT}", CODECS.concat()));
+    let signature = sign(&format!("{ts}{track_id}{quality}{}{TRANSPORT}", CODECS.concat()));
     let codecs = CODECS.join(",");
     let v = get(
         "get-file-info",
-        &[("ts", &ts), ("trackId", track_id), ("quality", QUALITY), ("codecs", &codecs), ("transports", TRANSPORT), ("sign", &signature)],
+        &[("ts", &ts), ("trackId", track_id), ("quality", quality), ("codecs", &codecs), ("transports", TRANSPORT), ("sign", &signature)],
         token,
     )?;
     let info = if v["result"].is_object() { &v["result"]["downloadInfo"] } else { &v["downloadInfo"] };

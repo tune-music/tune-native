@@ -27,7 +27,7 @@ use api::{Pin, PinTarget, Playlist, Profile, Source, Track, Wave, NEED_LOGIN};
 use media::Media;
 use player::Player;
 use raw_window_handle::RawWindowHandle;
-use settings::{Repeat, Settings};
+use settings::{Quality, Repeat, Settings};
 
 const TICK: Duration = Duration::from_millis(500);
 const COVER: f32 = 40.0;
@@ -62,6 +62,11 @@ const ROW: f32 = 58.0;
 /// Сколько строк держать готовыми за краем экрана.
 const ROW_MARGIN: usize = 6;
 const LIST: &str = "list";
+const QUEUE_LIST: &str = "queue";
+const QUEUE_WIDTH: f32 = 360.0;
+const QUALITY_WIDTH: f32 = 250.0;
+/// Сколько места оставить над играющим треком, когда открывается очередь.
+const QUEUE_ABOVE: f32 = 2.0 * ROW;
 const SKELETON_ROWS: usize = 10;
 /// После скольких обложек убирать те, что далеко от экрана.
 const COVERS_LIMIT: usize = 400;
@@ -130,6 +135,8 @@ enum Preview {
     WaveSeek,
     Collection,
     Likes,
+    /// Открытые очередь и выбор качества.
+    Panels,
     /// Лайки, прокрученные до конца.
     LikesEnd,
     Playlists,
@@ -205,6 +212,13 @@ struct App {
     shuffle: bool,
     /// Исходный порядок очереди, пока включён случайный.
     unshuffled: Option<Vec<Track>>,
+    quality: Quality,
+    /// Формат файла, который играет сейчас: Яндекс может отдать не то, что просили.
+    codec: Option<String>,
+    /// Выбор качества открыт в этой точке.
+    quality_menu: Option<(f32, f32)>,
+    queue_open: bool,
+    queue_offset: f32,
     error: Option<String>,
     preview: Option<Preview>,
 }
@@ -229,6 +243,12 @@ enum Message {
     ToggleMute,
     RepeatNext,
     ShuffleToggle,
+    QualityOpen,
+    QualitySet(Quality),
+    QueueToggle,
+    QueueScrolled(f32),
+    QueuePlay(usize),
+    QueueRemove(usize),
     Like(Track),
     LikeSaved(Track, bool, Result<(), String>),
     WaveStart,
@@ -255,7 +275,7 @@ enum Message {
     WindowReady(Option<isize>),
     Media(media::Event),
     Play(Section, usize),
-    Started(u64, Result<(), String>),
+    Started(u64, Result<String, String>),
     Toggle,
     Next,
     Previous,
@@ -327,6 +347,11 @@ impl App {
             repeat: saved.repeat,
             shuffle: saved.shuffle,
             unshuffled: None,
+            quality: saved.quality,
+            codec: None,
+            quality_menu: None,
+            queue_open: false,
+            queue_offset: 0.0,
             error,
             preview,
         };
@@ -341,7 +366,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -371,13 +396,25 @@ impl App {
         }
     }
 
+    /// Какие строки панели очереди сейчас строятся.
+    fn queue_rows(&self) -> Range<usize> {
+        if self.queue_open {
+            visible_rows(self.queue_offset, WINDOW.lock().unwrap().1, self.queue.len())
+        } else {
+            0..0
+        }
+    }
+
     fn visible_covers(&self) -> Task<Message> {
         let range = self.visible();
         let jobs = self.list(self.section).iter().skip(range.start).take(range.len()).filter_map(|t| Some((t.id.clone(), t.cover.clone()?))).collect();
         let list = self.fetch_cover_jobs(jobs, "100x100");
+        let range = self.queue_rows();
+        let jobs = self.queue.iter().skip(range.start).take(range.len()).filter_map(|t| Some((t.id.clone(), t.cover.clone()?))).collect();
+        let queue = self.fetch_cover_jobs(jobs, "100x100");
         // Играющий трек показан и в плеере, и крупно на главной.
         let current = self.current_track().and_then(|t| Some((t.id.clone(), t.cover.clone()?))).into_iter().collect();
-        Task::batch([list, self.fetch_cover_jobs(current, "300x300")])
+        Task::batch([list, queue, self.fetch_cover_jobs(current, "300x300")])
     }
 
     fn token(&self) -> Option<String> {
@@ -433,6 +470,9 @@ impl App {
         self.list_offset = 0.0;
         self.retry = None;
         self.unshuffled = None;
+        self.queue_open = false;
+        self.quality_menu = None;
+        self.codec = None;
         self.uid = None;
         self.wave = None;
         self.wave_pending = None;
@@ -478,7 +518,9 @@ impl App {
         let around = self.list(self.section).iter().skip(from).take(range.end + COVERS_AROUND - from);
         let index = self.current.unwrap_or(0);
         let queue = self.queue.iter().skip(index.saturating_sub(QUEUE_COVERS_AROUND)).take(QUEUE_COVERS_AROUND * 2 + 1);
-        let keep: HashSet<String> = around.chain(queue).map(|t| t.id.clone()).collect();
+        let panel = self.queue_rows();
+        let panel = self.queue.iter().skip(panel.start).take(panel.len());
+        let keep: HashSet<String> = around.chain(queue).chain(panel).map(|t| t.id.clone()).collect();
         self.covers.retain(|id, _| id.starts_with(PLAYLIST_COVER) || id.starts_with(PIN_COVER_PREFIX) || keep.contains(id));
         self.requested.borrow_mut().retain(|id| self.covers.contains_key(id));
     }
@@ -505,6 +547,7 @@ impl App {
             self.feedback("radioStarted", None, None);
         }
         self.retry = None;
+        self.codec = None;
         let generation = player.stop();
         self.play_id = generation;
         self.current = Some(index);
@@ -515,10 +558,12 @@ impl App {
         self.error = None;
         self.feedback("trackStarted", Some(&track), None);
         let id = track.id.clone();
+        let quality = self.quality;
         let start = Task::perform(
             background(move || {
-                let info = api::file_info(&id, &token)?;
-                player.play(generation, &info)
+                let info = api::file_info(&id, quality.code(), &token)?;
+                player.play(generation, &info)?;
+                Ok(info.codec)
             }),
             move |result| Message::Started(generation, result),
         );
@@ -679,7 +724,7 @@ impl App {
                 let pins = self.token().map_or(Task::none(), |token| Task::perform(background(move || api::pins(&token)), Message::PinsLoaded));
                 let page = match self.preview.clone() {
                     Some(Preview::Wave | Preview::WaveSeek) => self.wave_load(vec![api::MY_WAVE.to_string()], false),
-                    Some(Preview::Likes | Preview::LikesEnd | Preview::Menu) => self.update(Message::Open(Section::Likes)),
+                    Some(Preview::Likes | Preview::LikesEnd | Preview::Menu | Preview::Panels) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
                     Some(Preview::Playlists | Preview::Playlist | Preview::PlaylistHome) => self.update(Message::Open(Section::Playlists)),
                     Some(Preview::Search(query)) => {
@@ -832,6 +877,13 @@ impl App {
                             self.queue = self.liked.clone();
                             self.current = Some(0).filter(|_| !self.queue.is_empty());
                         }
+                        if matches!(self.preview, Some(Preview::Panels)) {
+                            self.preview = None;
+                            self.queue = self.liked.clone();
+                            self.current = Some(20).filter(|i| *i < self.queue.len());
+                            self.quality_menu = Some((1000.0, 700.0));
+                            return self.update(Message::QueueToggle);
+                        }
                         if matches!(self.preview, Some(Preview::LikesEnd)) {
                             self.preview = None;
                             return operation::snap_to(Id::new(LIST), scrollable::RelativeOffset { x: 0.0, y: 1.0 });
@@ -969,7 +1021,41 @@ impl App {
                 let (x, y) = *CURSOR.lock().unwrap();
                 self.menu = Some((track, x, y));
             }
-            Message::MenuClose => self.menu = None,
+            Message::MenuClose => {
+                self.menu = None;
+                self.quality_menu = None;
+            }
+            Message::QualityOpen => self.quality_menu = Some(*CURSOR.lock().unwrap()),
+            Message::QualitySet(quality) => {
+                self.quality = quality;
+                self.quality_menu = None;
+                self.save_settings();
+            }
+            Message::QueueToggle => {
+                self.queue_open = !self.queue_open;
+                if self.queue_open {
+                    self.queue_offset = (self.current.unwrap_or(0) as f32 * ROW - QUEUE_ABOVE).max(0.0);
+                    return operation::scroll_to(Id::new(QUEUE_LIST), scrollable::AbsoluteOffset { x: 0.0, y: self.queue_offset });
+                }
+            }
+            Message::QueueScrolled(offset) => self.queue_offset = offset,
+            Message::QueuePlay(index) => {
+                self.skip_feedback();
+                return self.play(index);
+            }
+            Message::QueueRemove(index) => {
+                if index < self.queue.len() && self.current != Some(index) {
+                    let track = self.queue.remove(index);
+                    if self.current.is_some_and(|i| index < i) {
+                        self.current = self.current.map(|i| i - 1);
+                    }
+                    if let Some(original) = &mut self.unshuffled {
+                        if let Some(at) = original.iter().position(|t| t.id == track.id) {
+                            original.remove(at);
+                        }
+                    }
+                }
+            }
             Message::Dislike(track) => {
                 self.menu = None;
                 let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
@@ -1106,7 +1192,8 @@ impl App {
                 }
                 self.starting = false;
                 match result {
-                    Ok(()) => {
+                    Ok(codec) => {
+                        self.codec = Some(codec);
                         self.active = true;
                         self.failures = 0;
                     }
@@ -1248,11 +1335,19 @@ impl App {
             }
             container(main).padding(Padding::ZERO.right(12).bottom(12)).width(Length::Fill).height(Length::Fill).into()
         };
-        let base = container(row![self.view_sidebar(), main]).width(Length::Fill).height(Length::Fill).style(ui::root);
+        let mut columns = row![self.view_sidebar(), main];
+        if self.queue_open {
+            columns = columns.push(container(self.view_queue()).padding(Padding::ZERO.right(12).bottom(12)));
+        }
+        let base = container(columns).width(Length::Fill).height(Length::Fill).style(ui::root);
         let mut layers = stack![base];
         if let Some((track, x, y)) = &self.menu {
             layers = layers.push(mouse_area(container(Space::new()).width(Length::Fill).height(Length::Fill)).on_press(Message::MenuClose).on_right_press(Message::MenuClose));
             layers = layers.push(self.view_menu(track, *x, *y));
+        }
+        if let Some((x, y)) = self.quality_menu {
+            layers = layers.push(mouse_area(container(Space::new()).width(Length::Fill).height(Length::Fill)).on_press(Message::MenuClose).on_right_press(Message::MenuClose));
+            layers = layers.push(self.view_quality(x, y));
         }
         if let Some((_, notice)) = &self.notice {
             layers = layers.push(
@@ -1297,15 +1392,69 @@ impl App {
         }
         items = items.push(item(ui::LINK, "Скопировать ссылку", Message::CopyLink(track.clone())));
         count += 1.0;
-        // Меню не должно выходить за край окна.
-        let (width, height) = *WINDOW.lock().unwrap();
-        let x = x.min(width - MENU_WIDTH - 8.0).max(8.0);
-        let y = y.min(height - (count * MENU_ITEM + 16.0) - 8.0).max(8.0);
-        container(container(items).width(MENU_WIDTH).padding(8).style(ui::popover))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(Padding::new(0.0).left(x).top(y))
-            .into()
+        popup(items.into(), x, y, MENU_WIDTH, count * MENU_ITEM)
+    }
+
+    /// Выбор качества. Новое качество действует со следующего трека.
+    fn view_quality(&self, x: f32, y: f32) -> Element<'_, Message> {
+        let mut items = column![container(text("Качество звука").font(ui::font_medium()).color(ui::TEXT)).padding([6, 10])];
+        for quality in Quality::ALL {
+            let mark: Element<'_, Message> = if quality == self.quality { ui::icon(ui::CHECK, 20.0, ui::ACCENT) } else { Space::new().width(20).into() };
+            items = items.push(
+                button(row![mark, text(quality.label()).color(ui::TEXT)].spacing(12).align_y(Alignment::Center))
+                    .width(Length::Fill)
+                    .height(MENU_ITEM)
+                    .padding([9, 10])
+                    .style(ui::menu_item)
+                    .on_press(Message::QualitySet(quality)),
+            );
+        }
+        if let Some(codec) = &self.codec {
+            items = items.push(container(text(format!("Сейчас играет: {}", codec_name(codec))).size(13).color(ui::MUTED)).padding([6, 10]));
+        }
+        popup(items.into(), x, y, QUALITY_WIDTH, 5.0 * MENU_ITEM)
+    }
+
+    /// Панель очереди: как и длинные списки, строит только видимые строки.
+    fn view_queue(&self) -> Element<'_, Message> {
+        let header = row![
+            text("Очередь").size(24).font(ui::font_headline()).color(ui::TEXT),
+            text(format!("{} {}", self.queue.len(), tracks_word(self.queue.len()))).color(ui::MUTED),
+            Space::new().width(Length::Fill),
+            button(ui::icon(ui::CLOSE, 20.0, ui::MUTED)).padding(6).style(ui::ghost).on_press(Message::QueueToggle),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+        let range = self.queue_rows();
+        let mut list = column![Space::new().height(range.start as f32 * ROW)].padding(Padding::ZERO.right(SCROLLBAR));
+        for index in range.clone() {
+            let track = &self.queue[index];
+            let current = self.current == Some(index);
+            let mut line = row![
+                self.cover(track, COVER),
+                column![
+                    text(&track.title).font(ui::font_medium()).color(if current { ui::ACCENT } else { ui::WHITE }).wrapping(Wrapping::None),
+                    text(&track.artists).color(ui::MUTED).wrapping(Wrapping::None),
+                ]
+                .width(Length::Fill)
+                .clip(true),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center);
+            if !current {
+                line = line.push(button(ui::icon(ui::CLOSE, 16.0, ui::MUTED)).padding(6).style(ui::ghost).on_press(Message::QueueRemove(index)));
+            }
+            list = list.push(mouse_area(button(line).width(Length::Fill).height(ROW).padding([8, 8]).style(ui::row).on_press(Message::QueuePlay(index))).on_right_press(Message::MenuOpen(track.clone())));
+        }
+        list = list.push(Space::new().height((self.queue.len() - range.end) as f32 * ROW));
+        let list = scrollable(list).id(QUEUE_LIST).on_scroll(|viewport| Message::QueueScrolled(viewport.absolute_offset().y)).height(Length::Fill);
+        container(column![header, list].spacing(12)).width(QUEUE_WIDTH).height(Length::Fill).padding(16).style(ui::content).into()
+    }
+
+    /// Качество и очередь: кнопки рядом с громкостью.
+    fn view_tools<'a>(&self, size: f32) -> Element<'a, Message> {
+        let tool = |icon, on: bool, message| button(ui::icon(icon, size, if on { ui::ACCENT } else { ui::MUTED })).padding(4).style(ui::ghost).on_press(message);
+        row![tool(ui::TUNE, self.quality == Quality::Lossless, Message::QualityOpen), tool(ui::QUEUE, self.queue_open, Message::QueueToggle)].spacing(6).align_y(Alignment::Center).into()
     }
 
     fn more_button<'a>(&self, track: &Track, size: f32) -> Element<'a, Message> {
@@ -1451,7 +1600,7 @@ impl App {
                 .spacing(28)
                 .align_y(Alignment::Center),
                 Space::new().height(16),
-                self.view_volume(22.0, 160.0),
+                row![self.view_tools(22.0), self.view_volume(22.0, Some(160.0))].spacing(10).align_y(Alignment::Center),
             ]
             .align_x(Alignment::Center),
         )
@@ -1459,15 +1608,13 @@ impl App {
         .into()
     }
 
-    fn view_volume<'a>(&self, icon: f32, width: f32) -> Element<'a, Message> {
+    fn view_volume<'a>(&self, icon: f32, width: Option<f32>) -> Element<'a, Message> {
         let shown = if self.muted { 0.0 } else { self.volume };
-        row![
-            button(ui::icon(if self.muted { ui::VOLUME_OFF } else { ui::VOLUME }, icon, ui::MUTED)).padding(4).style(ui::ghost).on_press(Message::ToggleMute),
-            slider(0.0..=1.0, shown, Message::Volume).step(0.01).width(width).style(ui::volume),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center)
-        .into()
+        let mut line = row![button(ui::icon(if self.muted { ui::VOLUME_OFF } else { ui::VOLUME }, icon, ui::MUTED)).padding(4).style(ui::ghost).on_press(Message::ToggleMute)].spacing(6).align_y(Alignment::Center);
+        if let Some(width) = width {
+            line = line.push(slider(0.0..=1.0, shown, Message::Volume).step(0.01).width(width).style(ui::volume));
+        }
+        line.into()
     }
 
     fn view_collection(&self) -> Element<'_, Message> {
@@ -1681,7 +1828,7 @@ impl App {
         ]
         .spacing(12)
         .align_y(Alignment::Center)
-        .width(Length::FillPortion(3));
+        .width(if self.queue_open { Length::Fill } else { Length::FillPortion(3) });
 
         // В волне порядок задаёт она сама, поэтому этих кнопок там нет.
         let mode = |icon, on: bool, message| button(ui::icon(icon, 22.0, if on { ui::ACCENT } else { ui::MUTED })).padding(8).style(ui::ghost).on_press(message);
@@ -1694,14 +1841,16 @@ impl App {
             let icon = if self.repeat == Repeat::One { ui::REPEAT_ONE } else { ui::REPEAT };
             buttons = buttons.push(mode(icon, self.repeat != Repeat::Off, Message::RepeatNext));
         }
-        let transport = container(buttons).center_x(Length::FillPortion(4));
+        // С открытой очередью места мало: название важнее пустых полей.
+        let (transport_width, right_width) = if self.queue_open { (Length::Shrink, Length::Shrink) } else { (Length::FillPortion(4), Length::FillPortion(3)) };
+        let transport = container(buttons).center_x(transport_width);
 
         let mut right = row![].spacing(8).align_y(Alignment::Center);
         if self.bar_hover {
             right = right.push(text(format!("{} / {}", clock(Duration::from_secs_f32(shown)), clock(track.duration))).size(12).color(ui::MUTED)).push(Space::new().width(8));
         }
-        let volume = container(right.push(self.view_volume(24.0, 90.0)))
-            .align_right(Length::FillPortion(3));
+        let volume = container(right.push(self.view_tools(22.0)).push(self.view_volume(24.0, (!self.queue_open).then_some(90.0))))
+            .align_right(right_width);
 
         let seek = canvas(seek::Seek { value: shown, total, radius: 12.0, base: iced::Color::TRANSPARENT, fill: ui::CONTROL }).width(Length::Fill).height(BAR_HEIGHT);
         let controls = container(row![about, transport, volume].spacing(16).align_y(Alignment::Center)).padding([8, 8]).center_y(BAR_HEIGHT).width(Length::Fill);
@@ -1711,6 +1860,28 @@ impl App {
                 .on_exit(Message::BarHover(false))
                 .into(),
         )
+    }
+}
+
+/// Всплывающая панель у курсора. Не выходит за край окна.
+fn popup<'a>(content: Element<'a, Message>, x: f32, y: f32, width: f32, height: f32) -> Element<'a, Message> {
+    let (window_width, window_height) = *WINDOW.lock().unwrap();
+    let x = x.min(window_width - width - 8.0).max(8.0);
+    let y = y.min(window_height - height - 24.0).max(8.0);
+    container(container(content).width(width).padding(8).style(ui::popover))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(Padding::new(0.0).left(x).top(y))
+        .into()
+}
+
+fn codec_name(codec: &str) -> String {
+    match codec {
+        "flac" | "flac-mp4" => "FLAC".to_string(),
+        "mp3" => "MP3".to_string(),
+        "aac" | "aac-mp4" => "AAC".to_string(),
+        "he-aac" | "he-aac-mp4" => "HE-AAC".to_string(),
+        other => other.to_uppercase(),
     }
 }
 
@@ -1827,7 +1998,7 @@ fn smoke(query: &str) -> Result<(), String> {
     println!("Найдено: {}", tracks.len());
     let track = tracks.first().ok_or("Ничего не найдено")?;
     println!("Трек: {} — {} ({})", track.artists, track.title, clock(track.duration));
-    let info = api::file_info(&track.id, &token)?;
+    let info = api::file_info(&track.id, Quality::Normal.code(), &token)?;
     println!("Файл: {}, зашифрован: {}", info.codec, info.key.is_some());
     let player = Player::new()?;
     player.set_volume(0.05);
@@ -1838,6 +2009,27 @@ fn smoke(query: &str) -> Result<(), String> {
     player.seek(Duration::from_secs(30))?;
     std::thread::sleep(Duration::from_secs(2));
     println!("Позиция после перемотки на 30 с: {:?}", player.position());
+    Ok(())
+}
+
+/// Проверка без окна и без звука: каждое качество запускается и перематывается.
+fn smoke_quality(query: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let tracks = api::search(query, &token)?;
+    let track = tracks.first().ok_or("Ничего не найдено")?;
+    println!("Трек: {} — {}", track.artists, track.title);
+    let player = Player::new()?;
+    player.set_volume(0.0);
+    for quality in Quality::ALL {
+        let info = api::file_info(&track.id, quality.code(), &token)?;
+        let generation = player.stop();
+        player.play(generation, &info)?;
+        std::thread::sleep(Duration::from_secs(3));
+        let played = player.position();
+        player.seek(Duration::from_secs(30))?;
+        std::thread::sleep(Duration::from_secs(1));
+        println!("{}: {}, позиция {played:?}, после перемотки {:?}", quality.code(), info.codec, player.position());
+    }
     Ok(())
 }
 
@@ -1897,8 +2089,12 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" => {
-            let result = if flag == "--smoke" { smoke(query) } else { smoke_library(query) };
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" => {
+            let result = match flag.as_str() {
+                "--smoke" => smoke(query),
+                "--smoke-library" => smoke_library(query),
+                _ => smoke_quality(query),
+            };
             if let Err(e) = result {
                 println!("Ошибка: {e}");
                 std::process::exit(1);
@@ -1910,6 +2106,7 @@ fn main() -> iced::Result {
             "wave-seek" => Preview::WaveSeek,
             "likes" => Preview::Likes,
             "likes-end" => Preview::LikesEnd,
+            "panels" => Preview::Panels,
             "menu" => Preview::Menu,
             "collection" => Preview::Collection,
             "playlists" => Preview::Playlists,
@@ -1936,6 +2133,12 @@ fn main() -> iced::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_codecs() {
+        assert_eq!(codec_name("flac-mp4"), "FLAC");
+        assert_eq!(codec_name("he-aac-mp4"), "HE-AAC");
+    }
 
     #[test]
     fn builds_only_rows_near_the_screen() {

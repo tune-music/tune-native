@@ -25,11 +25,40 @@ impl Repeat {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Quality {
+    Low,
+    Normal,
+    Lossless,
+}
+
+impl Quality {
+    pub const ALL: [Quality; 3] = [Quality::Low, Quality::Normal, Quality::Lossless];
+
+    /// Как качество называется в запросе файла.
+    pub fn code(self) -> &'static str {
+        match self {
+            Quality::Low => "lq",
+            Quality::Normal => "nq",
+            Quality::Lossless => "lossless",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Quality::Low => "Экономичное",
+            Quality::Normal => "Оптимальное",
+            Quality::Lossless => "Превосходное",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
     pub volume: f32,
     pub muted: bool,
     pub repeat: Repeat,
     pub shuffle: bool,
+    pub quality: Quality,
 }
 
 fn parse(v: &Value) -> Settings {
@@ -42,6 +71,7 @@ fn parse(v: &Value) -> Settings {
             _ => Repeat::Off,
         },
         shuffle: v["shuffle"].as_bool().unwrap_or(false),
+        quality: Quality::ALL.into_iter().find(|q| v["quality"].as_str() == Some(q.code())).unwrap_or(Quality::Normal),
     }
 }
 
@@ -57,7 +87,7 @@ pub fn save(settings: Settings) {
         Repeat::All => "all",
         Repeat::One => "one",
     };
-    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle });
+    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code() });
     let dir = api::data_dir();
     if fs::create_dir_all(&dir).is_ok() {
         let _ = fs::write(dir.join("settings.json"), value.to_string());
@@ -70,10 +100,10 @@ mod tests {
 
     #[test]
     fn reads_saved_and_broken_values() {
-        let saved = parse(&json!({ "volume": 0.25, "muted": true, "repeat": "one", "shuffle": true }));
-        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true });
+        let saved = parse(&json!({ "volume": 0.25, "muted": true, "repeat": "one", "shuffle": true, "quality": "lossless" }));
+        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, quality: Quality::Lossless });
         let empty = parse(&Value::Null);
-        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false });
+        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, quality: Quality::Normal });
         assert_eq!(parse(&json!({ "volume": 7 })).volume, 1.0);
     }
 }
