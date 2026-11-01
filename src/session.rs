@@ -1,0 +1,156 @@
+//! Что играло при выходе: очередь и место в треке. Очередь меняется редко, а место каждые
+//! несколько секунд, поэтому они лежат в разных файлах.
+
+use std::fs;
+use std::path::Path;
+use std::time::Duration;
+
+use serde_json::{json, Value};
+
+use crate::api::{self, Track};
+
+const QUEUE_FILE: &str = "queue.json";
+const PLACE_FILE: &str = "place.json";
+
+pub struct Saved {
+    pub tracks: Vec<Track>,
+    pub title: String,
+    pub current: usize,
+    pub position: Duration,
+}
+
+fn track_value(track: &Track) -> Value {
+    json!({
+        "id": track.id,
+        "title": track.title,
+        "artists": track.artists,
+        "ms": track.duration.as_millis() as u64,
+        "cover": track.cover,
+        "album": track.album,
+        "albumTitle": track.album_title,
+        "artistList": track.artist_list,
+        "explicit": track.explicit,
+    })
+}
+
+fn track_from(v: &Value) -> Option<Track> {
+    Some(Track {
+        id: v["id"].as_str()?.to_string(),
+        title: v["title"].as_str()?.to_string(),
+        artists: v["artists"].as_str().unwrap_or_default().to_string(),
+        duration: Duration::from_millis(v["ms"].as_u64().unwrap_or(0)),
+        cover: v["cover"].as_str().map(str::to_string),
+        album: v["album"].as_str().map(str::to_string),
+        album_title: v["albumTitle"].as_str().unwrap_or_default().to_string(),
+        artist_list: serde_json::from_value(v["artistList"].clone()).unwrap_or_default(),
+        explicit: v["explicit"].as_bool().unwrap_or(false),
+        batch: None,
+    })
+}
+
+/// Сбой посреди записи не должен портить прошлый файл.
+fn write(dir: &Path, name: &str, value: &Value) {
+    if fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let draft = dir.join(format!("{name}.tmp"));
+    if fs::write(&draft, value.to_string()).is_ok() {
+        let _ = fs::rename(&draft, dir.join(name));
+    }
+}
+
+fn read(dir: &Path, name: &str) -> Option<Value> {
+    serde_json::from_slice(&fs::read(dir.join(name)).ok()?).ok()
+}
+
+fn load_from(dir: &Path) -> Option<Saved> {
+    let queue = read(dir, QUEUE_FILE)?;
+    let tracks: Vec<Track> = queue["tracks"].as_array()?.iter().filter_map(track_from).collect();
+    let place = read(dir, PLACE_FILE).unwrap_or(Value::Null);
+    let current = place["current"].as_u64().unwrap_or(0) as usize;
+    // Трек мог исчезнуть из файла: тогда лучше начать очередь сначала, чем не открыть её.
+    let (current, position) = if current < tracks.len() { (current, place["seconds"].as_f64().unwrap_or(0.0).max(0.0)) } else { (0, 0.0) };
+    if tracks.is_empty() {
+        return None;
+    }
+    let position = Duration::from_secs_f64(position).min(tracks[current].duration);
+    Some(Saved { title: queue["title"].as_str().unwrap_or_default().to_string(), tracks, current, position })
+}
+
+pub fn load() -> Option<Saved> {
+    load_from(&api::data_dir())
+}
+
+/// Запись идёт в фоне, чтобы диск не задерживал музыку.
+pub fn save_queue(tracks: Vec<Track>, title: String) {
+    std::thread::spawn(move || {
+        let tracks: Vec<Value> = tracks.iter().map(track_value).collect();
+        write(&api::data_dir(), QUEUE_FILE, &json!({ "title": title, "tracks": tracks }));
+    });
+}
+
+pub fn save_place(current: usize, position: Duration) {
+    std::thread::spawn(move || write(&api::data_dir(), PLACE_FILE, &json!({ "current": current, "seconds": position.as_secs_f64() })));
+}
+
+pub fn clear() {
+    let dir = api::data_dir();
+    let _ = fs::remove_file(dir.join(QUEUE_FILE));
+    let _ = fs::remove_file(dir.join(PLACE_FILE));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(id: &str, seconds: u64) -> Track {
+        Track {
+            id: id.to_string(),
+            title: format!("Песня {id}"),
+            artists: "Группа".to_string(),
+            duration: Duration::from_secs(seconds),
+            cover: Some("avatars/%%".to_string()),
+            album: Some("7".to_string()),
+            album_title: "Альбом".to_string(),
+            artist_list: vec![("Группа".to_string(), "5".to_string())],
+            explicit: true,
+            batch: None,
+        }
+    }
+
+    fn folder(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tune-session-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn restores_queue_and_place() {
+        let dir = folder("full");
+        let tracks = [track("1", 100), track("2", 200)];
+        write(&dir, QUEUE_FILE, &json!({ "title": "Лист", "tracks": tracks.iter().map(track_value).collect::<Vec<_>>() }));
+        write(&dir, PLACE_FILE, &json!({ "current": 1, "seconds": 42.5 }));
+        let saved = load_from(&dir).unwrap();
+        assert_eq!(saved.title, "Лист");
+        assert_eq!(saved.tracks, tracks);
+        assert_eq!(saved.current, 1);
+        assert_eq!(saved.position, Duration::from_secs_f64(42.5));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn survives_bad_place_and_missing_files() {
+        let dir = folder("bad");
+        assert!(load_from(&dir).is_none());
+        write(&dir, QUEUE_FILE, &json!({ "title": "", "tracks": [track_value(&track("1", 100))] }));
+        write(&dir, PLACE_FILE, &json!({ "current": 9, "seconds": 42.0 }));
+        let saved = load_from(&dir).unwrap();
+        assert_eq!((saved.current, saved.position), (0, Duration::ZERO));
+        // Место дальше конца трека приводится к концу.
+        write(&dir, PLACE_FILE, &json!({ "current": 0, "seconds": 500.0 }));
+        assert_eq!(load_from(&dir).unwrap().position, Duration::from_secs(100));
+        write(&dir, QUEUE_FILE, &json!({ "title": "", "tracks": [] }));
+        assert!(load_from(&dir).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

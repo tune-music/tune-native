@@ -8,6 +8,7 @@ mod login;
 mod media;
 mod player;
 mod seek;
+mod session;
 mod settings;
 mod ui;
 
@@ -89,6 +90,8 @@ const ROW: f32 = 58.0;
 /// Сколько строк держать готовыми за краем экрана.
 const ROW_MARGIN: usize = 6;
 const LIST: &str = "list";
+/// Как часто запоминать место в треке.
+const SESSION_SAVE: Duration = Duration::from_secs(10);
 const DIALOG_INPUT: &str = "dialog";
 const DIALOG_WIDTH: f32 = 400.0;
 /// Сколько последних треков показать в истории.
@@ -408,6 +411,13 @@ struct App {
     notice_fade: Fade<String>,
     /// От чего запущена волна; пусто у обычной Моей волны.
     wave_title: Option<String>,
+    /// Место в треке после перезапуска: действует, пока трек не запустили.
+    resume: Option<Duration>,
+    /// Куда перемотать, как только трек запустится.
+    resume_seek: Option<Duration>,
+    /// Какая очередь уже на диске и когда запоминали место.
+    session_key: Option<u64>,
+    session_at: Option<Instant>,
     /// Какую волну ждём: опоздавший ответ о прежней не должен её заменить.
     wave_wanted: Vec<String>,
     last_frame: Option<Instant>,
@@ -616,6 +626,10 @@ impl App {
             dialog_fade: Fade::new(DIALOG_OPEN, DIALOG_CLOSE),
             notice_fade: Fade::new(NOTICE_OPEN, NOTICE_CLOSE),
             wave_title: None,
+            resume: None,
+            resume_seek: None,
+            session_key: None,
+            session_at: None,
             wave_wanted: Vec::new(),
             last_frame: None,
             error,
@@ -789,6 +803,11 @@ impl App {
         self.wave = None;
         self.wave_pending = None;
         self.queue_title = None;
+        self.wave_title = None;
+        self.resume = None;
+        self.resume_seek = None;
+        self.session_key = None;
+        session::clear();
         self.pins.clear();
         self.wave_queue = false;
         self.current = None;
@@ -884,6 +903,35 @@ impl App {
         self.queue.get(self.current?)
     }
 
+    /// Возвращает очередь прошлого запуска. Музыка не включается сама.
+    fn restore(&mut self, saved: session::Saved) {
+        self.session_key = Some(queue_key(&saved.tracks, &saved.title));
+        self.queue = saved.tracks;
+        self.queue_title = Some(saved.title);
+        self.wave_queue = false;
+        self.current = Some(saved.current);
+        self.position = saved.position;
+        self.resume = Some(saved.position);
+    }
+
+    /// Запоминает очередь и место. Волну не хранит: при запуске начнётся новая.
+    fn save_session(&mut self) {
+        self.session_at = Some(Instant::now());
+        if self.wave_queue {
+            self.session_key = None;
+            session::clear();
+            return;
+        }
+        let Some(current) = self.current else { return };
+        let title = self.queue_title.clone().unwrap_or_default();
+        let key = queue_key(&self.queue, &title);
+        if self.session_key != Some(key) {
+            self.session_key = Some(key);
+            session::save_queue(self.queue.clone(), title);
+        }
+        session::save_place(current, self.position);
+    }
+
     fn play(&mut self, index: usize) -> Task<Message> {
         let (Some(player), Some(token), Some(track)) = (self.player.clone(), self.token(), self.queue.get(index).cloned()) else {
             return Task::none();
@@ -892,6 +940,8 @@ impl App {
             self.wave = Some(session);
             self.feedback("radioStarted", None, None);
         }
+        // Место прошлого запуска относится только к тому же треку.
+        let resume = self.resume.take().filter(|_| self.current == Some(index));
         self.retry = None;
         self.codec = None;
         let generation = player.stop();
@@ -899,7 +949,8 @@ impl App {
         self.current = Some(index);
         self.active = false;
         self.starting = true;
-        self.position = Duration::ZERO;
+        self.position = resume.unwrap_or(Duration::ZERO);
+        self.resume_seek = resume.filter(|place| !place.is_zero());
         self.seeking = None;
         self.error = None;
         self.feedback("trackStarted", Some(&track), None);
@@ -1254,7 +1305,13 @@ impl App {
                     }
                     None if self.section == Section::Likes => self.likes_more(),
                     // Главная сразу показывает трек и управление, как в оригинале.
-                    None if self.queue.is_empty() => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
+                    None if self.queue.is_empty() => match session::load() {
+                        Some(saved) => {
+                            self.restore(saved);
+                            Task::none()
+                        }
+                        None => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
+                    },
                     None => Task::none(),
                 };
                 return Task::batch([pins, page]);
@@ -2042,6 +2099,11 @@ impl App {
                         self.codec = Some(codec);
                         self.active = true;
                         self.failures = 0;
+                        self.save_session();
+                        if let Some(place) = self.resume_seek.take() {
+                            self.seeking = Some(place.as_secs_f32());
+                            return self.update(Message::SeekDone);
+                        }
                     }
                     Err(e) => {
                         let task = self.fail(e);
@@ -2065,6 +2127,7 @@ impl App {
                 if let Some(p) = &self.player {
                     p.toggle();
                 }
+                self.save_session();
             }
             Message::Next => {
                 if let Some(next) = self.next_index() {
@@ -2086,6 +2149,10 @@ impl App {
                 self.preload_next();
                 if let (true, Some(p)) = (self.active, &self.player) {
                     self.position = p.position();
+                    if self.session_at.is_none_or(|at| at.elapsed() >= SESSION_SAVE) {
+                        self.save_session();
+                    }
+                    let Some(p) = &self.player else { return Task::none() };
                     if p.is_empty() {
                         self.active = false;
                         if let Some(track) = self.current_track().cloned() {
@@ -2101,6 +2168,14 @@ impl App {
                 }
             }
             Message::Seek(value) => self.seeking = Some(value),
+            // Трек после перезапуска ещё не запущен: перемотка только запоминает место.
+            Message::SeekDone if self.resume.is_some() => {
+                if let Some(value) = self.seeking.take() {
+                    let place = Duration::from_secs_f32(value.max(0.0));
+                    self.position = place;
+                    self.resume = Some(place);
+                }
+            }
             Message::SeekDone => {
                 if let (Some(value), Some(p)) = (self.seeking.take(), self.player.clone()) {
                     let position = Duration::from_secs_f32(value.max(0.0));
@@ -3129,6 +3204,15 @@ fn clipped(text: &str, limit: usize) -> String {
         return text.to_string();
     }
     format!("{}…", text.chars().take(limit - 1).collect::<String>().trim_end())
+}
+
+/// Отпечаток очереди: менялась ли она с прошлой записи.
+fn queue_key(tracks: &[Track], title: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    title.hash(&mut hasher);
+    tracks.iter().for_each(|track| track.id.hash(&mut hasher));
+    hasher.finish()
 }
 
 /// Название трека. Есть альбом — ведёт к нему.

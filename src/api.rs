@@ -3,9 +3,10 @@
 //! Те же запросы делает оригинальный клиент. Данные приложения общеизвестны, их используют
 //! открытые клиенты (MarshalX/yandex-music-api).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
@@ -150,11 +151,77 @@ pub fn login_data_dir() -> PathBuf {
 }
 
 pub fn logout() {
+    forget_cache();
     let _ = std::fs::remove_file(token_path());
     let _ = std::fs::remove_dir_all(login_data_dir());
 }
 
+/// Сколько живёт ответ сервера: повторный заход на страницу не должен идти в сеть.
+const CACHE_TIME: Duration = Duration::from_secs(120);
+const CACHE_SIZE: usize = 64;
+/// Паузы перед повтором, когда Яндекс просит подождать.
+const BUSY_WAITS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
+/// Сколько блоков главной грузить одновременно.
+const HOME_PARALLEL: usize = 4;
+const BUSY: &str = "Яндекс просит подождать: слишком много запросов";
+
+#[derive(Default)]
+struct Cache {
+    entries: HashMap<String, (Instant, Value)>,
+}
+
+impl Cache {
+    fn get(&self, key: &str, now: Instant) -> Option<Value> {
+        self.entries.get(key).filter(|(at, _)| now.duration_since(*at) < CACHE_TIME).map(|(_, value)| value.clone())
+    }
+
+    fn put(&mut self, key: String, value: Value, now: Instant) {
+        self.entries.retain(|_, (at, _)| now.duration_since(*at) < CACHE_TIME);
+        if self.entries.len() >= CACHE_SIZE {
+            if let Some(oldest) = self.entries.iter().min_by_key(|(_, (at, _))| *at).map(|(key, _)| key.clone()) {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, (now, value));
+    }
+}
+
+static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Mutex::default);
+
+/// Любое изменение на сервере делает сохранённые ответы устаревшими.
+fn forget_cache() {
+    CACHE.lock().unwrap().entries.clear();
+}
+
+/// История и ссылки на файлы всегда нужны свежими.
+fn cacheable(path: &str) -> bool {
+    !path.starts_with("music-history") && !path.contains("file-info") && !path.starts_with("rotor")
+}
+
 fn get(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, String> {
+    let key = format!("{path}?{query:?}");
+    if cacheable(path) {
+        if let Some(value) = CACHE.lock().unwrap().get(&key, Instant::now()) {
+            return Ok(value);
+        }
+    }
+    let mut waits = BUSY_WAITS.iter();
+    let value = loop {
+        match fetch(path, query, token) {
+            Err(e) if e == BUSY => match waits.next() {
+                Some(wait) => std::thread::sleep(*wait),
+                None => return Err(e),
+            },
+            other => break other?,
+        }
+    };
+    if cacheable(path) {
+        CACHE.lock().unwrap().put(key, value.clone(), Instant::now());
+    }
+    Ok(value)
+}
+
+fn fetch(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, String> {
     let mut req = agent()
         .get(format!("{API}/{path}"))
         .header("Authorization", &format!("OAuth {token}"))
@@ -168,7 +235,7 @@ fn get(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, String>
         return Err(NEED_LOGIN.into());
     }
     if status == 429 {
-        return Err("Яндекс просит подождать: слишком много запросов".into());
+        return Err(BUSY.into());
     }
     let body = resp.into_body().read_to_string().map_err(|e| e.to_string())?;
     let v: Value = serde_json::from_str(&body).map_err(|_| format!("Яндекс ответил {status}"))?;
@@ -180,6 +247,10 @@ fn get(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, String>
 }
 
 fn post(path: &str, content_type: &str, body: String, token: &str) -> Result<Value, String> {
+    // Отзывы волны ничего из сохранённого не меняют.
+    if !path.starts_with("rotor") {
+        forget_cache();
+    }
     let resp = agent()
         .post(format!("{API}/{path}"))
         .header("Authorization", &format!("OAuth {token}"))
@@ -192,7 +263,7 @@ fn post(path: &str, content_type: &str, body: String, token: &str) -> Result<Val
         return Err(NEED_LOGIN.into());
     }
     if status == 429 {
-        return Err("Яндекс просит подождать: слишком много запросов".into());
+        return Err(BUSY.into());
     }
     let body = resp.into_body().read_to_string().map_err(|e| e.to_string())?;
     let v: Value = serde_json::from_str(&body).map_err(|_| format!("Яндекс ответил {status}"))?;
@@ -665,14 +736,18 @@ pub fn home(tab: usize, token: &str) -> Result<Home, String> {
         .flatten()
         .filter_map(|b| Some((b["data"]["title"].as_str().unwrap_or_default().to_string(), b["data"]["source"]["uri"].as_str()?.trim_start_matches('/').to_string())))
         .collect();
-    let handles: Vec<_> = sources
-        .into_iter()
-        .map(|(title, uri)| {
-            let token = token.to_string();
-            std::thread::spawn(move || get(&uri, &[], &token).ok().map(|v| parse_home_block(&title, result(&v))))
-        })
-        .collect();
-    let blocks = handles.into_iter().filter_map(|h| h.join().ok().flatten()).filter(|b| !b.title.is_empty() && (!b.items.is_empty() || !b.tracks.is_empty())).collect();
+    let mut blocks = Vec::new();
+    for part in sources.chunks(HOME_PARALLEL) {
+        let handles: Vec<_> = part
+            .iter()
+            .cloned()
+            .map(|(title, uri)| {
+                let token = token.to_string();
+                std::thread::spawn(move || get(&uri, &[], &token).ok().map(|v| parse_home_block(&title, result(&v))))
+            })
+            .collect();
+        blocks.extend(handles.into_iter().filter_map(|h| h.join().ok().flatten()).filter(|b| !b.title.is_empty() && (!b.items.is_empty() || !b.tracks.is_empty())));
+    }
     Ok(Home { tabs: names, blocks })
 }
 
@@ -784,6 +859,7 @@ impl PinRef {
 pub fn set_pinned(target: &PinRef, pinned: bool, token: &str) -> Result<(), String> {
     let url = format!("{API}/{}", target.path());
     let body = target.body().to_string();
+    forget_cache();
     let request = if pinned { agent().put(url) } else { agent().delete(url).force_send_body() };
     let resp = request
         .header("Authorization", &format!("OAuth {token}"))
@@ -967,6 +1043,22 @@ mod tests {
         assert_eq!(names(track(r#"{"trackSource":"UGC","artists":[{"name":"А"}]}"#)), ["А="]);
         // Обычный исполнитель с запятой в имени остаётся целым.
         assert_eq!(names(track(r#"{"artists":[{"id":5,"name":"Tyler, The Creator"}]}"#)), ["Tyler, The Creator=5"]);
+    }
+
+    #[test]
+    fn cache_keeps_fresh_answers_only() {
+        let now = Instant::now();
+        let mut cache = Cache::default();
+        cache.put("a".to_string(), json!(1), now);
+        assert_eq!(cache.get("a", now + CACHE_TIME / 2), Some(json!(1)));
+        assert_eq!(cache.get("a", now + CACHE_TIME), None);
+        assert_eq!(cache.get("b", now), None);
+        for i in 0..CACHE_SIZE + 5 {
+            cache.put(format!("k{i}"), json!(i), now + Duration::from_millis(i as u64));
+        }
+        assert!(cache.entries.len() <= CACHE_SIZE);
+        assert_eq!(cache.get("k0", now + CACHE_TIME / 2), None);
+        assert!(!cacheable("music-history") && !cacheable("get-file-info") && cacheable("albums/1/with-tracks"));
     }
 
     #[test]
