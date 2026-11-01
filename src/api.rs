@@ -48,6 +48,15 @@ impl Track {
 }
 
 #[derive(Clone, Debug)]
+pub struct Playlist {
+    pub owner: String,
+    pub kind: String,
+    pub title: String,
+    pub count: u64,
+    pub cover: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct Wave {
     pub session: String,
     pub tracks: Vec<Track>,
@@ -243,6 +252,55 @@ pub fn set_liked(uid: &str, track_id: &str, liked: bool, token: &str) -> Result<
     Ok(())
 }
 
+/// Дизлайк: Яндекс больше не предложит этот трек.
+pub fn set_disliked(uid: &str, track_id: &str, disliked: bool, token: &str) -> Result<(), String> {
+    let path = if disliked {
+        format!("users/{uid}/dislikes/tracks/add?track-id={track_id}")
+    } else {
+        format!("users/{uid}/dislikes/tracks/{track_id}/remove")
+    };
+    let v = post(&path, "application/x-www-form-urlencoded", String::new(), token)?;
+    if result(&v)["revision"].is_null() {
+        return Err("Яндекс не сохранил дизлайк".into());
+    }
+    Ok(())
+}
+
+pub fn disliked_ids(uid: &str, token: &str) -> Result<Vec<String>, String> {
+    let v = get(&format!("users/{uid}/dislikes/tracks"), &[], token)?;
+    let tracks = result(&v)["library"]["tracks"].as_array().cloned().unwrap_or_default();
+    Ok(tracks
+        .iter()
+        .filter_map(|t| match &t["id"] {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+        .collect())
+}
+
+fn parse_playlist(v: &Value, uid: &str) -> Option<Playlist> {
+    let kind = v["kind"].as_u64()?.to_string();
+    let cover = v["cover"]["uri"].as_str().or(v["cover"]["itemsUri"][0].as_str()).or(v["ogImage"].as_str());
+    Some(Playlist {
+        owner: v["owner"]["uid"].as_u64().map_or_else(|| uid.to_string(), |u| u.to_string()),
+        kind,
+        title: v["title"].as_str()?.to_string(),
+        count: v["trackCount"].as_u64().unwrap_or(0),
+        cover: cover.filter(|c| !c.is_empty()).map(str::to_string),
+    })
+}
+
+pub fn playlists(uid: &str, token: &str) -> Result<Vec<Playlist>, String> {
+    let v = get(&format!("users/{uid}/playlists/list"), &[], token)?;
+    Ok(v["result"].as_array().into_iter().flatten().filter_map(|p| parse_playlist(p, uid)).collect())
+}
+
+pub fn playlist_tracks(playlist: &Playlist, token: &str) -> Result<Vec<Track>, String> {
+    let v = get(&format!("users/{}/playlists/{}", playlist.owner, playlist.kind), &[("rich-tracks", "true")], token)?;
+    Ok(result(&v)["tracks"].as_array().into_iter().flatten().filter_map(|item| parse_track(&item["track"])).collect())
+}
+
 fn parse_sequence(v: &Value) -> Vec<Track> {
     let batch = v["batchId"].as_str().map(str::to_string);
     v["sequence"]
@@ -350,6 +408,13 @@ pub fn cover(uri: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_uses_owner_and_cover() {
+        let v: Value = serde_json::from_str(r#"{"kind":3,"title":"P","trackCount":2,"owner":{"uid":8},"cover":{"itemsUri":["a/%%"]}}"#).unwrap();
+        let p = parse_playlist(&v, "1").unwrap();
+        assert_eq!((p.owner.as_str(), p.kind.as_str(), p.count, p.cover.as_deref()), ("8", "3", 2, Some("a/%%")));
+    }
 
     #[test]
     fn timestamp_is_iso() {
