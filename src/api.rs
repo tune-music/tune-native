@@ -34,6 +34,8 @@ pub struct Track {
     pub album_title: String,
     /// Имя и номер каждого исполнителя.
     pub artist_list: Vec<(String, String)>,
+    /// С ненормативной лексикой.
+    pub explicit: bool,
     /// Пачка волны, из которой пришёл трек.
     pub batch: Option<String>,
 }
@@ -165,6 +167,9 @@ fn get(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, String>
     if status == 401 {
         return Err(NEED_LOGIN.into());
     }
+    if status == 429 {
+        return Err("Яндекс просит подождать: слишком много запросов".into());
+    }
     let body = resp.into_body().read_to_string().map_err(|e| e.to_string())?;
     let v: Value = serde_json::from_str(&body).map_err(|_| format!("Яндекс ответил {status}"))?;
     if status != 200 {
@@ -185,6 +190,9 @@ fn post(path: &str, content_type: &str, body: String, token: &str) -> Result<Val
     let status = resp.status().as_u16();
     if status == 401 {
         return Err(NEED_LOGIN.into());
+    }
+    if status == 429 {
+        return Err("Яндекс просит подождать: слишком много запросов".into());
     }
     let body = resp.into_body().read_to_string().map_err(|e| e.to_string())?;
     let v: Value = serde_json::from_str(&body).map_err(|_| format!("Яндекс ответил {status}"))?;
@@ -236,6 +244,7 @@ fn parse_track(v: &Value) -> Option<Track> {
         album: v["albums"][0]["id"].as_u64().map(|a| a.to_string()),
         album_title: v["albums"][0]["title"].as_str().unwrap_or_default().to_string(),
         artist_list: parse_track_artists(v),
+        explicit: v["contentWarning"].as_str() == Some("explicit"),
         batch: None,
     })
 }
