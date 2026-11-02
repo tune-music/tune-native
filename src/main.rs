@@ -158,6 +158,8 @@ const DIALOG_OPEN: f32 = 0.2;
 const FULL_CHROME: f32 = 330.0;
 const FULL_COVER_MAX: f32 = 560.0;
 const FULL_TINT: f32 = 0.55;
+/// Как быстро фон перетекает в цвет обложки нового трека: чем больше, тем короче переход.
+const FULL_TINT_SPEED: f32 = 5.0;
 const DIALOG_CLOSE: f32 = 0.13;
 /// За сколько секунд плеер на всё окно выезжает и уезжает.
 const FULL_OPEN: f32 = 0.32;
@@ -586,6 +588,8 @@ struct App {
     full_fade: Fade<()>,
     /// Средний цвет крупной обложки трека: им окрашен фон плеера на всё окно.
     cover_tints: HashMap<String, iced::Color>,
+    /// Цвет фона плеера на всё окно сейчас: догоняет цвет обложки играющего трека.
+    full_tint: iced::Color,
     notice_fade: Fade<String>,
     /// От чего запущена волна; пусто у обычной Моей волны.
     wave_title: Option<String>,
@@ -932,6 +936,7 @@ impl App {
             player_full: false,
             full_fade: Fade::new(FULL_OPEN, FULL_CLOSE),
             cover_tints: HashMap::new(),
+            full_tint: ui::TILE,
             notice_fade: Fade::new(NOTICE_OPEN, NOTICE_CLOSE),
             wave_title: None,
             wave_tuning: saved.wave,
@@ -970,7 +975,7 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        self.pin_fade.busy() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.notice_fade.busy()
+        self.pin_fade.busy() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy()
     }
 
     /// Сколько места занимает основная часть окна.
@@ -1391,6 +1396,12 @@ impl App {
         listen
     }
 
+    /// Цвет обложки играющего трека: по крупной, а пока её нет — по уже загруженной мелкой.
+    fn full_target(&self) -> iced::Color {
+        let Some(track) = self.current_track() else { return ui::TILE };
+        self.cover_tints.get(&track.id).copied().or_else(|| self.covers.get(&track.id).and_then(average_color)).unwrap_or(ui::TILE)
+    }
+
     fn current_track(&self) -> Option<&Track> {
         self.queue.get(self.current?)
     }
@@ -1772,6 +1783,12 @@ impl App {
             self.quality_fade.step(elapsed);
             self.dialog_fade.step(elapsed);
             self.full_fade.step(elapsed);
+            if self.full_fade.item.is_some() {
+                let target = self.full_target();
+                let part = 1.0 - (-elapsed * FULL_TINT_SPEED).exp();
+                let mix = |from: f32, to: f32| from + (to - from) * part;
+                self.full_tint = if same_color(self.full_tint, target) { target } else { iced::Color::from_rgb(mix(self.full_tint.r, target.r), mix(self.full_tint.g, target.g), mix(self.full_tint.b, target.b)) };
+            }
             self.notice_fade.step(elapsed);
             let lyrics = if self.section == Section::Lyrics && (self.lyrics_shown != self.lyrics_target || self.lyrics_back < 1.0 || self.page_veil > 0.0) {
                 self.lyrics_shown += (self.lyrics_target - self.lyrics_shown) * (elapsed * LYRICS_SPEED).min(1.0);
@@ -1804,6 +1821,8 @@ impl App {
             if remembers_scroll(place.0) {
                 self.scroll_places.insert(place.clone(), offset);
             }
+            // Открыли исполнителя, альбом или другую страницу из плеера на всё окно — он уезжает.
+            self.player_full = false;
             let here = self.list_place();
             let section_root = matches!(here.0, Section::Home | Section::Likes | Section::Collection | Section::Albums | Section::Artists | Section::History | Section::Dislikes | Section::Search | Section::Settings)
                 || (here.0 == Section::Playlists && here.1.is_none());
@@ -3282,7 +3301,13 @@ impl App {
                 return Task::batch([iced::clipboard::write(track.share_link()), notice]);
             }
             Message::Unavailable => return self.notify(UNAVAILABLE.to_string()),
-            Message::FullToggle => self.player_full = !self.player_full && self.current_track().is_some(),
+            Message::FullToggle => {
+                self.player_full = !self.player_full && self.current_track().is_some();
+                // Плеер выезжает уже в цвете обложки, без перехода от серого.
+                if self.player_full && self.full_fade.item.is_none() {
+                    self.full_tint = self.full_target();
+                }
+            }
             Message::Availability(Ok(found)) => {
                 let found: HashMap<String, bool> = found.into_iter().collect();
                 for track in &mut self.queue {
@@ -4273,9 +4298,10 @@ impl App {
         let (width, height) = *WINDOW.lock().unwrap();
         let art = (height - FULL_CHROME).min(width - 48.0).clamp(WAVE_COVER_MIN, FULL_COVER_MAX);
         let line = (width - 48.0).min(WAVE_COLUMN);
-        let tint = self.cover_tints.get(&track.id).copied().unwrap_or(ui::TILE);
+        let tint = self.full_tint;
         // Цвет обложки приглушён, чтобы белый текст читался на любой картинке.
-        let top = iced::Color::from_rgb(tint.r * FULL_TINT, tint.g * FULL_TINT, tint.b * FULL_TINT);
+        let shade = move |level: f32| iced::Color::from_rgb(tint.r * level, tint.g * level, tint.b * level);
+        let top = shade(FULL_TINT);
         let source = if self.wave_queue { self.wave_title.clone().unwrap_or_else(|| "Моя волна".to_string()) } else { self.queue_title.clone().unwrap_or_default() };
         let collapse = glow(button(ui::icon(ui::COLLAPSE, 32.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::FullToggle), 20.0);
         let label = text(clipped(&source, WAVE_LABEL)).size(16).font(ui::font_medium()).color(ui::MUTED).wrapping(Wrapping::None);
@@ -4283,7 +4309,7 @@ impl App {
         let tools = row![Space::new().width(Length::Fill), self.view_tools(22.0, true), self.view_volume(22.0, Some(120.0))].spacing(10).align_y(Alignment::Center);
         let page = column![head, container(self.player_body(track, art, line, top)).center(Length::Fill), tools].padding(24).width(Length::Fill).height(Length::Fill);
         let back = move |_: &iced::Theme| container::Style {
-            background: Some(iced::Background::Gradient(iced::Gradient::Linear(iced::gradient::Linear::new(iced::Radians(std::f32::consts::PI)).add_stop(0.0, top).add_stop(1.0, ui::BLACK)))),
+            background: Some(iced::Background::Gradient(iced::Gradient::Linear(iced::gradient::Linear::new(iced::Radians(std::f32::consts::PI)).add_stop(0.0, top).add_stop(0.35, shade(FULL_TINT * 0.72)).add_stop(0.7, shade(FULL_TINT * 0.42)).add_stop(1.0, shade(FULL_TINT * 0.22))))),
             ..container::Style::default()
         };
         let shown = self.full_fade.shown();
@@ -5371,22 +5397,30 @@ impl PipeMedia for Subscription<Message> {
     }
 }
 
-/// Готовые пиксели обложки. Сжатую картинку iced распаковал бы прямо во время кадра,
-/// и при смене страницы с десятком новых обложек анимация спотыкалась бы.
-/// Средний цвет картинки по каждой десятой точке: для фона хватает.
-fn average_color(handle: &image::Handle) -> Option<iced::Color> {
-    let image::Handle::Rgba { pixels, .. } = handle else { return None };
-    let (mut sum, mut count) = ([0u64; 3], 0u64);
-    for pixel in pixels.chunks_exact(4).step_by(10) {
-        for (total, value) in sum.iter_mut().zip(pixel) {
-            *total += *value as u64;
-        }
-        count += 1;
-    }
-    let part = |total: u64| (total / count.max(1)) as f32 / 255.0;
-    (count > 0).then(|| iced::Color::from_rgb(part(sum[0]), part(sum[1]), part(sum[2])))
+/// Цвета неотличимы на глаз: переход можно закончить.
+fn same_color(a: iced::Color, b: iced::Color) -> bool {
+    (a.r - b.r).abs().max((a.g - b.g).abs()).max((a.b - b.b).abs()) < 0.004
 }
 
+/// Основной цвет обложки по каждой десятой точке. Яркие точки весят больше серых:
+/// простое среднее смешало бы цвета в бурый, а серая обложка и так останется серой.
+fn average_color(handle: &image::Handle) -> Option<iced::Color> {
+    let image::Handle::Rgba { pixels, .. } = handle else { return None };
+    let (mut sum, mut weights) = ([0f32; 3], 0f32);
+    for pixel in pixels.chunks_exact(4).step_by(10) {
+        let (high, low) = (pixel[..3].iter().max()?, pixel[..3].iter().min()?);
+        let weight = (high - low) as f32 / 255.0 + 0.08;
+        for (total, value) in sum.iter_mut().zip(pixel) {
+            *total += *value as f32 * weight;
+        }
+        weights += weight;
+    }
+    let part = |total: f32| total / weights / 255.0;
+    (weights > 0.0).then(|| iced::Color::from_rgb(part(sum[0]), part(sum[1]), part(sum[2])))
+}
+
+/// Готовые пиксели обложки. Сжатую картинку iced распаковал бы прямо во время кадра,
+/// и при смене страницы с десятком новых обложек анимация спотыкалась бы.
 fn decoded(bytes: &[u8]) -> Option<image::Handle> {
     let picture = ::image::load_from_memory(bytes).ok()?.into_rgba8();
     let (width, height) = picture.dimensions();
