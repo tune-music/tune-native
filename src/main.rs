@@ -75,6 +75,11 @@ const NOTICE_TIME: Duration = Duration::from_secs(4);
 static CURSOR: Mutex<(f32, f32)> = Mutex::new((0.0, 0.0));
 static WINDOW: Mutex<(f32, f32)> = Mutex::new((1280.0, 820.0));
 const PIN_COVER_PREFIX: &str = "pin:";
+const AVATAR_COVER: &str = "avatar";
+const AVATAR_SIZE: f32 = 42.0;
+const ACCOUNT_AVATAR: f32 = 72.0;
+const ACCOUNT_LINK: &str = "https://id.yandex.ru/";
+const PLUS_LINK: &str = "https://plus.yandex.ru/my";
 const SIDEBAR: f32 = 224.0;
 const LIKE: f32 = 32.0;
 /// Постоянное место под полосу прокрутки: колонка времени не прыгает на коротких списках.
@@ -282,6 +287,8 @@ enum Dialog {
     Delete(Playlist),
     WaveTune,
     TrackInfo(Track),
+    Logout,
+    Account,
 }
 
 /// Вкладка поиска.
@@ -360,6 +367,11 @@ enum Preview {
     Filter(String),
     /// Сведения о первом треке лайков.
     TrackInfo,
+    Account,
+    LogoutAsk,
+    PinMenu,
+    /// Нажатие на закреп под этим номером, без звука.
+    PinPlay(usize),
     /// Плейлист по владельцу и номеру или альбом, прокрученные до «Похожего».
     SimilarOf(Playlist),
     /// Очередь, прокрученная вниз, в которой включается трек ниже.
@@ -415,6 +427,11 @@ struct App {
     liked: Vec<Track>,
     likes_loading: bool,
     pins: Vec<Pin>,
+    /// Меню закрепа: его номер и точка клика.
+    pin_menu: Option<(usize, f32, f32)>,
+    pin_fade: Fade<(usize, f32, f32)>,
+    /// Последний нажатый закреп: ответ на прошлое нажатие уже не нужен.
+    pin_wanted: u64,
     playlists: Vec<Playlist>,
     playlists_loading: bool,
     /// Открытый плейлист и его треки; показывается только начало списка.
@@ -599,6 +616,10 @@ enum Message {
     PlaylistsLoaded(Result<Vec<Playlist>, String>),
     PlaylistOpen(usize),
     PinOpen(usize),
+    PinPage(usize),
+    PinMenu(usize),
+    PinTracks(u64, Playlist, String, Result<Vec<Track>, String>),
+    OpenLink(&'static str),
     PinsLoaded(Result<Vec<Pin>, String>),
     PlaylistLoaded(String, Result<Vec<Track>, String>),
     SimilarLoaded(String, Result<Vec<HomeItem>, String>),
@@ -704,6 +725,9 @@ impl App {
             liked: Vec::new(),
             likes_loading: false,
             pins: Vec::new(),
+            pin_menu: None,
+            pin_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
+            pin_wanted: 0,
             playlists: Vec::new(),
             playlists_loading: false,
             playlist: None,
@@ -781,7 +805,7 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.dialog_fade.busy() || self.notice_fade.busy()
+        self.pin_fade.busy() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.dialog_fade.busy() || self.notice_fade.busy()
     }
 
     /// Сколько места занимает основная часть окна.
@@ -791,6 +815,34 @@ impl App {
     }
 
     /// Свой обычный плейлист: его можно менять.
+    fn is_favorites(&self, list: &Playlist) -> bool {
+        list.source == Source::Playlist && list.kind == FAVORITES_KIND && self.uid.as_deref() == Some(list.owner.as_str())
+    }
+
+    fn queue_from_list(&self, list: Playlist) -> QueueFrom {
+        if self.is_favorites(&list) {
+            QueueFrom::Likes
+        } else if list.source == Source::Artist {
+            QueueFrom::Artist(list.kind)
+        } else {
+            QueueFrom::List(list)
+        }
+    }
+
+    /// Сейчас играет то, что на этом закрепе.
+    fn pin_active(&self, pin: &Pin) -> bool {
+        match &pin.target {
+            PinTarget::Wave(seeds) => self.wave_queue && self.wave_base == *seeds,
+            PinTarget::List(_) if self.wave_queue => false,
+            PinTarget::List(list) => match (&self.queue_from, self.queue_from_list(list.clone())) {
+                (QueueFrom::Likes, QueueFrom::Likes) => true,
+                (QueueFrom::Artist(a), QueueFrom::Artist(b)) => *a == b,
+                (QueueFrom::List(a), QueueFrom::List(b)) => a.source == b.source && a.kind == b.kind && a.owner == b.owner,
+                _ => false,
+            },
+        }
+    }
+
     fn is_own(&self, list: &Playlist) -> bool {
         list.source == Source::Playlist && list.kind != FAVORITES_KIND && self.uid.as_deref() == Some(list.owner.as_str())
     }
@@ -953,6 +1005,7 @@ impl App {
         self.session_key = None;
         session::clear();
         self.pins.clear();
+        self.pin_menu = None;
         self.wave_queue = false;
         self.current = None;
         self.active = false;
@@ -1047,7 +1100,7 @@ impl App {
         cards.extend(self.similar.iter().map(home_item_key));
         cards.extend(self.current_track().map(|t| format!("{WAVE_BIG}{}", t.id)));
         cards.extend(page.iter().map(|a| format!("{ARTIST_COVER}{}", a.id)));
-        self.covers.retain(|id, _| id.starts_with(PLAYLIST_COVER) || id.starts_with(PIN_COVER_PREFIX) || cards.contains(id) || keep.contains(id));
+        self.covers.retain(|id, _| id == AVATAR_COVER || id.starts_with(PLAYLIST_COVER) || id.starts_with(PIN_COVER_PREFIX) || cards.contains(id) || keep.contains(id));
         self.requested.borrow_mut().retain(|id| self.covers.contains_key(id));
     }
 
@@ -1338,6 +1391,7 @@ impl App {
                 *level < 1.0
             });
             self.menu_fade.step(elapsed);
+            self.pin_fade.step(elapsed);
             self.quality_fade.step(elapsed);
             self.dialog_fade.step(elapsed);
             self.notice_fade.step(elapsed);
@@ -1417,6 +1471,7 @@ impl App {
     fn sync_overlays(&mut self) {
         self.menu_fade.sync(self.menu.as_ref().map(|(track, x, y)| (track.clone(), *x, *y, self.menu_artists, self.menu_lists)));
         self.quality_fade.sync(self.quality_menu);
+        self.pin_fade.sync(self.pin_menu);
         self.dialog_fade.sync(self.dialog.clone());
         self.notice_fade.sync(self.notice.as_ref().map(|(_, text)| text.clone()));
         let track = self.current_track().map(|track| track.id.clone());
@@ -1485,7 +1540,8 @@ impl App {
                 self.liked_set = ids.iter().cloned().collect();
                 self.liked_ids = ids;
                 let pins = self.token().map_or(Task::none(), |token| Task::perform(background(move || api::pins(&token)), Message::PinsLoaded));
-                let pins = Task::batch([pins, self.liked_pages_load()]);
+                let avatar = self.profile.as_ref().and_then(|p| p.avatar.clone()).map_or(Task::none(), |uri| self.fetch_cover_jobs(vec![(AVATAR_COVER.to_string(), uri)], "islands-200"));
+                let pins = Task::batch([pins, avatar, self.liked_pages_load()]);
                 let page = match self.preview.clone() {
                     Some(Preview::Wave | Preview::WaveSeek) => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
                     Some(Preview::Lyrics) => self.wave_load(vec!["artist:3121".to_string()], None, false),
@@ -1535,6 +1591,15 @@ impl App {
                         // Отдельным сообщением: смена страницы очищает поиск уже после этого обработчика.
                         Task::batch([page, Task::done(Message::Filter(query))])
                     }
+                    Some(Preview::Account) => {
+                        self.preview = None;
+                        self.update(Message::DialogOpen(Dialog::Account))
+                    }
+                    Some(Preview::LogoutAsk) => {
+                        self.preview = None;
+                        self.update(Message::DialogOpen(Dialog::Logout))
+                    }
+                    Some(Preview::PinMenu | Preview::PinPlay(_)) => Task::none(),
                     Some(Preview::Search(query)) => {
                         self.preview = None;
                         self.section = Section::Search;
@@ -1556,29 +1621,77 @@ impl App {
             }
             Message::PinsLoaded(Ok(pins)) => {
                 self.pins = pins;
-                let jobs = self.pins.iter().enumerate().filter_map(|(i, p)| Some((format!("{PIN_COVER_PREFIX}{i}"), p.cover.clone()?))).collect();
-                return self.fetch_cover_jobs(jobs, "100x100");
+                let jobs = self.pins.iter().filter_map(|p| Some((format!("{PIN_COVER_PREFIX}{}", p.key()), p.cover.clone()?))).collect();
+                let covers = self.fetch_cover_jobs(jobs, "100x100");
+                match self.preview.clone() {
+                    Some(Preview::PinMenu) => {
+                        self.preview = None;
+                        self.pin_menu = Some((0, 200.0, 300.0));
+                    }
+                    Some(Preview::PinPlay(index)) => {
+                        self.preview = None;
+                        self.muted = true;
+                        self.apply_volume();
+                        return Task::batch([covers, self.handle(Message::PinOpen(index))]);
+                    }
+                    _ => {}
+                }
+                return covers;
             }
             // Закрепления не должны мешать музыке.
             Message::PinsLoaded(Err(_)) => {}
-            Message::PinOpen(index) => match self.pins.get(index).map(|p| p.target.clone()) {
-                Some(PinTarget::List(list)) if list.source == Source::Artist => return self.update(Message::ArtistOpen(list.kind)),
-                Some(PinTarget::List(list)) => {
-                    let favorites = list.source == Source::Playlist && list.kind == "3" && self.uid.as_deref() == Some(list.owner.as_str());
-                    if favorites {
-                        return self.update(Message::Open(Section::Likes));
-                    }
-                    return self.open_list(list);
+            // Закреп включает то, что на нём: волну, плейлист, альбом или исполнителя.
+            Message::PinOpen(index) => {
+                let Some(pin) = self.pins.get(index).cloned() else { return Task::none() };
+                if self.pin_active(&pin) && self.current.is_some() {
+                    return self.handle(Message::Toggle);
                 }
-                Some(PinTarget::Wave(seeds)) => {
-                    if seeds.len() == 1 && seeds[0] == api::MY_WAVE {
-                        return self.update(Message::Open(Section::Wave));
+                self.pin_wanted += 1;
+                match pin.target {
+                    PinTarget::Wave(seeds) => {
+                        let title = (seeds != [api::MY_WAVE]).then_some(pin.title);
+                        return self.handle(Message::WaveStartSeeds(seeds, title));
                     }
-                    let title = self.pins.get(index).map(|p| p.title.clone());
-                    return self.update(Message::WaveStartSeeds(seeds, title));
+                    PinTarget::List(list) => {
+                        let Some(token) = self.token() else { return Task::none() };
+                        let (id, title, wanted) = (self.pin_wanted, pin.title, list.clone());
+                        return Task::perform(background(move || api::playlist_tracks(&wanted, &token)), move |r| Message::PinTracks(id, list.clone(), title.clone(), r));
+                    }
                 }
-                None => {}
-            },
+            }
+            Message::PinTracks(id, list, title, result) => {
+                if id != self.pin_wanted {
+                    return Task::none();
+                }
+                return match result {
+                    Ok(tracks) if tracks.is_empty() => self.notify("Здесь пока нет треков".to_string()),
+                    Ok(tracks) => {
+                        self.queue_from = self.queue_from_list(list);
+                        self.play_list(tracks, title, 0)
+                    }
+                    Err(e) => self.fail(e),
+                };
+            }
+            // Страница закрепа: открывается из его меню.
+            Message::PinPage(index) => {
+                self.pin_menu = None;
+                match self.pins.get(index).map(|p| p.target.clone()) {
+                    Some(PinTarget::List(list)) if list.source == Source::Artist => return self.handle(Message::ArtistOpen(list.kind)),
+                    Some(PinTarget::List(list)) if self.is_favorites(&list) => return self.handle(Message::Open(Section::Likes)),
+                    Some(PinTarget::List(list)) => return self.open_list(list),
+                    Some(PinTarget::Wave(_)) | None => {}
+                }
+            }
+            Message::PinMenu(index) => {
+                let (x, y) = *CURSOR.lock().unwrap();
+                self.pin_menu = Some((index, x, y));
+            }
+            Message::OpenLink(link) => {
+                // Покупки и настройки аккаунта живут на сайтах Яндекса.
+                if let Err(e) = std::process::Command::new("explorer").arg(link).spawn() {
+                    return self.fail(format!("Не удалось открыть браузер: {e}"));
+                }
+            }
             Message::Account(Err(e)) => return self.fail_retry(e, Message::AccountRetry),
             Message::AccountRetry => {
                 if let Some(token) = self.token() {
@@ -2155,6 +2268,7 @@ impl App {
             }
             Message::MenuClose => {
                 self.menu = None;
+                self.pin_menu = None;
                 self.quality_menu = None;
                 self.dialog = None;
             }
@@ -2182,7 +2296,7 @@ impl App {
                         move || api::credits(&id, &token)
                     }), move |r| Message::TrackInfoLoaded(id.clone(), r));
                 }
-                let focus = !matches!(dialog, Dialog::Delete(_) | Dialog::WaveTune);
+                let focus = !matches!(dialog, Dialog::Delete(_) | Dialog::WaveTune | Dialog::Logout | Dialog::Account);
                 self.dialog = Some(dialog);
                 if focus {
                     return operation::focus(Id::new(DIALOG_INPUT));
@@ -2206,7 +2320,8 @@ impl App {
                 }
                 self.dialog = None;
                 return match dialog {
-                    Dialog::WaveTune | Dialog::TrackInfo(_) => Task::none(),
+                    Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account => Task::none(),
+                    Dialog::Logout => self.handle(Message::Logout),
                     Dialog::Create => Task::perform(background(move || api::create_playlist(&uid, &title, &token)), Message::PlaylistCreated),
                     Dialog::Rename(list) => {
                         let kind = list.kind;
@@ -2309,6 +2424,7 @@ impl App {
                 return Task::perform(background(move || api::set_visibility(&uid, &list.kind, value, &token)), Message::SimpleSaved);
             }
             Message::Pin(target) => {
+                self.pin_menu = None;
                 let Some(token) = self.token() else { return Task::none() };
                 let pinned = !self.pins.iter().any(|pin| target.matches(pin));
                 return Task::perform(background(move || api::set_pinned(&target, pinned, &token)), Message::PinSaved);
@@ -2710,11 +2826,14 @@ impl App {
         let columns = row![self.view_sidebar(), main];
         let base = container(columns).width(Length::Fill).height(Length::Fill).style(ui::root);
         let mut layers = stack![base];
-        if self.menu.is_some() || self.quality_menu.is_some() {
+        if self.menu.is_some() || self.quality_menu.is_some() || self.pin_menu.is_some() {
             layers = layers.push(mouse_area(container(Space::new()).width(Length::Fill).height(Length::Fill)).on_press(Message::MenuClose).on_right_press(Message::MenuClose));
         }
         if let Some((track, x, y, artists, lists)) = &self.menu_fade.item {
             layers = layers.push(self.view_menu(track, *x, *y, *artists, *lists));
+        }
+        if let Some((index, x, y)) = self.pin_fade.item {
+            layers = layers.push(self.view_pin_menu(index, x, y));
         }
         if let Some((x, y)) = self.quality_fade.item {
             layers = layers.push(self.view_quality(x, y));
@@ -2742,6 +2861,8 @@ impl App {
         let (title, confirm, danger): (String, &str, bool) = match dialog {
             Dialog::WaveTune => return self.view_wave_tune(),
             Dialog::TrackInfo(track) => return self.view_track_info(track),
+            Dialog::Account => return self.view_account(),
+            Dialog::Logout => ("Выйти из аккаунта?".to_string(), "Выйти", true),
             Dialog::Create => ("Новый плейлист".to_string(), "Создать", false),
             Dialog::Rename(_) => ("Название плейлиста".to_string(), "Сохранить", false),
             Dialog::Describe(_) => ("Описание плейлиста".to_string(), "Сохранить", false),
@@ -2762,6 +2883,70 @@ impl App {
         // Затемнение ловит клики, чтобы страница под окном не реагировала.
         let dim = ui::BLACK.scale_alpha(0.6 * alpha);
         reveal(mouse_area(container(mouse_area(window).on_press(Message::DialogInput(self.dialog_text.clone()))).center(Length::Fill).style(move |_| container::Style::default().background(dim))).on_press(Message::MenuClose)).inert(!self.dialog_fade.live).into()
+    }
+
+    fn avatar<'a>(&self, side: f32, letter: f32) -> Element<'a, Message> {
+        if let Some(handle) = self.covers.get(AVATAR_COVER) {
+            return image(handle.clone()).opacity(self.cover_alpha(handle)).width(side).height(side).border_radius(side / 2.0).into();
+        }
+        let first = self.profile.as_ref().and_then(|p| p.name.chars().next()).map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+        container(text(first).size(letter).font(ui::font_medium())).center(side).style(skeleton_round(side / 2.0)).into()
+    }
+
+    /// Окно аккаунта. Изменить данные и подписку можно только на сайтах Яндекса.
+    fn view_account(&self) -> Element<'_, Message> {
+        let alpha = self.dialog_fade.shown();
+        let Some(profile) = &self.profile else { return Space::new().into() };
+        let tint = |color: iced::Color| color.scale_alpha(alpha);
+        let close = glow(button(ui::icon(ui::CLOSE, 20.0, tint(ui::MUTED))).padding(4).style(ui::ghost).on_press(Message::MenuClose), 16.0);
+        let head = row![text("Аккаунт").size(20).font(ui::font_medium()).color(tint(ui::TEXT)), Space::new().width(Length::Fill), close].align_y(Alignment::Center);
+        let mut who = column![text(&profile.name).size(18).font(ui::font_medium()).color(tint(ui::TEXT)).wrapping(Wrapping::None)].spacing(2).width(Length::Fill).clip(true);
+        for line in [profile.login.as_str(), profile.email.as_str()] {
+            if !line.is_empty() {
+                who = who.push(text(line).size(14).color(tint(ui::MUTED)).wrapping(Wrapping::None));
+            }
+        }
+        let plus = match (profile.plus, &profile.plus_until, profile.family) {
+            (false, ..) => "Нет подписки Плюс".to_string(),
+            (true, Some(until), true) => format!("Плюс по семейной подписке, до {until}"),
+            (true, Some(until), false) => format!("Плюс до {until}"),
+            (true, None, true) => "Плюс по семейной подписке".to_string(),
+            (true, None, false) => "Подписка Плюс активна".to_string(),
+        };
+        let link = |label, target| shine(button(container(text(label).color(tint(ui::TEXT))).center_x(Length::Fill)).width(Length::Fill).padding([9, 18]).style(ui::button_faded(ui::secondary, alpha)).on_press(Message::OpenLink(target)), 24.0);
+        let exit = shine(button(container(text("Выйти из аккаунта").color(tint(ui::TEXT))).center_x(Length::Fill)).width(Length::Fill).padding([9, 18]).style(ui::button_faded(ui::secondary, alpha)).on_press(Message::DialogOpen(Dialog::Logout)), 24.0);
+        let body = column![
+            head,
+            row![self.avatar(ACCOUNT_AVATAR, 30.0), who].spacing(16).align_y(Alignment::Center),
+            text(plus).color(tint(ui::TEXT)),
+            column![link("Управление аккаунтом", ACCOUNT_LINK), link(if profile.plus { "Управление подпиской" } else { "Подключить Плюс" }, PLUS_LINK), exit].spacing(8),
+        ]
+        .spacing(16);
+        let window = reveal(container(body).width(DIALOG_WIDTH).padding(24).style(ui::popover_faded(alpha))).scale(0.94 + 0.06 * alpha, 0.5, 0.5).shift(0.0, 10.0 * (1.0 - alpha));
+        let dim = ui::BLACK.scale_alpha(0.6 * alpha);
+        reveal(mouse_area(container(mouse_area(window).on_press(Message::DialogInput(self.dialog_text.clone()))).center(Length::Fill).style(move |_| container::Style::default().background(dim))).on_press(Message::MenuClose)).inert(!self.dialog_fade.live).into()
+    }
+
+    /// Меню закрепа: открепить и перейти на страницу, если она есть.
+    fn view_pin_menu(&self, index: usize, x: f32, y: f32) -> Element<'_, Message> {
+        let Some(pin) = self.pins.get(index) else { return Space::new().into() };
+        let (alpha, live) = (self.pin_fade.shown(), self.pin_fade.live);
+        let item = |icon, label, message| {
+            glow(button(row![ui::icon(icon, 20.0, ui::MUTED.scale_alpha(alpha)), text(label).color(ui::TEXT.scale_alpha(alpha))].spacing(12).align_y(Alignment::Center)).width(Length::Fill).height(MENU_ITEM).padding([9, 10]).style(ui::menu_item).on_press(message), 6.0)
+        };
+        let mut items = column![];
+        let mut count = 1.0;
+        if let PinTarget::List(list) = &pin.target {
+            let (icon, label) = match list.source {
+                Source::Album => (ui::ALBUM, "Перейти к альбому"),
+                Source::Artist => (ui::ARTIST, "Перейти к исполнителю"),
+                Source::Playlist => (ui::QUEUE, "Перейти к плейлисту"),
+            };
+            items = items.push(item(icon, label, Message::PinPage(index)));
+            count += 1.0;
+        }
+        items = items.push(item(ui::PIN, "Открепить", Message::Pin(pin.reference())));
+        popup(items.into(), x, y, MENU_WIDTH, count * MENU_ITEM, alpha, live)
     }
 
     /// Окно со сведениями о треке.
@@ -3112,14 +3297,8 @@ impl App {
         if self.profile.as_ref().is_some_and(|p| p.plus) {
             account = account.push(container(text("Плюс").size(12).font(ui::font_medium())).padding([1, 8]).style(ui::plus));
         }
-        let first = self.profile.as_ref().and_then(|p| p.name.chars().next()).map(|c| c.to_uppercase().to_string()).unwrap_or_default();
-        let profile = row![
-            container(text(first).size(18).font(ui::font_medium())).center(42).style(ui::avatar),
-            account,
-            glow(button(ui::icon(ui::LOGOUT, 18.0, ui::MUTED)).padding(6).style(ui::ghost).on_press(Message::Logout), 20.0),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center);
+        let who = glow(button(row![self.avatar(AVATAR_SIZE, 18.0), account].spacing(10).align_y(Alignment::Center)).width(Length::Fill).padding(4).style(ui::row).on_press(Message::DialogOpen(Dialog::Account)), 8.0);
+        let profile = row![who, glow(button(ui::icon(ui::LOGOUT, 18.0, ui::MUTED)).padding(6).style(ui::ghost).on_press(Message::DialogOpen(Dialog::Logout)), 20.0)].spacing(4).align_y(Alignment::Center);
         container(
             column![
                 container(text("Tune").size(26).font(ui::font_headline()).color(ui::ACCENT)).padding(Padding::new(0.0).left(12)),
@@ -3151,22 +3330,23 @@ impl App {
             .enumerate()
             .fold(column![].spacing(4), |list, (index, pin)| {
                 let radius = if pin.round { 20.0 } else { 6.0 };
-                let cover: Element<'_, Message> = match self.covers.get(&format!("{PIN_COVER_PREFIX}{index}")) {
+                let cover: Element<'_, Message> = match self.covers.get(&format!("{PIN_COVER_PREFIX}{}", pin.key())) {
                     Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle)).width(40).height(40).border_radius(radius).into(),
                     None => container(Space::new()).width(40).height(40).style(if pin.round { ui::avatar } else { ui::tile }).into(),
                 };
                 let line = row![
                     cover,
                     column![
-                        text(&pin.title).size(13).font(ui::font_medium()).color(ui::TEXT).wrapping(Wrapping::None),
-                        text(pin.subtitle).size(12).color(ui::MUTED).wrapping(Wrapping::None),
+                        text(&pin.title).size(13).font(ui::font_medium()).color(if self.pin_active(pin) { ui::ACCENT } else { ui::TEXT }).wrapping(Wrapping::None),
+                        text(&pin.subtitle).size(12).color(ui::MUTED).wrapping(Wrapping::None),
                     ]
                     .width(Length::Fill)
                     .clip(true),
+                    glow(button(ui::icon(ui::MORE, 16.0, ui::MUTED)).padding(4).style(ui::ghost).on_press(Message::PinMenu(index)), 14.0),
                 ]
                 .spacing(10)
                 .align_y(Alignment::Center);
-                list.push(glow(button(line).width(Length::Fill).padding(6).style(ui::row).on_press(Message::PinOpen(index)), 8.0))
+                list.push(mouse_area(glow(button(line).width(Length::Fill).padding(6).style(ui::row).on_press(Message::PinOpen(index)), 8.0)).on_right_press(Message::PinMenu(index)))
             })
             .into()
     }
@@ -3265,7 +3445,14 @@ impl App {
         } else {
             Space::new().into()
         };
-        let tools = row![tune, Space::new().width(Length::Fill), self.view_tools(22.0, true), self.view_volume(22.0, Some((space - 130.0).clamp(50.0, 130.0)))].spacing(10).align_y(Alignment::Center);
+        let pin: Element<'_, Message> = if self.wave_queue {
+            let target = PinRef::Wave(self.wave_base.clone());
+            let pinned = self.pins.iter().any(|pin| target.matches(pin));
+            shine(button(container(ui::icon(ui::PIN, 20.0, if pinned { ui::ACCENT } else { ui::TEXT })).center(20)).padding(9).style(ui::secondary).on_press(Message::Pin(target)), 20.0).into()
+        } else {
+            Space::new().into()
+        };
+        let tools = row![tune, pin, Space::new().width(Length::Fill), self.view_tools(22.0, true), self.view_volume(22.0, Some((space - 130.0).clamp(50.0, 130.0)))].spacing(10).align_y(Alignment::Center);
         column![container(top).center_x(Length::Fill).padding(Padding::ZERO.top(8)), container(body).center(Length::Fill), tools].height(Length::Fill).into()
     }
 
@@ -4387,6 +4574,12 @@ fn main() -> iced::Result {
             "queue-jump" => Preview::QueueJump,
             "menu" => Preview::Menu,
             "track-info" => Preview::TrackInfo,
+            "account" => Preview::Account,
+            "logout-ask" => Preview::LogoutAsk,
+            "pin-menu" => Preview::PinMenu,
+            "pin-play-0" => Preview::PinPlay(0),
+            "pin-play-1" => Preview::PinPlay(1),
+            "pin-play-2" => Preview::PinPlay(2),
             "collection" => Preview::Collection,
             "playlists" => Preview::Playlists,
             "playlist" => Preview::Playlist,

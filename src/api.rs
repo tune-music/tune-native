@@ -65,6 +65,14 @@ pub struct Profile {
     pub uid: String,
     pub name: String,
     pub plus: bool,
+    pub login: String,
+    pub email: String,
+    /// Адрес аватарки. У аккаунта без своей картинки его нет.
+    pub avatar: Option<String>,
+    /// До какого дня действует подписка, в виде ДД.ММ.ГГГГ.
+    pub plus_until: Option<String>,
+    /// Подписка получена от владельца семейной группы.
+    pub family: bool,
 }
 
 impl Playlist {
@@ -104,9 +112,10 @@ pub enum PinTarget {
 
 #[derive(Clone, Debug)]
 pub struct Pin {
+    /// Что он открывает и включает.
     pub target: PinTarget,
     pub title: String,
-    pub subtitle: &'static str,
+    pub subtitle: String,
     pub cover: Option<String>,
     pub round: bool,
 }
@@ -339,7 +348,29 @@ pub fn profile(token: &str) -> Result<Profile, String> {
     let account = &v["account"];
     let uid = account["uid"].as_u64().map(|u| u.to_string()).ok_or("Яндекс не сообщил номер аккаунта")?;
     let name = account["displayName"].as_str().or(account["firstName"].as_str()).or(account["login"].as_str()).unwrap_or_default();
-    Ok(Profile { uid, name: name.to_string(), plus: v["plus"]["hasPlus"].as_bool().unwrap_or(false) })
+    // Без этих сведений приложение работает: их показывает только окно аккаунта.
+    let about = get("account/about", &[], token).unwrap_or_default();
+    let about = result(&about);
+    Ok(Profile {
+        uid,
+        name: name.to_string(),
+        plus: v["plus"]["hasPlus"].as_bool().unwrap_or(false),
+        login: about["login"].as_str().or(account["login"].as_str()).unwrap_or_default().to_string(),
+        email: about["email"].as_str().or(v["defaultEmail"].as_str()).unwrap_or_default().to_string(),
+        avatar: about["avatarId"].as_str().and_then(avatar_uri),
+        plus_until: v["subscription"]["autoRenewable"][0]["expires"].as_str().and_then(short_date),
+        family: account["nonOwnerFamilyMember"].as_bool().unwrap_or(false),
+    })
+}
+
+/// 0/0-0 Яндекс отдаёт тем, кто не ставил себе картинку.
+fn avatar_uri(id: &str) -> Option<String> {
+    (!id.is_empty() && id != "0/0-0").then(|| format!("avatars.mds.yandex.net/get-yapic/{id}/%%"))
+}
+
+fn short_date(stamp: &str) -> Option<String> {
+    let (year, month, day) = (stamp.get(0..4)?, stamp.get(5..7)?, stamp.get(8..10)?);
+    Some(format!("{day}.{month}.{year}"))
 }
 
 /// Номера треков из «Мне нравится», сначала новые.
@@ -474,23 +505,25 @@ fn parse_pin(item: &Value) -> Option<Pin> {
             let owner = id_text(&data["uid"])?;
             let title = data["title"].as_str()?.to_string();
             let target = Playlist { source: Source::Playlist, owner, kind: id_text(&data["kind"])?, title: title.clone(), count: 0, cover: cover.clone() };
-            Some(Pin { target: PinTarget::List(target), title, subtitle: "Плейлист", cover, round: false })
+            Some(Pin { target: PinTarget::List(target), title, subtitle: "Плейлист".to_string(), cover, round: false })
         }
         "wave_item" => {
             let seeds = data["seeds"].as_array()?.iter().filter_map(|s| s.as_str().map(str::to_string)).collect();
-            let cover = data["backgroundImageUrl"].as_str().or(data["agent"]["cover"]["uri"].as_str()).map(str::to_string);
+            let cover = [&data["backgroundImageUrl"], &data["agent"]["cover"]["uri"]].iter().find_map(|uri| uri.as_str().filter(|uri| !uri.is_empty())).map(str::to_string);
             let title = data["title"].as_str()?.to_string();
-            Some(Pin { target: PinTarget::Wave(seeds), title, subtitle: "Моя волна", cover, round: true })
+            // Подпись говорит, по чему волна: «Моя волна по альбому» и так далее.
+            let subtitle = data["header"].as_str().filter(|header| *header != title).unwrap_or("Волна").to_string();
+            Some(Pin { target: PinTarget::Wave(seeds), title, subtitle, cover, round: true })
         }
         "album_item" => {
             let title = data["title"].as_str()?;
             let cover = data["coverUri"].as_str();
-            Some(Pin { target: PinTarget::List(list(Source::Album, title, cover)), title: title.to_string(), subtitle: "Альбом", cover: cover.map(str::to_string), round: false })
+            Some(Pin { target: PinTarget::List(list(Source::Album, title, cover)), title: title.to_string(), subtitle: "Альбом".to_string(), cover: cover.map(str::to_string), round: false })
         }
         "artist_item" => {
             let title = data["name"].as_str()?;
             let cover = data["cover"]["uri"].as_str().or(data["coverUri"].as_str());
-            Some(Pin { target: PinTarget::List(list(Source::Artist, title, cover)), title: title.to_string(), subtitle: "Исполнитель", cover: cover.map(str::to_string), round: true })
+            Some(Pin { target: PinTarget::List(list(Source::Artist, title, cover)), title: title.to_string(), subtitle: "Исполнитель".to_string(), cover: cover.map(str::to_string), round: true })
         }
         _ => None,
     }
@@ -921,6 +954,29 @@ pub enum PinRef {
     Album(String),
     Artist(String),
     Playlist(String, String),
+    Wave(Vec<String>),
+}
+
+impl Pin {
+    /// Ссылка на этот закреп для запроса на открепление.
+    pub fn reference(&self) -> PinRef {
+        match &self.target {
+            PinTarget::Wave(seeds) => PinRef::Wave(seeds.clone()),
+            PinTarget::List(list) => match list.source {
+                Source::Album => PinRef::Album(list.kind.clone()),
+                Source::Artist => PinRef::Artist(list.kind.clone()),
+                Source::Playlist => PinRef::Playlist(list.owner.clone(), list.kind.clone()),
+            },
+        }
+    }
+
+    /// Постоянное имя обложки: порядок закрепов меняется.
+    pub fn key(&self) -> String {
+        match &self.target {
+            PinTarget::Wave(seeds) => seeds.join(","),
+            PinTarget::List(list) => format!("{:?}:{}:{}", list.source, list.owner, list.kind),
+        }
+    }
 }
 
 impl PinRef {
@@ -929,6 +985,7 @@ impl PinRef {
             PinRef::Album(_) => "pin/album",
             PinRef::Artist(_) => "pin/artist",
             PinRef::Playlist(..) => "pin/playlist",
+            PinRef::Wave(_) => "pin/wave",
         }
     }
 
@@ -936,15 +993,20 @@ impl PinRef {
         match self {
             PinRef::Album(id) | PinRef::Artist(id) => json!({ "id": id }),
             PinRef::Playlist(uid, kind) => json!({ "uid": uid, "kind": kind }),
+            PinRef::Wave(seeds) => json!({ "seeds": seeds }),
         }
     }
 
     pub fn matches(&self, pin: &Pin) -> bool {
+        if let (PinRef::Wave(seeds), PinTarget::Wave(pinned)) = (self, &pin.target) {
+            return seeds == pinned;
+        }
         let PinTarget::List(list) = &pin.target else { return false };
         match self {
             PinRef::Album(id) => list.source == Source::Album && list.kind == *id,
             PinRef::Artist(id) => list.source == Source::Artist && list.kind == *id,
             PinRef::Playlist(uid, kind) => list.source == Source::Playlist && list.owner == *uid && list.kind == *kind,
+            PinRef::Wave(_) => false,
         }
     }
 }
@@ -1187,7 +1249,7 @@ mod tests {
 
     #[test]
     fn pin_reference_matches_its_target() {
-        let list = |source, owner: &str, kind: &str| Pin { target: PinTarget::List(Playlist { source, owner: owner.to_string(), kind: kind.to_string(), title: String::new(), count: 0, cover: None }), title: String::new(), subtitle: "", cover: None, round: false };
+        let list = |source, owner: &str, kind: &str| Pin { target: PinTarget::List(Playlist { source, owner: owner.to_string(), kind: kind.to_string(), title: String::new(), count: 0, cover: None }), title: String::new(), subtitle: String::new(), cover: None, round: false };
         assert!(PinRef::Album("1".into()).matches(&list(Source::Album, "", "1")));
         assert!(!PinRef::Album("1".into()).matches(&list(Source::Artist, "", "1")));
         assert!(PinRef::Playlist("5".into(), "7".into()).matches(&list(Source::Playlist, "5", "7")));
@@ -1234,6 +1296,26 @@ mod tests {
         assert!(cache.entries.len() <= CACHE_SIZE);
         assert_eq!(cache.get("k0", now + CACHE_TIME / 2), None);
         assert!(!cacheable("music-history") && !cacheable("get-file-info") && cacheable("albums/1/with-tracks"));
+    }
+
+    #[test]
+    fn pinned_wave_round_trip() {
+        let v: Value = serde_json::from_str(r#"{"type":"wave_item","data":{"agent":{"cover":{"uri":""}},"backgroundImageUrl":"","header":"Моя волна по альбому","seeds":["album:7"],"title":"Альбом"}}"#).unwrap();
+        let pin = parse_pin(&v).unwrap();
+        assert_eq!(pin.subtitle, "Моя волна по альбому");
+        assert_eq!(pin.cover, None);
+        assert!(pin.reference().matches(&pin));
+        assert_eq!(pin.reference().body(), json!({"seeds":["album:7"]}));
+        assert!(!PinRef::Wave(vec!["album:8".to_string()]).matches(&pin));
+    }
+
+    #[test]
+    fn reads_account_details() {
+        assert_eq!(avatar_uri("0/0-0"), None);
+        assert_eq!(avatar_uri(""), None);
+        assert_eq!(avatar_uri("1/ab-c").as_deref(), Some("avatars.mds.yandex.net/get-yapic/1/ab-c/%%"));
+        assert_eq!(short_date("2026-11-09T09:01:22+03:00").as_deref(), Some("09.11.2026"));
+        assert_eq!(short_date("2026"), None);
     }
 
     #[test]
