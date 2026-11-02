@@ -306,7 +306,7 @@ fn fetch(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, Strin
 
 fn post(path: &str, content_type: &str, body: String, token: &str) -> Result<Value, String> {
     // Отзывы волны и отчёты о прослушивании ничего из сохранённого не меняют.
-    if !path.starts_with("rotor") && !path.starts_with("plays") {
+    if !path.starts_with("rotor") && !path.starts_with("plays") && !path.starts_with("availability") {
         forget_cache();
     }
     let resp = agent()
@@ -1513,6 +1513,16 @@ pub fn random_id() -> String {
 
 pub fn now_stamp() -> String {
     now()
+}
+
+/// Можно ли сейчас слушать треки: номер трека и ответ.
+pub fn availability(ids: &[String], token: &str) -> Result<Vec<(String, bool)>, String> {
+    let mut found = Vec::new();
+    for part in ids.chunks(100) {
+        let v = post(&format!("availability/tracks?trackIds={}", part.join("%2C")), "application/json", String::new(), token)?;
+        found.extend(v["result"]["availabilities"].as_array().into_iter().flatten().filter_map(|item| Some((id_text(&item["trackId"])?, item["available"].as_bool()?))));
+    }
+    Ok(found)
 }
 
 /// Отправляет отчёты о прослушивании.

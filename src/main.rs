@@ -259,7 +259,7 @@ enum Screen {
     Main(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Section {
     Home,
     Wave,
@@ -385,6 +385,10 @@ enum Preview {
     SearchHistory,
     /// Поиск сам перебирает вкладки: номер следующей.
     SearchTabs(usize),
+    /// Поиск набирает запрос по буквам и пишет в stderr, где фокус.
+    SearchFocus,
+    /// Лайки прокручиваются, открывается главная и снова лайки: в stderr — где прокрутка.
+    ScrollReturn,
     /// Все релизы исполнителя.
     Discography(String),
     /// Первый плейлист в очереди, открыта главная.
@@ -545,6 +549,10 @@ struct App {
     page_veil: f32,
     /// Текущее прослушивание для отчётов `plays`.
     listen: Option<api::Listen>,
+    /// Где была прокрутка на каждой странице.
+    scroll_places: HashMap<(Section, Option<String>, Option<String>), f32>,
+    /// Прокрутка ждёт, пока страница загрузится.
+    scroll_wait: Option<f32>,
     listen_tick: Option<Instant>,
     /// После скольких секунд звучания уйдёт следующий промежуточный отчёт.
     listen_next: f32,
@@ -668,6 +676,9 @@ enum Message {
     PreviewQueueDown,
     PreviewArtistEnd,
     PreviewSearchTab(usize),
+    PreviewType(usize),
+    PreviewScroll(usize),
+    PreviewFocused(usize, bool),
     Frame(Instant),
     QueuePlay(usize),
     QueueRemove(usize),
@@ -738,6 +749,8 @@ enum Message {
     TrackRemoved(Result<(), String>),
     /// Нажали на недоступный трек.
     Unavailable,
+    /// Ответ, какие треки очереди сейчас можно слушать.
+    Availability(Result<Vec<(String, bool)>, String>),
     HistoryLoaded(Result<Vec<Track>, String>),
     DislikesLoaded(Result<Vec<Track>, String>),
     LikedLists(Result<Vec<Playlist>, String>),
@@ -883,6 +896,8 @@ impl App {
             quality_menu: None,
             page_veil: 0.0,
             listen: None,
+            scroll_places: HashMap::new(),
+            scroll_wait: None,
             listen_tick: None,
             listen_next: LISTEN_REPORT,
             change_reason: None,
@@ -1359,6 +1374,15 @@ impl App {
 
     /// Возвращает очередь прошлого запуска. Музыка не включается сама.
     fn restore(&mut self, saved: session::Saved) -> Task<Message> {
+        let ids: Vec<String> = saved.tracks.iter().map(|track| track.id.clone()).collect();
+        let check = match self.token() {
+            Some(token) => Task::perform(background(move || api::availability(&ids, &token)), Message::Availability),
+            None => Task::none(),
+        };
+        Task::batch([check, self.restore_queue(saved)])
+    }
+
+    fn restore_queue(&mut self, saved: session::Saved) -> Task<Message> {
         self.session_key = Some(queue_key(&saved.tracks, &saved.title));
         self.queue = saved.tracks;
         self.queue_from = QueueFrom::Unknown;
@@ -1741,17 +1765,27 @@ impl App {
             return Task::batch([lyrics, queue, self.visible_covers()]);
         }
         let place = self.list_place();
+        let offset = self.list_offset;
         let back = matches!(message, Message::Back);
+        let travel = matches!(message, Message::Back | Message::Forward);
         let rank = self.section as u8;
         let tab = (self.search_tab, self.home_tab);
         let ready = self.page_ready();
         let loading = self.area_loading();
         let task = self.handle(message);
-        // Другой список открывается с начала.
-        let snap = if place == self.list_place() {
+        // Другая страница открывается там, где её оставили; новая — с начала.
+        let mut snap = if place == self.list_place() {
             Task::none()
         } else {
-            self.list_offset = 0.0;
+            if remembers_scroll(place.0) {
+                self.scroll_places.insert(place.clone(), offset);
+            }
+            let here = self.list_place();
+            let section_root = matches!(here.0, Section::Home | Section::Likes | Section::Collection | Section::Albums | Section::Artists | Section::History | Section::Dislikes | Section::Search | Section::Settings)
+                || (here.0 == Section::Playlists && here.1.is_none());
+            let restore = self.scroll_places.get(&here).copied().filter(|_| remembers_scroll(here.0) && (section_root || travel));
+            self.scroll_wait = restore.filter(|_| !self.page_ready());
+            self.list_offset = restore.unwrap_or(0.0);
             self.queue_scroll = None;
             self.filter_reset();
             self.page_veil = 1.0;
@@ -1762,8 +1796,18 @@ impl App {
             self.lyrics_fresh = true;
             let down = back || (self.section as u8) < rank;
             self.page_shift = (0.0, if down { -PAGE_SHIFT } else { PAGE_SHIFT });
-            operation::snap_to(Id::new(LIST), scrollable::RelativeOffset::START)
+            match restore {
+                Some(y) => operation::scroll_to(Id::new(LIST), scrollable::AbsoluteOffset { x: 0.0, y }),
+                None => operation::snap_to(Id::new(LIST), scrollable::RelativeOffset::START),
+            }
         };
+        // Страница дождалась данных: прокрутка встаёт на прежнее место.
+        if place == self.list_place() && self.page_ready() {
+            if let Some(y) = self.scroll_wait.take() {
+                self.list_offset = y;
+                snap = operation::scroll_to(Id::new(LIST), scrollable::AbsoluteOffset { x: 0.0, y });
+            }
+        }
         if place == self.list_place() {
             let tabbed = matches!(self.section, Section::Search | Section::Home);
             if tabbed && (self.search_tab, self.home_tab) != tab {
@@ -1924,6 +1968,16 @@ impl App {
                     Some(Preview::Home) => {
                         self.preview = None;
                         self.update(Message::Open(Section::Home))
+                    }
+                    Some(Preview::ScrollReturn) => {
+                        self.preview = None;
+                        let open = self.update(Message::Open(Section::Likes));
+                        Task::batch([open, Task::perform(background(|| std::thread::sleep(Duration::from_millis(2500))), |()| Message::PreviewScroll(0))])
+                    }
+                    Some(Preview::SearchFocus) => {
+                        self.preview = None;
+                        let open = self.update(Message::Open(Section::Search));
+                        Task::batch([open, Task::perform(background(|| std::thread::sleep(Duration::from_millis(800))), |()| Message::PreviewType(0))])
                     }
                     Some(Preview::SearchTabs(_)) => {
                         self.section = Section::Search;
@@ -3017,6 +3071,29 @@ impl App {
                     return self.play(index);
                 }
             }
+            Message::PreviewScroll(step) => {
+                eprintln!("шаг {step}: раздел {:?}, прокрутка {:.0}", self.section, self.list_offset);
+                let task = match step {
+                    0 => operation::scroll_to(Id::new(LIST), scrollable::AbsoluteOffset { x: 0.0, y: 1500.0 }),
+                    1 => self.update(Message::Open(Section::Home)),
+                    2 => self.update(Message::Open(Section::Likes)),
+                    _ => return Task::none(),
+                };
+                let next = Task::perform(background(|| std::thread::sleep(Duration::from_millis(2000))), move |()| Message::PreviewScroll(step + 1));
+                return Task::batch([task, next]);
+            }
+            Message::PreviewType(step) => {
+                const WORD: &str = "Linkin Park numb";
+                let check = operation::is_focused(Id::new(SEARCH_INPUT)).map(move |focused| Message::PreviewFocused(step, focused));
+                if step >= WORD.len() + 4 {
+                    return check;
+                }
+                let typed = if step < WORD.len() { self.update(Message::Query(WORD[..=step].to_string())) } else { Task::none() };
+                let pause = if step % 4 == 3 { 900 } else { 150 };
+                let next = Task::perform(background(move || std::thread::sleep(Duration::from_millis(pause))), move |()| Message::PreviewType(step + 1));
+                return Task::batch([check, typed, next]);
+            }
+            Message::PreviewFocused(step, focused) => eprintln!("шаг {step}: запрос «{}», найдено {}, фокус {focused}", self.query, self.results.len()),
             Message::PreviewSearchTab(step) => {
                 // Вперёд по всем вкладкам и обратно: второй круг уже из кэша.
                 const ORDER: [usize; 9] = [1, 2, 3, 4, 3, 2, 1, 0, 2];
@@ -3142,6 +3219,16 @@ impl App {
                 return Task::batch([iced::clipboard::write(track.share_link()), notice]);
             }
             Message::Unavailable => return self.notify(UNAVAILABLE.to_string()),
+            Message::Availability(Ok(found)) => {
+                let found: HashMap<String, bool> = found.into_iter().collect();
+                for track in &mut self.queue {
+                    if let Some(&open) = found.get(&track.id) {
+                        track.unavailable = !open;
+                    }
+                }
+            }
+            // Проверка не удалась: треки остаются как были.
+            Message::Availability(Err(_)) => {}
             Message::NoticeClear(id) => {
                 if self.notice.as_ref().is_some_and(|(current, _)| *current == id) {
                     self.notice = None;
@@ -3880,26 +3967,36 @@ impl App {
         } else {
             self.cover(track, COVER)
         };
+        let (title_color, names_color) = match (current, track.unavailable) {
+            (true, _) => (ui::ACCENT, ui::MUTED),
+            (false, true) => (ui::MUTED, FAINT),
+            (false, false) => (ui::WHITE, ui::MUTED),
+        };
         let names: Element<'a, Message> = if track.artist_list.is_empty() {
-            text(&track.artists).color(ui::MUTED).wrapping(Wrapping::None).into()
+            text(&track.artists).color(names_color).wrapping(Wrapping::None).into()
         } else {
-            artist_links(&track.artist_list, 16.0, ui::font(), ui::MUTED).into()
+            artist_links(&track.artist_list, 16.0, ui::font(), names_color).into()
         };
         let mut line = row![
             cover,
-            column![track_title(track, 16.0, ui::font_medium(), if current { ui::ACCENT } else { ui::WHITE }), names].width(Length::Fill).clip(true),
+            column![track_title(track, 16.0, ui::font_medium(), title_color), names].width(Length::Fill).clip(true),
             self.like_button(track, 20.0),
         ]
         .spacing(12)
         .align_y(Alignment::Center);
         if self.main_width() >= TRACK_TIME_WIDTH {
-            line = line.push(text(clock(track.duration)).color(ui::MUTED));
+            let time_color = if track.duration.is_zero() { iced::Color::TRANSPARENT } else { names_color };
+            line = line.push(text(clock(track.duration)).color(time_color));
         }
         line = line.push(self.more_button(track, 18.0));
         if !current {
             line = line.push(glow(button(ui::icon(ui::CLOSE, 16.0, ui::MUTED)).padding(6).style(ui::ghost).on_press(Message::QueueRemove(index)), 20.0));
         }
-        let press = if current { Message::Toggle } else { Message::QueuePlay(index) };
+        let press = match (current, track.unavailable) {
+            (true, _) => Message::Toggle,
+            (false, true) => Message::Unavailable,
+            (false, false) => Message::QueuePlay(index),
+        };
         mouse_area(glow(button(line).width(Length::Fill).height(ROW).padding([8, 8]).style(ui::row).on_press(press), 8.0)).on_right_press(Message::MenuOpen(track.clone())).into()
     }
 
@@ -4171,7 +4268,7 @@ impl App {
         .spacing(28)
         .max_width(700)
         .padding(Padding::ZERO.right(20));
-        ui::scroll(page).width(Length::Fill).height(Length::Fill).into()
+        ui::scroll(page).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
     }
 
     fn view_collection(&self) -> Element<'_, Message> {
@@ -4225,7 +4322,7 @@ impl App {
             let shown = &self.liked_artists[..self.liked_artists.len().min(COLLECTION_CARDS)];
             page = page.push(Space::new().height(8)).push(self.block_title("Исполнители", Section::Artists)).push(self.view_cards(shown, ARTIST_COVER, true, open_artist));
         }
-        ui::scroll(page).width(Length::Fill).height(Length::Fill).into()
+        ui::scroll(page).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
     }
 
     fn view_card_page<'a>(&'a self, title: &'a str, cards: &'a [Card], prefix: &str, round: bool, empty: &'a str) -> Element<'a, Message> {
@@ -4235,7 +4332,7 @@ impl App {
             placeholder("Пока пусто", Some(empty))
         } else {
             let open = if round { open_artist } else { open_album };
-            ui::scroll(container(self.view_cards(cards, prefix, round, open)).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).width(Length::Fill).height(Length::Fill).into()
+            ui::scroll(container(self.view_cards(cards, prefix, round, open)).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
         };
         column![head, center].spacing(16).height(Length::Fill).into()
     }
@@ -4365,7 +4462,7 @@ impl App {
         let create = shine(button(row![ui::icon(ui::PLUS, 20.0, ui::TEXT), text("Новый плейлист").color(ui::TEXT)].spacing(6).align_y(Alignment::Center)).padding([6, 14]).style(ui::secondary).on_press(Message::DialogOpen(Dialog::Create)), 24.0);
         let title = row![back, text("Плейлисты").size(36).font(ui::font_headline()).color(ui::TEXT), Space::new().width(Length::Fill), create].spacing(12).align_y(Alignment::Center);
         let center: Element<'_, Message> = if !self.playlists.is_empty() {
-            ui::scroll(container(self.view_playlist_cards(&self.playlists)).padding(Padding::ZERO.right(SCROLLBAR))).width(Length::Fill).height(Length::Fill).into()
+            ui::scroll(container(self.view_playlist_cards(&self.playlists)).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
         } else if self.playlists_loading || self.uid.is_none() {
             skeleton_cards()
         } else {
@@ -4427,7 +4524,7 @@ impl App {
             if !found.playlists.is_empty() {
                 blocks = blocks.push(block("Плейлисты")).push(self.view_playlist_cards(&found.playlists));
             }
-            ui::scroll(blocks).id(LIST).width(Length::Fill).height(Length::Fill).into()
+            ui::scroll(blocks).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
         };
         page.push(self.area(center)).into()
     }
@@ -4468,7 +4565,7 @@ impl App {
             }
             blocks.push(body).push(Space::new().height(8))
         });
-        page.push(self.area(ui::scroll(blocks).id(LIST).width(Length::Fill).height(Length::Fill))).into()
+        page.push(self.area(ui::scroll(blocks).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill))).into()
     }
 
     fn view_home_item<'a>(&self, item: &'a HomeItem) -> Element<'a, Message> {
@@ -4627,7 +4724,7 @@ impl App {
             });
             page = page.push(links.wrap());
         }
-        ui::scroll(page).id(LIST).width(Length::Fill).height(Length::Fill).into()
+        ui::scroll(page).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
     }
 
     fn view_tag(&self) -> Element<'_, Message> {
@@ -4640,7 +4737,7 @@ impl App {
             placeholder("Пока пусто", Some("В этом миксе нет плейлистов"))
         } else {
             let cards = self.tag_lists.iter().fold(row![].spacing(4), |cards, item| cards.push(self.view_home_item(item)));
-            ui::scroll(container(cards.wrap()).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).width(Length::Fill).height(Length::Fill).into()
+            ui::scroll(container(cards.wrap()).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
         };
         column![head, center].spacing(16).height(Length::Fill).into()
     }
@@ -4662,7 +4759,7 @@ impl App {
         let center: Element<'_, Message> = if self.discography.is_empty() && self.discography_key.is_none() {
             placeholder("Пока пусто", Some("У исполнителя нет таких релизов"))
         } else {
-            ui::scroll(container(list).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).width(Length::Fill).height(Length::Fill).into()
+            ui::scroll(container(list).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
         };
         column![head, sort, center].spacing(16).height(Length::Fill).into()
     }
@@ -4971,6 +5068,11 @@ fn track_title<'a>(track: &'a Track, size: f32, font: iced::Font, color: iced::C
     }
     let badge = container(text("E").size(11).font(ui::font_medium()).color(ui::WHITE)).center(16).style(ui::explicit);
     row![title, badge].spacing(6).align_y(Alignment::Center).into()
+}
+
+/// Страницы, которые возвращаются на прежнее место. У текста песни, очереди и волны своя прокрутка.
+fn remembers_scroll(section: Section) -> bool {
+    !matches!(section, Section::Lyrics | Section::Queue | Section::Wave)
 }
 
 fn home_item_key(item: &HomeItem) -> String {
@@ -5601,6 +5703,8 @@ fn main() -> iced::Result {
             what if what.starts_with("tag:") => Preview::Tag(what[4..].to_string()),
             "search-history" => Preview::SearchHistory,
             "search-tabs" => Preview::SearchTabs(1),
+            "search-focus" => Preview::SearchFocus,
+            "scroll-return" => Preview::ScrollReturn,
             query => Preview::Search(query.to_string()),
         }),
         _ => None,
