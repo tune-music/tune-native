@@ -174,7 +174,7 @@ const SKELETON_HEAD: f32 = 32.0;
 const SKELETON_TITLE: f32 = 21.0;
 const SKELETON_SUBTITLE: f32 = 17.0;
 const SKELETON_TAB: f32 = 35.0;
-const SKELETON_TABS: [f32; 3] = [86.0, 112.0, 96.0];
+const SKELETON_TABS: [f32; 2] = [89.0, 87.0];
 /// После скольких обложек убирать те, что далеко от экрана.
 const COVERS_LIMIT: usize = 400;
 const COVERS_AROUND: usize = 100;
