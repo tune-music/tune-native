@@ -903,6 +903,8 @@ pub enum HomeItem {
     Wave { title: String, seeds: Vec<String>, cover: Option<String>, color: Option<String> },
     /// Карточки в начале главной: «Мне нравится» со счётчиком и «История» с последними треками.
     Likes { count: u64, cover: Option<String> },
+    /// Микс: подборка плейлистов по тегу, например «Осенняя».
+    Mix { tag: String, title: String, cover: Option<String> },
     History { subtitle: String, cover: Option<String> },
 }
 
@@ -959,6 +961,9 @@ fn parse_home_item(v: &Value) -> Option<HomeItem> {
     if data["album"].is_object() {
         return album_card(&data["album"]).map(HomeItem::Album);
     }
+    if let Some(tag) = data["action"]["weblink"].as_str().and_then(|link| link.strip_prefix("/tag/")).map(|tag| tag.trim_matches('/')).filter(|tag| !tag.is_empty()) {
+        return Some(HomeItem::Mix { tag: tag.to_string(), title: data["title"].as_str()?.to_string(), cover: data["covers"][0]["uri"].as_str().map(str::to_string) });
+    }
     // В похожем волна лежит глубже: название и зёрна в wave, обложка в agent.
     let wave = &data["wave"];
     let seeds: Vec<String> = data["seeds"].as_array().or(wave["seeds"].as_array())?.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
@@ -976,6 +981,22 @@ impl HomeItem {
     pub fn is_shortcut(&self) -> bool {
         matches!(self, HomeItem::Likes { .. } | HomeItem::History { .. })
     }
+}
+
+/// Название тега и его плейлисты: сначала номера, потом сами плейлисты одним запросом.
+pub fn tag_playlists(tag: &str, token: &str) -> Result<(Option<String>, Vec<Playlist>), String> {
+    let v = get(&format!("tags/{tag}/playlist-ids"), &[], token)?;
+    let name = result(&v)["tag"]["name"].as_str().map(str::to_string);
+    let ids: Vec<String> = result(&v)["ids"].as_array().into_iter().flatten().filter_map(|id| Some(format!("{}:{}", id_text(&id["uid"])?, id_text(&id["kind"])?))).collect();
+    if ids.is_empty() {
+        return Ok((name, Vec::new()));
+    }
+    let v = get("playlists/list", &[("playlist-ids", &ids.join(","))], token)?;
+    Ok((name, parse_tag_playlists(result(&v))))
+}
+
+fn parse_tag_playlists(v: &Value) -> Vec<Playlist> {
+    v.as_array().into_iter().flatten().filter_map(|list| parse_playlist_loose(list, &id_text(&list["uid"]).or_else(|| id_text(&list["owner"]["uid"]))?)).collect()
 }
 
 /// Куда ведёт ссылка на Яндекс Музыку.
@@ -1530,6 +1551,16 @@ mod tests {
         let block = parse_home_block("В стиле", &style);
         assert!(block.tabs.is_empty());
         assert!(matches!(&block.items[0], HomeItem::Album(card) if card.id == "7"));
+    }
+
+    #[test]
+    fn reads_mixes_and_tag_playlists() {
+        let v = json!({"items":[{"type":"mix_card_item","data":{"id":"autumn_playlists","title":"Осенняя","action":{"weblink":"/tag/autumn"},"covers":[{"uri":"c/%%"}]}}]});
+        let block = parse_home_block("Миксы", &v);
+        assert!(matches!(&block.items[0], HomeItem::Mix { tag, title, cover } if tag == "autumn" && title == "Осенняя" && cover.as_deref() == Some("c/%%")));
+        let lists = parse_tag_playlists(&json!([{"uid":103372440,"kind":2620,"title":"Лоу-фай","trackCount":247},{"kind":1}]));
+        assert_eq!(lists.len(), 1);
+        assert_eq!((lists[0].owner.as_str(), lists[0].kind.as_str(), lists[0].count), ("103372440", "2620", 247));
     }
 
     #[test]

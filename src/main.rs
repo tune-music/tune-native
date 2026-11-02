@@ -270,6 +270,8 @@ enum Section {
     Settings,
     /// Все релизы исполнителя или сборники с ним.
     Discography,
+    /// Плейлисты микса.
+    Tag,
 }
 
 /// Окно поверх страницы.
@@ -370,6 +372,8 @@ enum Preview {
     Artist(String),
     /// Исполнитель, прокрученный до описания.
     ArtistAbout(String),
+    /// Микс по тегу.
+    Tag(String),
     /// Все релизы исполнителя.
     Discography(String),
     /// Первый плейлист в очереди, открыта главная.
@@ -566,6 +570,10 @@ struct App {
     /// «Меньше ИИ»; пока не знаем ответа сервера, переключатель не работает.
     ai_less: Option<bool>,
     discography: Vec<Card>,
+    /// Открытый микс: тег, название и его плейлисты карточками главной.
+    tag: Option<(String, String)>,
+    tag_lists: Vec<HomeItem>,
+    tag_loading: bool,
     /// Другие альбомы исполнителя открытого альбома.
     album_others: Vec<Card>,
     discography_total: u64,
@@ -671,6 +679,7 @@ enum Message {
     /// Сортировка по дате выхода или по популярности.
     DiscographySort(bool),
     DiscographyMore,
+    TagLoaded(String, Result<(Option<String>, Vec<Playlist>), String>),
     DiscographyLoaded(String, Result<api::Releases, String>),
     /// Другие альбомы исполнителя для страницы альбома.
     AlbumOthers(String, Result<api::Releases, String>),
@@ -869,6 +878,9 @@ impl App {
             session_at: None,
             ai_less: None,
             discography: Vec::new(),
+            tag: None,
+            tag_lists: Vec::new(),
+            tag_loading: false,
             album_others: Vec::new(),
             discography_total: 0,
             discography_also: false,
@@ -1215,7 +1227,7 @@ impl App {
         cards.extend(self.album.iter().map(|a| format!("{ALBUM_COVER}{}", a.id)));
         let album_cards = self.album.iter().flat_map(|a| &a.versions).chain(&self.album_others).chain(&self.discography);
         cards.extend(album_cards.map(|c| format!("{ALBUM_COVER}{}", c.id)));
-        cards.extend(self.similar.iter().map(home_item_key));
+        cards.extend(self.similar.iter().chain(&self.tag_lists).map(home_item_key));
         cards.extend(self.current_track().map(|t| format!("{WAVE_BIG}{}", t.id)));
         cards.extend(page.iter().map(|a| format!("{ARTIST_COVER}{}", a.id)));
         self.covers.retain(|id, _| id == AVATAR_COVER || id.starts_with(PLAYLIST_COVER) || id.starts_with(PIN_COVER_PREFIX) || cards.contains(id) || keep.contains(id));
@@ -1543,7 +1555,7 @@ impl App {
             Section::Likes | Section::Collection => &self.liked,
             Section::Playlists => &self.playlist_tracks,
             Section::Artist => self.artist.as_ref().map_or(&[], |a| a.popular.as_slice()),
-            Section::Albums | Section::Artists | Section::Home | Section::Discography => &[],
+            Section::Albums | Section::Artists | Section::Home | Section::Discography | Section::Tag => &[],
             // На странице очереди список — то, что будет после играющего трека.
             Section::History => &self.history_tracks,
             Section::Dislikes => &self.disliked_list,
@@ -1673,6 +1685,7 @@ impl App {
             Section::Artists => !self.liked_artists.is_empty(),
             Section::Artist => self.artist.is_some(),
             Section::Discography => self.discography_key.is_none(),
+            Section::Tag => !self.tag_loading,
             Section::Playlists if self.playlist.is_none() => !self.playlists.is_empty(),
             section => !self.list(section).is_empty(),
         }
@@ -1750,6 +1763,11 @@ impl App {
                     Some(Preview::Home) => {
                         self.preview = None;
                         self.update(Message::Open(Section::Home))
+                    }
+                    Some(Preview::Tag(tag)) => {
+                        self.preview = None;
+                        let title = tag.clone();
+                        self.update(Message::HomeOpen(HomeItem::Mix { tag, title, cover: None }))
                     }
                     Some(Preview::HomeTrends) => {
                         self.preview = None;
@@ -1928,6 +1946,23 @@ impl App {
                 if by_year != self.discography_by_year {
                     self.discography_by_year = by_year;
                     return self.discography_load(0);
+                }
+            }
+            Message::TagLoaded(tag, result) => {
+                if self.tag.as_ref().is_none_or(|(open, _)| *open != tag) {
+                    return Task::none();
+                }
+                self.tag_loading = false;
+                match result {
+                    Ok((name, lists)) => {
+                        if let (Some(name), Some((_, title))) = (name, self.tag.as_mut()) {
+                            *title = name;
+                        }
+                        self.tag_lists = lists.into_iter().map(HomeItem::Playlist).collect();
+                        let jobs = self.tag_lists.iter().filter_map(|item| Some((home_item_key(item), home_item_cover(item)?))).collect();
+                        return self.fetch_cover_jobs(jobs, "200x200");
+                    }
+                    Err(e) => return self.fail(e),
                 }
             }
             Message::DiscographyMore => {
@@ -2114,6 +2149,17 @@ impl App {
                 HomeItem::Playlist(list) => return self.open_list(list),
                 HomeItem::Wave { seeds, title, .. } => return self.update(Message::WaveStartSeeds(seeds, Some(title))),
                 HomeItem::Likes { .. } => return self.update(Message::Open(Section::Likes)),
+                HomeItem::Mix { tag, title, .. } => {
+                    let Some(token) = self.token() else { return Task::none() };
+                    if self.tag.as_ref().is_none_or(|(open, _)| *open != tag) {
+                        self.tag_lists.clear();
+                        self.tag_loading = true;
+                    }
+                    self.tag = Some((tag.clone(), title));
+                    let open = self.handle(Message::Open(Section::Tag));
+                    let wanted = tag.clone();
+                    return Task::batch([open, Task::perform(background(move || api::tag_playlists(&tag, &token)), move |result| Message::TagLoaded(wanted.clone(), result))]);
+                }
                 HomeItem::History { .. } => return self.update(Message::Open(Section::History)),
             },
             Message::LikedPages(Ok((albums, artists))) => {
@@ -3148,6 +3194,7 @@ impl App {
             Section::Lyrics => self.view_lyrics(),
             Section::Settings => self.view_settings(),
             Section::Discography => self.view_discography(),
+            Section::Tag => self.view_tag(),
             Section::History => self.view_track_page("История", &self.history_tracks, "Здесь появятся треки, которые вы слушали", Section::History),
             Section::Dislikes => self.view_track_page("Дизлайки", &self.disliked_list, "Здесь появятся треки, которые вам не понравились", Section::Dislikes),
             Section::Wave => self.view_wave(),
@@ -4200,6 +4247,7 @@ impl App {
             HomeItem::Artist(card) => (&card.title, card.subtitle.clone(), true),
             HomeItem::Playlist(list) => (&list.title, if list.count > 0 { format!("{} {}", list.count, tracks_word(list.count as usize)) } else { "Плейлист".to_string() }, false),
             HomeItem::Wave { title, .. } => (title, "Волна".to_string(), true),
+            HomeItem::Mix { title, .. } => (title, "Микс".to_string(), false),
             HomeItem::Likes { count, .. } => ("Мне нравится", format!("{count} {}", tracks_word(*count as usize)), false),
             HomeItem::History { subtitle, .. } => ("История", if subtitle.is_empty() { "Недавно прослушанное".to_string() } else { subtitle.clone() }, false),
         };
@@ -4350,6 +4398,21 @@ impl App {
             page = page.push(links.wrap());
         }
         ui::scroll(page).id(LIST).height(Length::Fill).into()
+    }
+
+    fn view_tag(&self) -> Element<'_, Message> {
+        let back = glow(button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0);
+        let title = self.tag.as_ref().map_or(String::new(), |(_, title)| title.clone());
+        let head = row![back, text(title).size(36).font(ui::font_headline()).color(ui::TEXT)].spacing(12).align_y(Alignment::Center);
+        let center: Element<'_, Message> = if self.tag_loading {
+            skeleton_home(self.cards_in_row())
+        } else if self.tag_lists.is_empty() {
+            placeholder("Пока пусто", Some("В этом миксе нет плейлистов"))
+        } else {
+            let cards = self.tag_lists.iter().fold(row![].spacing(4), |cards, item| cards.push(self.view_home_item(item)));
+            ui::scroll(container(cards.wrap()).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).height(Length::Fill).into()
+        };
+        column![head, center].spacing(16).height(Length::Fill).into()
     }
 
     fn view_discography(&self) -> Element<'_, Message> {
@@ -4682,6 +4745,7 @@ fn home_item_key(item: &HomeItem) -> String {
         HomeItem::Playlist(list) => playlist_cover_key(list),
         HomeItem::Wave { title, .. } => format!("{WAVE_CARD}{title}"),
         HomeItem::Likes { .. } => format!("{WAVE_CARD}:likes"),
+        HomeItem::Mix { tag, .. } => format!("{WAVE_CARD}:mix:{tag}"),
         HomeItem::History { .. } => format!("{WAVE_CARD}:history"),
     }
 }
@@ -4690,7 +4754,7 @@ fn home_item_cover(item: &HomeItem) -> Option<String> {
     match item {
         HomeItem::Album(card) | HomeItem::Artist(card) => card.cover.clone(),
         HomeItem::Playlist(list) => list.cover.clone(),
-        HomeItem::Wave { cover, .. } | HomeItem::Likes { cover, .. } | HomeItem::History { cover, .. } => cover.clone(),
+        HomeItem::Wave { cover, .. } | HomeItem::Likes { cover, .. } | HomeItem::History { cover, .. } | HomeItem::Mix { cover, .. } => cover.clone(),
     }
 }
 
@@ -5277,6 +5341,7 @@ fn main() -> iced::Result {
             what if what.starts_with("artist:") => Preview::Artist(what[7..].to_string()),
             what if what.starts_with("artist-about:") => Preview::ArtistAbout(what[13..].to_string()),
             what if what.starts_with("discography:") => Preview::Discography(what[12..].to_string()),
+            what if what.starts_with("tag:") => Preview::Tag(what[4..].to_string()),
             query => Preview::Search(query.to_string()),
         }),
         _ => None,
