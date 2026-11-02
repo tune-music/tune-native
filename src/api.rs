@@ -133,6 +133,49 @@ pub struct FileInfo {
     pub url: String,
     pub key: Option<String>,
     pub codec: String,
+    /// Кбит/с; ноль, если Яндекс не сказал.
+    pub bitrate: u64,
+    /// Качество, которое Яндекс дал на самом деле: lossless он отдаёт не всем и не всегда.
+    pub quality: String,
+}
+
+/// Что играет: подпись и качество файла.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sound {
+    pub label: String,
+    pub quality: String,
+}
+
+impl Sound {
+    /// Яндекс дал хуже, чем просили.
+    pub fn below(&self, asked: &str) -> bool {
+        let rank = |quality: &str| ["lq", "nq", "hq", "lossless"].iter().position(|known| *known == quality);
+        matches!((rank(&self.quality), rank(asked)), (Some(got), Some(asked)) if got < asked)
+    }
+}
+
+impl FileInfo {
+    pub fn sound(&self) -> Sound {
+        Sound { label: self.label(), quality: self.quality.clone() }
+    }
+
+    /// Что слышит пользователь, например «AAC, 256 кбит/с».
+    pub fn label(&self) -> String {
+        match self.bitrate {
+            0 => codec_name(&self.codec),
+            bitrate => format!("{}, {bitrate} кбит/с", codec_name(&self.codec)),
+        }
+    }
+}
+
+pub fn codec_name(codec: &str) -> String {
+    match codec {
+        "flac" | "flac-mp4" => "FLAC".to_string(),
+        "mp3" => "MP3".to_string(),
+        "aac" | "aac-mp4" => "AAC".to_string(),
+        "he-aac" | "he-aac-mp4" => "HE-AAC".to_string(),
+        other => other.to_uppercase(),
+    }
 }
 
 fn agent() -> ureq::Agent {
@@ -1247,6 +1290,8 @@ pub fn file_info(track_id: &str, quality: &str, token: &str) -> Result<FileInfo,
         url: url.to_string(),
         key: info["key"].as_str().filter(|k| !k.is_empty()).map(str::to_string),
         codec: info["codec"].as_str().unwrap_or("mp3").to_string(),
+        bitrate: info["bitrate"].as_u64().unwrap_or(0),
+        quality: info["quality"].as_str().unwrap_or(quality).to_string(),
     })
 }
 
@@ -1263,6 +1308,18 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn labels_sound() {
+        let info = |codec: &str, bitrate| FileInfo { url: String::new(), key: None, codec: codec.to_string(), bitrate, quality: "nq".to_string() };
+        assert_eq!(info("aac-mp4", 256).label(), "AAC, 256 кбит/с");
+        let sound = info("aac-mp4", 192).sound();
+        assert!(sound.below("lossless"));
+        assert!(!sound.below("nq"));
+        assert!(!sound.below("lq"));
+        assert_eq!(info("flac-mp4", 0).label(), "FLAC");
+        assert_eq!(codec_name("he-aac-mp4"), "HE-AAC");
+    }
 
     #[test]
     fn pin_reference_matches_its_target() {

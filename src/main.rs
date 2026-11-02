@@ -119,6 +119,9 @@ const LYRICS_DIM_FAR: f32 = 0.16;
 const LYRICS_CHROME: f32 = 300.0;
 /// Как часто запоминать место в треке.
 const SESSION_SAVE: Duration = Duration::from_secs(10);
+/// Шаг перемотки и громкости с клавиатуры.
+const SEEK_STEP: f32 = 5.0;
+const VOLUME_STEP: f32 = 0.05;
 const DIALOG_INPUT: &str = "dialog";
 const DIALOG_WIDTH: f32 = 400.0;
 /// Сколько окна остаётся вокруг сведений о треке.
@@ -499,7 +502,14 @@ struct App {
     unshuffled: Option<Vec<Track>>,
     quality: Quality,
     /// Формат файла, который играет сейчас: Яндекс может отдать не то, что просили.
-    codec: Option<String>,
+    /// Кодек и битрейт играющего файла.
+    sound: Option<api::Sound>,
+    /// Трек перезапускается в другом качестве; внутри — был ли он на паузе.
+    restart: Option<bool>,
+    /// После перемотки на прошлое место трек надо пустить.
+    unhold: bool,
+    /// Страницы, с которых ушли кнопкой «назад».
+    forward: Vec<Place>,
     /// Выбор качества открыт в этой точке.
     quality_menu: Option<(f32, f32)>,
     /// Что ещё закрывает новую страницу, от 1 до 0.
@@ -677,13 +687,19 @@ enum Message {
     WindowSize(Size),
     Media(media::Event),
     Play(Section, usize),
-    Started(u64, Result<String, String>),
+    Started(u64, Result<api::Sound, String>),
     Toggle,
     Next,
     Previous,
     Tick,
     Seek(f32),
     SeekDone,
+    /// Горячие клавиши: перемотка и громкость на шаг, оценка играющего трека.
+    SeekBy(f32),
+    VolumeBy(f32),
+    LikeCurrent,
+    DislikeCurrent,
+    Forward,
     Seeked(Result<(), String>),
     Volume(f32),
 }
@@ -785,7 +801,10 @@ impl App {
             shuffle: saved.shuffle,
             unshuffled: None,
             quality: saved.quality,
-            codec: None,
+            sound: None,
+            restart: None,
+            unhold: false,
+            forward: Vec::new(),
             quality_menu: None,
             page_veil: 0.0,
             page_shift: (0.0, 0.0),
@@ -1011,6 +1030,7 @@ impl App {
         self.screen = Screen::Login(false);
         self.section = Section::Wave;
         self.history.clear();
+        self.forward.clear();
         self.profile = None;
         self.results.clear();
         self.history_tracks.clear();
@@ -1045,7 +1065,7 @@ impl App {
         self.retry = None;
         self.unshuffled = None;
         self.quality_menu = None;
-        self.codec = None;
+        self.sound = None;
         self.uid = None;
         self.wave = None;
         self.wave_pending = None;
@@ -1220,10 +1240,11 @@ impl App {
             self.wave = Some(session);
             self.feedback("radioStarted", None, None);
         }
+        let restart = self.restart.take();
         // Место прошлого запуска относится только к тому же треку.
         let resume = self.resume.take().filter(|_| self.current == Some(index));
         self.retry = None;
-        self.codec = None;
+        self.sound = None;
         let generation = player.stop();
         self.play_id = generation;
         self.current = Some(index);
@@ -1233,7 +1254,12 @@ impl App {
         self.resume_seek = resume.filter(|place| !place.is_zero());
         self.seeking = None;
         self.error = None;
-        self.feedback("trackStarted", Some(&track), None);
+        // Трек с прошлого места стартует на паузе, иначе на миг слышно его начало.
+        player.hold_next(restart == Some(true) || self.resume_seek.is_some());
+        self.unhold = self.resume_seek.is_some() && restart != Some(true);
+        if restart.is_none() {
+            self.feedback("trackStarted", Some(&track), None);
+        }
         let id = track.id.clone();
         let quality = self.quality;
         let start = Task::perform(
@@ -1243,7 +1269,7 @@ impl App {
                 }
                 let info = api::file_info(&id, quality.code(), &token)?;
                 player.play(generation, &info)?;
-                Ok(info.codec)
+                Ok(info.sound())
             }),
             move |result| Message::Started(generation, result),
         );
@@ -1316,8 +1342,29 @@ impl App {
         Task::perform(background(move || api::home(tab, &token)), move |r| Message::HomeLoaded(tab, r))
     }
 
+    fn here(&self) -> Place {
+        Place { section: self.section, playlist: self.playlist.clone(), artist: self.artist.clone() }
+    }
+
     fn remember(&mut self) {
-        self.history.push(Place { section: self.section, playlist: self.playlist.clone(), artist: self.artist.clone() });
+        self.history.push(self.here());
+        self.forward.clear();
+    }
+
+    fn go(&mut self, place: Place) -> Task<Message> {
+        self.section = place.section;
+        self.artist = place.artist;
+        self.artist_loading = None;
+        if place.section == Section::Playlists {
+            if let Some(playlist) = place.playlist {
+                return self.load_list(playlist);
+            }
+            self.playlist = None;
+            self.album = None;
+            self.playlist_tracks.clear();
+        }
+        self.prune_covers();
+        Task::none()
     }
 
     fn open_list(&mut self, playlist: Playlist) -> Task<Message> {
@@ -1808,18 +1855,14 @@ impl App {
             }
             Message::Back => {
                 if let Some(place) = self.history.pop() {
-                    self.section = place.section;
-                    self.artist = place.artist;
-                    self.artist_loading = None;
-                    if place.section == Section::Playlists {
-                        if let Some(playlist) = place.playlist {
-                            return self.load_list(playlist);
-                        }
-                        self.playlist = None;
-                        self.album = None;
-                        self.playlist_tracks.clear();
-                    }
-                    self.prune_covers();
+                    self.forward.push(self.here());
+                    return self.go(place);
+                }
+            }
+            Message::Forward => {
+                if let Some(place) = self.forward.pop() {
+                    self.history.push(self.here());
+                    return self.go(place);
                 }
             }
             Message::Open(section) => {
@@ -2465,6 +2508,7 @@ impl App {
             Message::PlaylistDeleted(kind, Ok(())) => {
                 self.playlists.retain(|list| list.kind != kind);
                 self.history.retain(|place| place.playlist.as_ref().is_none_or(|list| list.kind != kind));
+                self.forward.retain(|place| place.playlist.as_ref().is_none_or(|list| list.kind != kind));
                 if self.playlist.as_ref().is_some_and(|list| list.kind == kind) {
                     return self.handle(Message::Back);
                 }
@@ -2575,9 +2619,17 @@ impl App {
             }
             Message::QualityOpen => self.quality_menu = Some(*CURSOR.lock().unwrap()),
             Message::QualitySet(quality) => {
+                let changed = quality != self.quality;
                 self.quality = quality;
                 self.quality_menu = None;
                 self.save_settings();
+                // Играющий трек сразу переходит на новое качество с того же места.
+                if let (true, true, Some(index)) = (changed, self.active, self.current) {
+                    self.restart = Some(self.player.as_ref().is_some_and(Player::is_paused));
+                    self.resume = Some(self.position);
+                    self.preloaded = None;
+                    return self.play(index);
+                }
             }
             Message::PreviewQueueDown => {
                 let down = operation::scroll_to(Id::new(LIST), scrollable::AbsoluteOffset { x: 0.0, y: 1200.0 });
@@ -2767,8 +2819,8 @@ impl App {
                 }
                 self.starting = false;
                 match result {
-                    Ok(codec) => {
-                        self.codec = Some(codec);
+                    Ok(sound) => {
+                        self.sound = Some(sound);
                         self.active = true;
                         self.failures = 0;
                         self.save_session();
@@ -2778,6 +2830,7 @@ impl App {
                         }
                     }
                     Err(e) => {
+                        self.unhold = false;
                         let task = self.fail(e);
                         self.failures += 1;
                         if let (Screen::Main(_), true, Some(i)) = (&self.screen, self.failures < MAX_FAILURES, self.current.filter(|i| i + 1 < self.queue.len())) {
@@ -2855,8 +2908,33 @@ impl App {
                     return Task::perform(background(move || p.seek(position)), Message::Seeked);
                 }
             }
-            Message::Seeked(Err(e)) => self.error = Some(e),
-            Message::Seeked(Ok(())) => {}
+            Message::Seeked(result) => {
+                if std::mem::take(&mut self.unhold) {
+                    if let Some(p) = self.player.as_ref().filter(|p| p.is_paused()) {
+                        p.toggle();
+                    }
+                }
+                if let Err(e) = result {
+                    self.error = Some(e);
+                }
+            }
+            Message::SeekBy(step) => {
+                let Some(end) = self.current_track().map(|track| track.duration.as_secs_f32()).filter(|_| self.active) else { return Task::none() };
+                let from = self.seeking.unwrap_or(self.position.as_secs_f32());
+                self.seeking = Some((from + step).clamp(0.0, (end - 1.0).max(0.0)));
+                return self.update(Message::SeekDone);
+            }
+            Message::VolumeBy(step) => return self.handle(Message::Volume((self.volume + step).clamp(0.0, 1.0))),
+            Message::LikeCurrent => {
+                if let Some(track) = self.current_track().cloned() {
+                    return self.handle(Message::Like(track));
+                }
+            }
+            Message::DislikeCurrent => {
+                if let Some(track) = self.current_track().cloned() {
+                    return self.handle(Message::Dislike(track));
+                }
+            }
             // Кадры обрабатывает update.
             Message::Frame(_) => {}
             Message::Volume(volume) => {
@@ -3288,8 +3366,8 @@ impl App {
                     .on_press(Message::QualitySet(quality)), 6.0),
             );
         }
-        if let Some(codec) = &self.codec {
-            items = items.push(container(text(format!("Сейчас играет: {}", codec_name(codec))).size(13).color(ui::MUTED.scale_alpha(alpha))).padding([6, 10]));
+        if let Some(sound) = &self.sound {
+            items = items.push(container(text(format!("Сейчас играет: {}", sound.label)).size(13).color(ui::MUTED.scale_alpha(alpha))).padding([6, 10]));
         }
         popup(items.into(), x, y, QUALITY_WIDTH, 5.0 * MENU_ITEM, alpha, live)
     }
@@ -3619,8 +3697,11 @@ impl App {
 
         let quality = Quality::ALL.into_iter().fold(row![].spacing(8), |line, quality| line.push(choice(quality.label(), quality == self.quality, Message::QualitySet(quality))));
         let mut sound = column![title("Качество звука"), quality].spacing(12);
-        if let Some(codec) = &self.codec {
-            sound = sound.push(text(format!("Сейчас играет: {}", codec_name(codec))).size(13).color(ui::MUTED));
+        if let Some(playing) = &self.sound {
+            sound = sound.push(text(format!("Сейчас играет: {}", playing.label)).size(13).color(ui::MUTED));
+            if playing.below(self.quality.code()) {
+                sound = sound.push(text("Яндекс не дал этот трек в выбранном качестве: играет лучшее, что есть для вашего аккаунта").size(13).color(ui::MUTED));
+            }
         }
 
         let ai = row![
@@ -3631,16 +3712,11 @@ impl App {
         .align_y(Alignment::Center);
         let ai = glow(button(ai).width(Length::Fill).padding(8).style(ui::row).on_press_maybe(self.ai_less.map(|enabled| Message::AiLessSet(!enabled))), 8.0);
 
-        let keys = [("Пауза и продолжение", "Пробел"), ("Закрыть меню или окно", "Esc"), ("Назад", "Боковая кнопка мыши"), ("Пауза, следующий и предыдущий трек", "Медиаклавиши")];
-        let keys = keys.into_iter().fold(column![title("Горячие клавиши")].spacing(10), |list, (action, key)| {
-            list.push(row![text(action).color(ui::TEXT).width(Length::Fill), container(text(key).size(13).color(ui::TEXT)).padding([3, 10]).style(ui::tile)].align_y(Alignment::Center))
-        });
-
         let page = column![
             text("Настройки").size(36).font(ui::font_headline()).color(ui::TEXT),
             sound,
             column![title("Рекомендации"), ai].spacing(8),
-            keys,
+            view_hotkeys(),
             column![title("Аккаунт"), row![link("Управление аккаунтом", Message::DialogOpen(Dialog::Account)), link("Выйти", Message::DialogOpen(Dialog::Logout))].spacing(8)].spacing(12),
             column![
                 title("О приложении"),
@@ -3650,7 +3726,8 @@ impl App {
             .spacing(12),
         ]
         .spacing(28)
-        .max_width(680);
+        .max_width(700)
+        .padding(Padding::ZERO.right(20));
         ui::scroll(page).height(Length::Fill).into()
     }
 
@@ -4383,16 +4460,6 @@ fn artist_links<'a>(artists: &[(String, String)], size: f32, font: iced::Font, c
     })
 }
 
-fn codec_name(codec: &str) -> String {
-    match codec {
-        "flac" | "flac-mp4" => "FLAC".to_string(),
-        "mp3" => "MP3".to_string(),
-        "aac" | "aac-mp4" => "AAC".to_string(),
-        "he-aac" | "he-aac-mp4" => "HE-AAC".to_string(),
-        other => other.to_uppercase(),
-    }
-}
-
 /// Заглушка строки, пока трек не загружен.
 /// Движение с плавным началом и концом: t от 0 до 1.
 fn smooth_step(t: f32) -> f32 {
@@ -4493,6 +4560,7 @@ impl PipeMedia for Subscription<Message> {
     fn pipe_media(self) -> Self {
         let back = event::listen_with(|event, status, _| match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Back)) => Some(Message::Back),
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Forward)) => Some(Message::Forward),
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 *CURSOR.lock().unwrap() = (position.x, position.y);
                 None
@@ -4500,11 +4568,91 @@ impl PipeMedia for Subscription<Message> {
             Event::Window(window::Event::Resized(size)) => Some(Message::WindowSize(size)),
             Event::Window(window::Event::CloseRequested) => Some(Message::Quit),
             Event::Keyboard(keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Escape), .. }) => Some(Message::MenuClose),
-            Event::Keyboard(keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Space), .. }) if status == event::Status::Ignored => Some(Message::Toggle),
+            Event::Keyboard(keyboard::Event::KeyPressed { key, physical_key, modifiers, .. }) if status == event::Status::Ignored => hotkey(&key, physical_key, modifiers),
             _ => None,
         });
         Subscription::batch([self, back, Subscription::run(media::events).map(Message::Media)])
     }
+}
+
+/// Клавиши как в официальном клиенте. Буквы берутся по месту на клавиатуре,
+/// поэтому работают и в русской раскладке.
+fn hotkey(key: &keyboard::Key, physical: keyboard::key::Physical, modifiers: keyboard::Modifiers) -> Option<Message> {
+    use keyboard::key::{Code, Named, Physical};
+    if modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    if let keyboard::Key::Named(named) = key {
+        let message = match named {
+            Named::Space => Message::Toggle,
+            Named::ArrowRight => Message::SeekBy(SEEK_STEP),
+            Named::ArrowLeft => Message::SeekBy(-SEEK_STEP),
+            Named::ArrowUp => Message::VolumeBy(VOLUME_STEP),
+            Named::ArrowDown => Message::VolumeBy(-VOLUME_STEP),
+            _ => return None,
+        };
+        return Some(message);
+    }
+    let Physical::Code(code) = physical else { return None };
+    Some(match code {
+        Code::KeyK => Message::Toggle,
+        Code::KeyL => Message::SeekBy(SEEK_STEP),
+        Code::KeyJ => Message::SeekBy(-SEEK_STEP),
+        Code::KeyN => Message::Next,
+        Code::KeyP => Message::Previous,
+        Code::KeyM => Message::ToggleMute,
+        Code::KeyF => Message::LikeCurrent,
+        Code::KeyD => Message::DislikeCurrent,
+        Code::KeyR => Message::RepeatNext,
+        Code::KeyS => Message::ShuffleToggle,
+        _ => return None,
+    })
+}
+
+/// Список для настроек: группа, действие и клавиши.
+const HOTKEYS: [(&str, &[(&str, &[&str])]); 4] = [
+    ("Воспроизведение", &[
+        ("Пауза и продолжение", &["Пробел", "K"]),
+        ("Следующий трек", &["N"]),
+        ("Предыдущий трек", &["P"]),
+        ("Перемотать вперёд на 5 секунд", &["→", "L"]),
+        ("Перемотать назад на 5 секунд", &["←", "J"]),
+        ("Режим повтора", &["R"]),
+        ("Случайный порядок", &["S"]),
+    ]),
+    ("Громкость", &[("Громче", &["↑"]), ("Тише", &["↓"]), ("Выключить или включить звук", &["M"])]),
+    ("Оценки", &[("Лайк играющему треку", &["F"]), ("Дизлайк играющему треку", &["D"])]),
+    ("Окна и страницы", &[
+        ("Предыдущая страница", &["Мышь: боковая «назад»"]),
+        ("Следующая страница", &["Мышь: боковая «вперёд»"]),
+        ("Закрыть меню или окно", &["Esc"]),
+    ]),
+];
+
+fn keycap<'a>(label: &'a str) -> Element<'a, Message> {
+    container(text(label).size(13).font(ui::font_medium()).color(ui::TEXT))
+        .padding([3, 9])
+        .style(|_| container::Style::default().background(ui::TEXT.scale_alpha(0.08)).border(iced::border::rounded(6.0).width(1.0).color(ui::TEXT.scale_alpha(0.14))))
+        .into()
+}
+
+fn view_hotkeys<'a>() -> Element<'a, Message> {
+    let line = || container(Space::new()).width(Length::Fill).height(1).style(|_| container::Style::default().background(ui::TEXT.scale_alpha(0.06)));
+    HOTKEYS
+        .iter()
+        .fold(column![text("Горячие клавиши").size(20).font(ui::font_medium()).color(ui::TEXT)].spacing(12), |page, (group, items)| {
+            let rows = items.iter().enumerate().fold(column![], |rows, (index, (action, keys))| {
+                let caps = keys.iter().enumerate().fold(row![].spacing(6).align_y(Alignment::Center), |caps, (at, key)| {
+                    let caps = if at > 0 { caps.push(text("или").size(12).color(ui::MUTED)) } else { caps };
+                    caps.push(keycap(key))
+                });
+                let rows = if index > 0 { rows.push(line()) } else { rows };
+                rows.push(container(row![text(*action).color(ui::TEXT).width(Length::Fill), caps].spacing(16).align_y(Alignment::Center)).padding([9, 16]))
+            });
+            let card = container(rows).width(Length::Fill).style(|_| container::Style::default().background(ui::TEXT.scale_alpha(0.035)).border(iced::border::rounded(12.0)));
+            page.push(column![text(*group).size(13).font(ui::font_medium()).color(ui::MUTED), card].spacing(6))
+        })
+        .into()
 }
 
 /// Переключатель. Пока значение неизвестно, он блёклый и стоит в положении «выключено».
@@ -4563,7 +4711,7 @@ fn smoke(query: &str) -> Result<(), String> {
     let track = tracks.first().ok_or("Ничего не найдено")?;
     println!("Трек: {} — {} ({})", track.artists, track.title, clock(track.duration));
     let info = api::file_info(&track.id, Quality::Normal.code(), &token)?;
-    println!("Файл: {}, зашифрован: {}", info.codec, info.key.is_some());
+    println!("Файл: {}, зашифрован: {}", info.label(), info.key.is_some());
     let player = Player::new()?;
     player.set_volume(0.05);
     let generation = player.stop();
@@ -4638,7 +4786,7 @@ fn smoke_quality(query: &str) -> Result<(), String> {
         let played = player.position();
         player.seek(Duration::from_secs(30))?;
         std::thread::sleep(Duration::from_secs(1));
-        println!("{}: {}, позиция {played:?}, после перемотки {:?}", quality.code(), info.codec, player.position());
+        println!("{}: {}, позиция {played:?}, после перемотки {:?}", quality.code(), info.label(), player.position());
     }
     let info = api::file_info(&track.id, Quality::Normal.code(), &token)?;
     player.preload("проверка", &info)?;
@@ -4646,6 +4794,17 @@ fn smoke_quality(query: &str) -> Result<(), String> {
     let started = std::time::Instant::now();
     player.play_prepared(generation, "проверка").ok_or("Подготовленный файл потерялся")??;
     println!("Запуск подготовленного файла: {:?}", started.elapsed());
+    std::thread::sleep(Duration::from_secs(1));
+    player.hold_next(true);
+    let generation = player.stop();
+    player.play(generation, &info)?;
+    std::thread::sleep(Duration::from_secs(1));
+    println!("Запуск на паузе: пауза {}, позиция {:?}", player.is_paused(), player.position());
+    player.seek(Duration::from_secs(60))?;
+    println!("Перемотка на паузе: позиция {:?}", player.position());
+    player.toggle();
+    std::thread::sleep(Duration::from_secs(1));
+    println!("После продолжения: пауза {}, позиция {:?}", player.is_paused(), player.position());
     std::thread::sleep(Duration::from_secs(2));
     println!("Позиция: {:?}", player.position());
     Ok(())
@@ -4868,8 +5027,8 @@ mod tests {
 
     #[test]
     fn names_codecs() {
-        assert_eq!(codec_name("flac-mp4"), "FLAC");
-        assert_eq!(codec_name("he-aac-mp4"), "HE-AAC");
+        assert_eq!(api::codec_name("flac-mp4"), "FLAC");
+        assert_eq!(api::codec_name("he-aac-mp4"), "HE-AAC");
     }
 
     #[test]

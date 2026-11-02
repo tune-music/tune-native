@@ -145,6 +145,7 @@ fn download(info: &FileInfo, path: &Path, progress: Arc<Progress>) -> Result<u64
 struct Prepared {
     key: String,
     codec: String,
+    sound: crate::api::Sound,
     path: PathBuf,
     progress: Arc<Progress>,
     len: u64,
@@ -166,6 +167,8 @@ pub struct Player {
     current_file: Arc<Mutex<Option<PathBuf>>>,
     prepared: Arc<Mutex<Option<Prepared>>>,
     generation: Arc<AtomicU64>,
+    /// Следующий трек откроется на паузе: его ещё надо перемотать или он и был на паузе.
+    hold: Arc<AtomicBool>,
     _device: Arc<SendDevice>,
 }
 
@@ -185,6 +188,7 @@ impl Player {
             current_file: Arc::default(),
             prepared: Arc::default(),
             generation: Arc::default(),
+            hold: Arc::default(),
             _device: Arc::new(SendDevice(device)),
         })
     }
@@ -221,7 +225,7 @@ impl Player {
         let path = std::env::temp_dir().join(format!("tune-native-{}-next-{}.part", std::process::id(), key.replace(':', "-")));
         let progress = Arc::new(Progress::default());
         let len = download(info, &path, progress.clone())?;
-        let new = Prepared { key: key.to_string(), codec: info.codec.clone(), path, progress, len };
+        let new = Prepared { key: key.to_string(), codec: info.codec.clone(), sound: info.sound(), path, progress, len };
         if let Some(old) = self.prepared.lock().unwrap().replace(new) {
             old.discard();
         }
@@ -229,7 +233,7 @@ impl Player {
     }
 
     /// Запускает подготовленный файл. `None` — такого нет, файл надо запросить обычным путём.
-    pub fn play_prepared(&self, generation: u64, key: &str) -> Option<Result<String, String>> {
+    pub fn play_prepared(&self, generation: u64, key: &str) -> Option<Result<crate::api::Sound, String>> {
         let prepared = {
             let mut slot = self.prepared.lock().unwrap();
             if slot.as_ref().is_none_or(|p| p.key != key) {
@@ -239,7 +243,7 @@ impl Player {
         };
         *self.current.lock().unwrap() = Some(prepared.progress.clone());
         *self.current_file.lock().unwrap() = Some(prepared.path.clone());
-        Some(self.start(generation, &prepared.path, prepared.progress, prepared.len, &prepared.codec).map(|()| prepared.codec))
+        Some(self.start(generation, &prepared.path, prepared.progress, prepared.len, &prepared.codec).map(|()| prepared.sound))
     }
 
     fn start(&self, generation: u64, path: &Path, progress: Arc<Progress>, len: u64, codec: &str) -> Result<(), String> {
@@ -256,8 +260,16 @@ impl Player {
             return Ok(());
         }
         self.output.append(decoder);
-        self.output.play();
+        if self.hold.swap(false, Ordering::AcqRel) {
+            self.output.pause();
+        } else {
+            self.output.play();
+        }
         Ok(())
+    }
+
+    pub fn hold_next(&self, hold: bool) {
+        self.hold.store(hold, Ordering::Release);
     }
 
     pub fn toggle(&self) {
