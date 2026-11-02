@@ -46,13 +46,15 @@ const BAR_MODE: f32 = 38.0;
 const BAR_SIDE: f32 = 38.0;
 const BAR_TOGGLE: f32 = 40.0;
 const BAR_GAP: f32 = 14.0;
-/// Самая узкая часть трекбара, при которой что-то ещё помещается.
-const BAR_ZONE_MODES: f32 = 130.0;
-const BAR_ZONE_COVER: f32 = 150.0;
-const BAR_TITLE_MIN: f32 = 120.0;
+/// Сколько места нужно названию рядом с обложкой. Меньше — оно уезжает в строку сверху.
+const BAR_TITLE_ROOM: f32 = 150.0;
+/// Верхняя строка трекбара с названием: высота, размер текста и время выезда.
+const BAR_TOP_LINE: f32 = 24.0;
+const BAR_TOP_SIZE: f32 = 14.0;
+const BAR_TOP_FADE: f32 = 0.2;
 const BAR_TOOL: f32 = 30.0;
 const BAR_VOLUME_ICON: f32 = 32.0;
-const BAR_SLIDER_MIN: f32 = 36.0;
+const BAR_SLIDER_MIN: f32 = 30.0;
 const BAR_SLIDER_MAX: f32 = 110.0;
 const CARD: f32 = 190.0;
 /// Волна: что занято по высоте кроме обложки, пределы обложки и ширина подписей под ней.
@@ -419,6 +421,8 @@ struct App {
     page_veil: f32,
     /// Откуда въезжает страница.
     page_shift: (f32, f32),
+    /// Насколько выехала верхняя строка трекбара, от 0 до 1.
+    bar_top: f32,
     /// Что ещё закрывает новый трек Моей волны, от 1 до 0.
     track_veil: f32,
     shown_track: Option<String>,
@@ -658,6 +662,7 @@ impl App {
             quality_menu: None,
             page_veil: 0.0,
             page_shift: (0.0, 0.0),
+            bar_top: 0.0,
             track_veil: 0.0,
             shown_track: None,
             menu_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
@@ -687,7 +692,7 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        self.page_veil > 0.0 || self.track_veil > 0.0 || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.dialog_fade.busy() || self.notice_fade.busy()
+        self.page_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.dialog_fade.busy() || self.notice_fade.busy()
     }
 
     /// Сколько места занимает основная часть окна.
@@ -1186,6 +1191,8 @@ impl App {
             let elapsed = self.last_frame.map_or(0.0, |last| now.duration_since(last).as_secs_f32()).min(FRAME_LIMIT);
             self.page_veil = (self.page_veil - elapsed / PAGE_FADE).max(0.0);
             self.track_veil = (self.track_veil - elapsed / TRACK_FADE).max(0.0);
+            let bar_top = self.bar_top_target();
+            self.bar_top = if bar_top > self.bar_top { (self.bar_top + elapsed / BAR_TOP_FADE).min(bar_top) } else { (self.bar_top - elapsed / BAR_TOP_FADE).max(bar_top) };
             self.cover_fades.retain(|_, level| {
                 *level += elapsed / COVER_FADE;
                 *level < 1.0
@@ -3360,60 +3367,85 @@ impl App {
         self.starting || (self.active && !self.player.as_ref().is_none_or(Player::is_paused))
     }
 
-    /// Кнопки всегда стоят посередине, а края занимают равные зоны. Когда окно сужается,
-    /// уменьшаются только зоны: сначала название и громкость, потом пропадает лишнее.
+    /// Ширина боковых частей трекбара и нужна ли строка с названием сверху.
+    /// Кнопки стоят посередине, края занимают равные части.
+    fn bar_layout(&self) -> (f32, bool) {
+        let inner = self.main_width() - 16.0;
+        let core = 2.0 * BAR_SIDE + BAR_TOGGLE + 2.0 * BAR_GAP;
+        let transport = if self.wave_queue { core } else { core + 2.0 * (BAR_MODE + BAR_GAP) };
+        let zone = ((inner - transport) / 2.0 - 16.0).max(0.0);
+        let room = zone - BAR_COVER - 12.0 - 2.0 * (LIKE + 12.0);
+        (zone, room < BAR_TITLE_ROOM)
+    }
+
+    fn bar_top_target(&self) -> f32 {
+        if self.bar_layout().1 {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Все кнопки есть всегда. Когда окно сужается, сжимается только громкость,
+    /// а название уезжает в тонкую строку сверху; не поместится и там — обрезается.
     fn view_bar(&self) -> Option<Element<'_, Message>> {
         let track = self.current_track()?;
         let side = |icon, message| glow(button(ui::icon(icon, 26.0, ui::MUTED)).padding(6).style(ui::ghost).on_press(message), 20.0);
         let toggle = shine(button(container(ui::icon(if self.is_playing() { ui::PAUSE } else { ui::PLAY }, 26.0, ui::ON_ACCENT)).center(26)).padding(7).style(ui::round).on_press(Message::Toggle), 40.0);
         let mode = |icon, on: bool, message| glow(button(ui::icon(icon, 22.0, if on { ui::ACCENT } else { ui::MUTED })).padding(8).style(ui::ghost).on_press(message), 20.0);
+        let (zone, stacked) = self.bar_layout();
 
-        let inner = self.main_width() - 16.0;
-        let core = 2.0 * BAR_SIDE + BAR_TOGGLE + 2.0 * BAR_GAP;
-        let zone_for = |transport: f32| ((inner - transport) / 2.0 - 16.0).max(0.0);
-        // В волне порядок задаёт она сама, поэтому этих кнопок там нет.
-        let modes = !self.wave_queue && zone_for(core + 2.0 * (BAR_MODE + BAR_GAP)) >= BAR_ZONE_MODES;
-        let zone = zone_for(if modes { core + 2.0 * (BAR_MODE + BAR_GAP) } else { core });
-
-        let names: Element<'_, Message> = if self.starting {
-            text("Загрузка…").color(ui::MUTED).wrapping(Wrapping::None).into()
-        } else if track.artist_list.is_empty() {
-            text(&track.artists).color(ui::MUTED).wrapping(Wrapping::None).into()
-        } else {
-            artist_links(&track.artist_list, 16.0, ui::font(), ui::MUTED).into()
+        let names = |size: f32, alpha: f32| -> Element<'_, Message> {
+            if self.starting {
+                text("Загрузка…").size(size).color(ui::MUTED.scale_alpha(alpha)).wrapping(Wrapping::None).into()
+            } else if track.artist_list.is_empty() {
+                text(&track.artists).size(size).color(ui::MUTED.scale_alpha(alpha)).wrapping(Wrapping::None).into()
+            } else {
+                artist_links(&track.artist_list, size, ui::font(), ui::MUTED.scale_alpha(alpha)).into()
+            }
         };
-        let mut about = row![].spacing(12).align_y(Alignment::Center);
-        if zone >= BAR_ZONE_COVER {
-            about = about.push(self.cover(track, BAR_COVER));
+        let mut about = row![self.cover(track, BAR_COVER)].spacing(12).align_y(Alignment::Center);
+        if !stacked {
+            about = about.push(column![track_title(track, 16.0, ui::font_medium(), ui::WHITE), names(16.0, 1.0)].width(Length::Fill).clip(true));
         }
-        about = about.push(column![track_title(track, 16.0, ui::font_medium(), ui::WHITE), names].width(Length::Fill).clip(true));
-        if zone >= BAR_COVER + BAR_TITLE_MIN + 2.0 * (LIKE + 12.0) + 12.0 {
-            about = about.push(self.like_button(track, 22.0)).push(self.more_button(track, 20.0));
-        }
+        about = about.push(self.like_button(track, 22.0)).push(self.more_button(track, 20.0));
         let about = mouse_area(container(about).width(zone).clip(true)).on_right_press(Message::MenuOpen(track.clone()));
 
+        // В волне порядок задаёт она сама, поэтому этих кнопок там нет.
         let mut buttons = row![].spacing(BAR_GAP).align_y(Alignment::Center);
-        if modes {
+        if !self.wave_queue {
             buttons = buttons.push(mode(ui::SHUFFLE, self.shuffle, Message::ShuffleToggle));
         }
         buttons = buttons.push(side(ui::PREVIOUS, Message::Previous)).push(toggle).push(side(ui::NEXT, Message::Next));
-        if modes {
+        if !self.wave_queue {
             let icon = if self.repeat == Repeat::One { ui::REPEAT_ONE } else { ui::REPEAT };
             buttons = buttons.push(mode(icon, self.repeat != Repeat::Off, Message::RepeatNext));
         }
 
         let lyrics = if track.lyrics { BAR_TOOL + 6.0 } else { 0.0 };
-        let quality = zone >= 2.0 * BAR_TOOL + 6.0 + lyrics;
-        let tools = lyrics + if quality { 2.0 * BAR_TOOL + 6.0 } else { BAR_TOOL };
-        let slider_room = zone - tools - BAR_VOLUME_ICON - 14.0;
-        let mut right = row![self.view_tools(22.0, quality)].spacing(8).align_y(Alignment::Center);
-        if slider_room >= 0.0 {
-            right = right.push(self.view_volume(24.0, (slider_room >= BAR_SLIDER_MIN).then_some(slider_room.min(BAR_SLIDER_MAX))));
-        }
+        let tools = lyrics + 2.0 * BAR_TOOL + 6.0;
+        let slider_room = (zone - tools - BAR_VOLUME_ICON - 14.0).clamp(BAR_SLIDER_MIN, BAR_SLIDER_MAX);
+        let right = row![self.view_tools(22.0, true), self.view_volume(24.0, Some(slider_room))].spacing(8).align_y(Alignment::Center);
 
         let controls = row![about, container(buttons).center_x(Length::Fill), container(right).align_right(zone)].spacing(16).align_y(Alignment::Center);
+
+        // Строка сверху выезжает плавно и обрезается по краю окна.
+        let shown = anim::ease_out(self.bar_top);
+        let top: Element<'_, Message> = if self.bar_top > 0.0 {
+            let line = row![
+                track_title(track, BAR_TOP_SIZE, ui::font_medium(), ui::WHITE.scale_alpha(shown)),
+                text("·").size(BAR_TOP_SIZE).color(ui::MUTED.scale_alpha(shown)),
+                names(BAR_TOP_SIZE, shown),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+            mouse_area(container(line).width(Length::Fill).height(BAR_TOP_LINE * shown).padding([0, 8]).clip(true).align_y(Alignment::Center)).on_right_press(Message::MenuOpen(track.clone())).into()
+        } else {
+            Space::new().height(0).into()
+        };
         Some(
             container(column![
+                top,
                 container(self.seek_line(track, Length::Fill)).padding([0, 8]).height(SEEK_HEIGHT),
                 container(controls).padding([0, 8]).center_y(BAR_HEIGHT - 4.0).width(Length::Fill),
             ])
