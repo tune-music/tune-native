@@ -602,6 +602,8 @@ enum Message {
     PinsLoaded(Result<Vec<Pin>, String>),
     PlaylistLoaded(String, Result<Vec<Track>, String>),
     SimilarLoaded(String, Result<Vec<HomeItem>, String>),
+    LinkTrack(Result<Vec<Track>, String>),
+    LinkPlaylist(Result<Playlist, String>),
     MenuOpen(Track),
     MenuClose,
     MenuArtists,
@@ -965,10 +967,26 @@ impl App {
         self.fetch_cover_jobs(albums.chain(artists).chain(lists).collect(), "300x300")
     }
 
+    /// Открывает страницу, на которую ведёт ссылка.
+    fn link_open(&mut self, link: api::Link, token: String) -> Task<Message> {
+        match link {
+            api::Link::Album(id) => self.open_list(Playlist::album(&id, "")),
+            api::Link::Artist(id) => self.handle(Message::ArtistOpen(id)),
+            api::Link::Track(id) => Task::perform(background(move || api::tracks_by_ids(&[id], &token)), Message::LinkTrack),
+            link => Task::perform(background(move || api::link_playlist(&link, &token)), Message::LinkPlaylist),
+        }
+    }
+
     fn search_run(&mut self) -> Task<Message> {
         let Some(token) = self.token() else { return Task::none() };
         let text = self.query.trim().to_string();
         self.search_id += 1;
+        if let Some(link) = api::parse_link(&text) {
+            self.query.clear();
+            self.searching = false;
+            self.searched = false;
+            return self.link_open(link, token);
+        }
         if text.is_empty() {
             self.searching = false;
             self.searched = false;
@@ -1518,6 +1536,7 @@ impl App {
                         Task::batch([page, Task::done(Message::Filter(query))])
                     }
                     Some(Preview::Search(query)) => {
+                        self.preview = None;
                         self.section = Section::Search;
                         self.query = query;
                         self.update(Message::Search)
@@ -2079,6 +2098,21 @@ impl App {
                     return self.open_list(playlist);
                 }
             }
+            Message::LinkTrack(result) => match result.map(|tracks| tracks.into_iter().next()) {
+                Ok(Some(track)) if track.album.is_some() => return self.handle(Message::OpenAlbum(track)),
+                // Трек без альбома показать негде, поэтому просто включаем.
+                Ok(Some(track)) => {
+                    self.queue_from = QueueFrom::Unknown;
+                    let title = track.title.clone();
+                    return self.play_list(vec![track], title, 0);
+                }
+                Ok(None) => return self.fail("Этот трек недоступен".to_string()),
+                Err(e) => return self.fail(e),
+            },
+            Message::LinkPlaylist(result) => match result {
+                Ok(list) => return self.open_list(list),
+                Err(e) => return self.fail(e),
+            },
             Message::SimilarLoaded(kind, result) => {
                 if self.playlist.as_ref().is_some_and(|list| list.kind == kind) {
                     // Похожее не главное на странице: если не пришло, просто его не показываем.
@@ -3450,7 +3484,7 @@ impl App {
     }
 
     fn view_search(&self) -> Element<'_, Message> {
-        let input = text_input("Трек или исполнитель", &self.query)
+        let input = text_input("Трек, исполнитель или ссылка", &self.query)
             .id(SEARCH_INPUT)
             .on_input(Message::Query)
             .on_submit(Message::Search)
@@ -4335,6 +4369,8 @@ fn main() -> iced::Result {
             }
             return Ok(());
         }
+        // Ссылка в командной строке открывается как и в поиске.
+        [_, link] if api::parse_link(link).is_some() => Some(Preview::Search(link.clone())),
         [_, flag, what] if flag == "--preview" => Some(match what.as_str() {
             "wave" => Preview::Wave,
             "home" => Preview::Home,

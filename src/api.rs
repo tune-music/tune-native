@@ -741,6 +741,49 @@ fn parse_home_item(v: &Value) -> Option<HomeItem> {
     Some(HomeItem::Wave { title: data["title"].as_str().or(wave["name"].as_str())?.to_string(), seeds, cover })
 }
 
+/// Куда ведёт ссылка на Яндекс Музыку.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Link {
+    Album(String),
+    Track(String),
+    Artist(String),
+    Playlist(String, String),
+    PlaylistUuid(String),
+}
+
+/// Разбирает ссылку на music.yandex.*. Всё остальное не ссылка, а обычный поиск.
+pub fn parse_link(text: &str) -> Option<Link> {
+    let text = text.trim();
+    let rest = text.strip_prefix("https://").or_else(|| text.strip_prefix("http://")).unwrap_or(text);
+    let path = rest.split(['?', '#']).next()?;
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let (host, parts) = parts.split_first()?;
+    if !host.starts_with("music.yandex.") {
+        return None;
+    }
+    let number = |id: &str| (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then(|| id.to_string());
+    match parts {
+        ["album", album, ..] => number(album).map(Link::Album),
+        ["track", track, ..] => number(track).map(Link::Track),
+        ["artist", artist, ..] => number(artist).map(Link::Artist),
+        ["users", owner, "playlists", kind, ..] => number(kind).map(|kind| Link::Playlist(owner.to_string(), kind)),
+        // В ссылках на плейлисты перед номером бывает приставка.
+        ["playlists", id, ..] => Some(Link::PlaylistUuid(id.strip_prefix("lk.").unwrap_or(id).to_string())),
+        _ => None,
+    }
+}
+
+/// Плейлист по ссылке: владелец в ней может быть логином, а приложению нужен номер.
+pub fn link_playlist(link: &Link, token: &str) -> Result<Playlist, String> {
+    let path = match link {
+        Link::Playlist(owner, kind) => format!("users/{owner}/playlists/{kind}"),
+        Link::PlaylistUuid(id) => format!("playlist/{id}"),
+        _ => return Err("Это не ссылка на плейлист".to_string()),
+    };
+    let v = get(&path, &[], token)?;
+    parse_playlist(result(&v), "").ok_or_else(|| "Не удалось открыть плейлист".to_string())
+}
+
 fn parse_similar(v: &Value) -> Vec<HomeItem> {
     result(v)["items"].as_array().into_iter().flatten().filter_map(parse_home_item).collect()
 }
@@ -1191,6 +1234,20 @@ mod tests {
         assert!(cache.entries.len() <= CACHE_SIZE);
         assert_eq!(cache.get("k0", now + CACHE_TIME / 2), None);
         assert!(!cacheable("music-history") && !cacheable("get-file-info") && cacheable("albums/1/with-tracks"));
+    }
+
+    #[test]
+    fn parses_links() {
+        let link = |text: &str| parse_link(text);
+        assert_eq!(link("https://music.yandex.ru/album/3389008"), Some(Link::Album("3389008".to_string())));
+        assert_eq!(link(" https://music.yandex.ru/album/1/track/2?utm_source=x "), Some(Link::Album("1".to_string())));
+        assert_eq!(link("music.yandex.com/track/5"), Some(Link::Track("5".to_string())));
+        assert_eq!(link("https://music.yandex.kz/artist/3121/tracks"), Some(Link::Artist("3121".to_string())));
+        assert_eq!(link("https://music.yandex.ru/users/music-blog/playlists/2131"), Some(Link::Playlist("music-blog".to_string(), "2131".to_string())));
+        assert_eq!(link("https://music.yandex.ru/playlists/lk.ab-cd"), Some(Link::PlaylistUuid("ab-cd".to_string())));
+        for other in ["metallica", "https://example.com/album/1", "https://music.yandex.ru/album/abc", "https://music.yandex.ru/home", ""] {
+            assert_eq!(link(other), None, "{other}");
+        }
     }
 
     #[test]
