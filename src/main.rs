@@ -4768,9 +4768,10 @@ impl App {
         ]
         .spacing(12)
         .align_y(Alignment::Center);
-        // У недоступных треков Яндекс длительности не присылает: пустое место лучше «00:00».
-        if self.main_width() >= TRACK_TIME_WIDTH && !track.duration.is_zero() {
-            line = line.push(text(clock(track.duration)).color(names_color));
+        // У недоступных треков Яндекс длительности не присылает: вместо «00:00» пустое место той же ширины.
+        if self.main_width() >= TRACK_TIME_WIDTH {
+            let time_color = if track.duration.is_zero() { iced::Color::TRANSPARENT } else { names_color };
+            line = line.push(text(clock(track.duration)).color(time_color));
         }
         let line = line.push(self.more_button(track, 18.0));
         mouse_area(glow(button(line).width(Length::Fill).height(ROW).padding([8, 8]).style(ui::row).on_press(play), 8.0)).on_right_press(Message::MenuOpen(track.clone())).into()
