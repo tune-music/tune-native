@@ -169,6 +169,62 @@ impl<'a> From<Reveal<'a>> for Element<'a, Message> {
     }
 }
 
+/// Заслонка: всё, что под ней в стопке слоёв, не видит мыши. Нажатия, колесо и наведение
+/// забираются, даже если под курсором пустое место; кнопки внутри работают как обычно.
+pub struct Block<'a> {
+    content: Element<'a, Message>,
+}
+
+pub fn block<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    Element::new(Block { content: content.into() })
+}
+
+impl Widget<Message, Theme, Renderer> for Block<'_> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) -> layout::Node {
+        self.content.as_widget_mut().layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer, operation: &mut dyn Operation) {
+        self.content.as_widget_mut().operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(&mut self, tree: &mut Tree, event: &Event, layout: Layout<'_>, cursor: mouse::Cursor, renderer: &Renderer, clipboard: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, viewport: &Rectangle) {
+        self.content.as_widget_mut().update(&mut tree.children[0], event, layout, cursor, renderer, clipboard, shell, viewport);
+        let mouse = matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_) | mouse::Event::ButtonReleased(_) | mouse::Event::WheelScrolled { .. }));
+        if mouse && cursor.is_over(layout.bounds()) {
+            shell.capture_event();
+        }
+    }
+
+    fn mouse_interaction(&self, tree: &Tree, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle, renderer: &Renderer) -> mouse::Interaction {
+        // Не «ничего» над пустым местом: стопка тогда не пускает курсор к слоям ниже.
+        match self.content.as_widget().mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer) {
+            mouse::Interaction::None if cursor.is_over(layout.bounds()) => mouse::Interaction::Idle,
+            interaction => interaction,
+        }
+    }
+
+    fn draw(&self, tree: &Tree, renderer: &mut Renderer, theme: &Theme, style: &renderer::Style, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle) {
+        self.content.as_widget().draw(&tree.children[0], renderer, theme, style, layout, cursor, viewport);
+    }
+
+    fn overlay<'b>(&'b mut self, tree: &'b mut Tree, layout: Layout<'b>, renderer: &Renderer, viewport: &Rectangle, translation: Vector) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(&mut tree.children[0], layout, renderer, viewport, translation)
+    }
+}
+
 /// Сколько точек прокрутки даёт один щелчок колеса.
 const WHEEL_STEP: f32 = 90.0;
 /// Как быстро догоняется прокрутка: чем больше, тем короче хвост.

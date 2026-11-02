@@ -398,6 +398,8 @@ enum Preview {
     ScrollReturn,
     /// Восстановленная очередь и плеер на всё окно.
     Full,
+    /// Восстановленная очередь на странице волны, без звука.
+    WaveRestored,
     /// В лайках набирается фильтр по буквам: в stderr — остался ли фокус.
     FilterFocus,
     /// Все релизы исполнителя.
@@ -768,8 +770,7 @@ enum Message {
     Unavailable,
     /// Плеер на всё окно: открыть или закрыть.
     FullToggle,
-    /// Нажатие мимо кнопок плеера на всё окно не должно доходить до страницы под ним.
-    Swallow,
+
     /// Ответ, какие треки очереди сейчас можно слушать.
     Availability(Result<Vec<(String, bool)>, String>),
     HistoryLoaded(Result<Vec<Track>, String>),
@@ -2055,6 +2056,11 @@ impl App {
                         self.preview = None;
                         self.update(Message::Open(Section::Settings))
                     }
+                    Some(Preview::WaveRestored) => {
+                        self.preview = None;
+                        self.section = Section::Wave;
+                        session::load().map_or(Task::none(), |saved| self.restore(saved))
+                    }
                     Some(Preview::Full) => {
                         self.preview = None;
                         self.player_full = true;
@@ -3279,7 +3285,6 @@ impl App {
             }
             Message::Unavailable => return self.notify(UNAVAILABLE.to_string()),
             Message::FullToggle => self.player_full = !self.player_full && self.current_track().is_some(),
-            Message::Swallow => {}
             Message::Availability(Ok(found)) => {
                 let found: HashMap<String, bool> = found.into_iter().collect();
                 for track in &mut self.queue {
@@ -3580,7 +3585,7 @@ impl App {
         };
         // Вместо затухания самой страницы её на миг закрывает фон и плавно уходит.
         let rest = 1.0 - anim::ease_out(1.0 - self.page_veil);
-        let back = if self.section == Section::Wave { ui::BLACK } else { ui::CONTENT };
+        let back = ui::CONTENT;
         let page: Element<'_, Message> = reveal(page).shift(self.page_shift.0 * rest, self.page_shift.1 * rest).veil(back.scale_alpha(rest)).into();
         let mut page = column![page].spacing(12).height(Length::Fill);
         if let Some(error) = &self.error {
@@ -3590,16 +3595,11 @@ impl App {
             }
             page = page.push(line);
         }
-        // Моя волна в оригинале занимает всё окно без панели и нижнего плеера.
-        let main: Element<'_, Message> = if self.section == Section::Wave {
-            container(page).width(Length::Fill).height(Length::Fill).padding(Padding::ZERO.right(12).bottom(12)).clip(true).into()
-        } else {
-            let mut main = column![container(page).padding(24).width(Length::Fill).height(Length::Fill).style(ui::content).clip(true)].spacing(12);
-            if let Some(bar) = self.view_bar() {
-                main = main.push(bar);
-            }
-            container(main).padding(Padding::ZERO.right(12).bottom(12)).width(Length::Fill).height(Length::Fill).into()
-        };
+        let mut main = column![container(page).padding(24).width(Length::Fill).height(Length::Fill).style(ui::content).clip(true)].spacing(12);
+        if let Some(bar) = self.view_bar() {
+            main = main.push(bar);
+        }
+        let main: Element<'_, Message> = container(main).padding(Padding::ZERO.right(12).bottom(12)).width(Length::Fill).height(Length::Fill).into();
         let columns = row![self.view_sidebar(), main];
         let base = container(columns).width(Length::Fill).height(Length::Fill).style(ui::root);
         let mut layers = stack![base];
@@ -4197,9 +4197,10 @@ impl App {
             .center(Length::Fill)
             .into();
         };
-        let space = self.main_width() - 24.0;
+        // Волна стоит в панели над нижним плеером: место под обложку меньше окна.
+        let space = self.main_width() - 48.0;
         let height = WINDOW.lock().unwrap().1;
-        let art = (height - WAVE_CHROME).min(space).clamp(WAVE_COVER_MIN, WAVE_COVER_MAX);
+        let art = (height - WAVE_CHROME - BAR_HEIGHT).min(space).clamp(WAVE_COVER_MIN, WAVE_COVER_MAX);
         let line = space.min(WAVE_COLUMN);
 
         let tuned = settings::wave_names(self.wave_tuning).join(", ");
@@ -4223,7 +4224,7 @@ impl App {
             None => text("Моя волна").size(18).font(ui::font_headline()).color(ui::ACCENT).wrapping(Wrapping::None).into(),
         };
 
-        let body = self.player_body(track, art, line, ui::BLACK);
+        let body = self.player_body(track, art, line, ui::CONTENT);
         let tune: Element<'_, Message> = if self.wave_queue {
             let tint = if tuned.is_empty() { ui::TEXT } else { ui::ACCENT };
             shine(button(row![ui::icon(ui::WAVE, 20.0, tint), text("Настроить").color(tint)].spacing(8).align_y(Alignment::Center)).padding([8, 16]).style(ui::secondary).on_press(Message::DialogOpen(Dialog::WaveTune)), 24.0)
@@ -4237,7 +4238,8 @@ impl App {
         } else {
             Space::new().into()
         };
-        let tools = row![tune, pin, Space::new().width(Length::Fill), self.view_tools(22.0, true), self.view_volume(22.0, Some((space - 130.0).clamp(50.0, 130.0)))].spacing(10).align_y(Alignment::Center);
+        // Качество, текст, очередь и громкость есть в нижнем плеере, здесь только своё для волны.
+        let tools = row![tune, pin].spacing(10).align_y(Alignment::Center);
         column![container(top).center_x(Length::Fill).padding(Padding::ZERO.top(8)), container(body).center(Length::Fill), tools].height(Length::Fill).into()
     }
 
@@ -4271,7 +4273,7 @@ impl App {
         let shift = 10.0 * rest;
         let veil = back.scale_alpha(rest);
         column![
-            reveal(self.wave_cover(track, art)).shift(0.0, shift).veil(veil),
+            reveal(button(self.wave_cover(track, art)).padding(0).style(ui::ghost).on_press_maybe((!self.player_full).then_some(Message::FullToggle))).shift(0.0, shift).veil(veil),
             Space::new().height(20),
             reveal(info).shift(0.0, shift).veil(veil),
             Space::new().height(12),
@@ -4304,7 +4306,7 @@ impl App {
             ..container::Style::default()
         };
         let shown = self.full_fade.shown();
-        let sheet = mouse_area(container(page).width(Length::Fill).height(Length::Fill).style(back)).on_press(Message::Swallow);
+        let sheet = anim::block(container(page).width(Length::Fill).height(Length::Fill).style(back));
         Some(reveal(sheet).shift(0.0, height * (1.0 - shown)).inert(!self.player_full).into())
     }
 
@@ -5840,6 +5842,7 @@ fn main() -> iced::Result {
             "search-focus" => Preview::SearchFocus,
             "scroll-return" => Preview::ScrollReturn,
             "full" => Preview::Full,
+            "wave-restored" => Preview::WaveRestored,
             "filter-focus" => Preview::FilterFocus,
             query => Preview::Search(query.to_string()),
         }),
