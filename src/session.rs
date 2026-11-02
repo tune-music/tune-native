@@ -11,6 +11,9 @@ use crate::api::{self, Track};
 
 const QUEUE_FILE: &str = "queue.json";
 const PLACE_FILE: &str = "place.json";
+/// Недавние запросы поиска. Как и у официального клиента, они хранятся только на компьютере.
+const SEARCH_FILE: &str = "searches.json";
+const SEARCH_LIMIT: usize = 20;
 
 pub struct Saved {
     pub tracks: Vec<Track>,
@@ -105,6 +108,22 @@ pub fn save_place(current: usize, position: Duration, wait: bool) {
     run(wait, move || write(&api::data_dir(), PLACE_FILE, &json!({ "current": current, "seconds": position.as_secs_f64() })));
 }
 
+pub fn searches() -> Vec<String> {
+    read(&api::data_dir(), SEARCH_FILE).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default()
+}
+
+pub fn save_searches(list: Vec<String>) {
+    run(false, move || write(&api::data_dir(), SEARCH_FILE, &json!(list)));
+}
+
+/// Запрос встаёт первым; тот же запрос в другом регистре не повторяется.
+pub fn remember_search(list: &[String], query: &str) -> Vec<String> {
+    let query = query.trim();
+    let same = query.to_lowercase();
+    let rest = list.iter().filter(|old| old.to_lowercase() != same).cloned();
+    std::iter::once(query.to_string()).filter(|q| !q.is_empty()).chain(rest).take(SEARCH_LIMIT).collect()
+}
+
 pub fn clear() {
     let dir = api::data_dir();
     let _ = fs::remove_file(dir.join(QUEUE_FILE));
@@ -163,6 +182,18 @@ mod tests {
         write(&dir, QUEUE_FILE, &json!({ "title": "Лист", "tracks": tracks }));
         assert_eq!(load_from(&dir).unwrap().wave, None);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keeps_recent_searches_unique() {
+        let list = remember_search(&[], " Queen ");
+        assert_eq!(list, vec!["Queen"]);
+        let list = remember_search(&list, "Земфира");
+        let list = remember_search(&list, "queen");
+        assert_eq!(list, vec!["queen", "Земфира"]);
+        assert_eq!(remember_search(&list, "  "), list);
+        let many = (0..30).fold(Vec::new(), |list, n| remember_search(&list, &n.to_string()));
+        assert_eq!((many.len(), many[0].as_str()), (SEARCH_LIMIT, "29"));
     }
 
     #[test]

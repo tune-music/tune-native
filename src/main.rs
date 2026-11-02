@@ -374,6 +374,8 @@ enum Preview {
     ArtistAbout(String),
     /// Микс по тегу.
     Tag(String),
+    /// Пустой поиск с недавними запросами; в файл они не пишутся.
+    SearchHistory,
     /// Все релизы исполнителя.
     Discography(String),
     /// Первый плейлист в очереди, открыта главная.
@@ -574,6 +576,7 @@ struct App {
     tag: Option<(String, String)>,
     tag_lists: Vec<HomeItem>,
     tag_loading: bool,
+    searches: Vec<String>,
     /// Другие альбомы исполнителя открытого альбома.
     album_others: Vec<Card>,
     discography_total: u64,
@@ -680,6 +683,9 @@ enum Message {
     DiscographySort(bool),
     DiscographyMore,
     TagLoaded(String, Result<(Option<String>, Vec<Playlist>), String>),
+    /// Повторить недавний запрос.
+    SearchAgain(String),
+    SearchHistoryClear,
     DiscographyLoaded(String, Result<api::Releases, String>),
     /// Другие альбомы исполнителя для страницы альбома.
     AlbumOthers(String, Result<api::Releases, String>),
@@ -881,6 +887,7 @@ impl App {
             tag: None,
             tag_lists: Vec::new(),
             tag_loading: false,
+            searches: session::searches(),
             album_others: Vec::new(),
             discography_total: 0,
             discography_also: false,
@@ -1131,6 +1138,8 @@ impl App {
         self.resume_seek = None;
         self.session_key = None;
         session::clear();
+        self.searches.clear();
+        session::save_searches(Vec::new());
         self.ai_less = None;
         self.pins.clear();
         self.pin_menu = None;
@@ -1566,6 +1575,15 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Запрос запоминается, когда по нему что-то открыли или нажали Enter, а не на каждой букве.
+        let chosen = matches!(message, Message::Search | Message::Play(Section::Search, _) | Message::ArtistOpen(_) | Message::AlbumOpen(..) | Message::ListOpen(_));
+        if chosen && self.section == Section::Search && self.searched && api::parse_link(&self.query).is_none() {
+            let list = session::remember_search(&self.searches, &self.query);
+            if list != self.searches {
+                self.searches = list.clone();
+                session::save_searches(list);
+            }
+        }
         if let Message::Quit = message {
             self.session_store(true);
             return iced::exit();
@@ -1764,6 +1782,11 @@ impl App {
                         self.preview = None;
                         self.update(Message::Open(Section::Home))
                     }
+                    Some(Preview::SearchHistory) => {
+                        self.preview = None;
+                        self.searches = ["Queen", "Земфира", "Linkin Park Numb", "лоу-фай"].map(String::from).to_vec();
+                        self.update(Message::Open(Section::Search))
+                    }
                     Some(Preview::Tag(tag)) => {
                         self.preview = None;
                         let title = tag.clone();
@@ -1947,6 +1970,14 @@ impl App {
                     self.discography_by_year = by_year;
                     return self.discography_load(0);
                 }
+            }
+            Message::SearchAgain(query) => {
+                self.query = query;
+                return self.handle(Message::Search);
+            }
+            Message::SearchHistoryClear => {
+                self.searches.clear();
+                session::save_searches(Vec::new());
             }
             Message::TagLoaded(tag, result) => {
                 if self.tag.as_ref().is_none_or(|(open, _)| *open != tag) {
@@ -4164,7 +4195,17 @@ impl App {
             .style(ui::input);
         let mut page = column![input].spacing(16).height(Length::Fill);
         if !self.searched && !self.searching {
-            return page.push(placeholder("Что послушаем?", Some("Начните вводить название трека, альбома или исполнителя"))).into();
+            if self.searches.is_empty() {
+                return page.push(placeholder("Что послушаем?", Some("Начните вводить название трека, альбома или исполнителя"))).into();
+            }
+            let clear = shine(button(text("Очистить историю").size(14)).padding([6, 14]).style(ui::secondary).on_press(Message::SearchHistoryClear), 18.0);
+            let head = row![text("Недавние запросы").size(24).font(ui::font_headline()).color(ui::TEXT), Space::new().width(Length::Fill), clear].align_y(Alignment::Center);
+            let rows = self.searches.iter().fold(column![].spacing(2), |rows, query| {
+                let line = row![ui::icon(ui::SEARCH, 20.0, ui::MUTED), text(query).color(ui::TEXT).wrapping(Wrapping::None)].spacing(12).align_y(Alignment::Center);
+                rows.push(glow(button(line).width(Length::Fill).padding([10, 12]).style(ui::row).on_press(Message::SearchAgain(query.clone())), 8.0))
+            });
+            let history = column![head, ui::scroll(container(rows).padding(Padding::ZERO.right(SCROLLBAR))).height(Length::Fill)].spacing(12).max_width(760);
+            return page.push(history).into();
         }
         let tabs = SearchTab::ALL.into_iter().fold(row![].spacing(8), |tabs, tab| {
             tabs.push(shine(button(text(tab.label())).padding([7, 16]).style(ui::chip(tab == self.search_tab)).on_press(Message::SearchTabSet(tab)), 18.0))
@@ -5342,6 +5383,7 @@ fn main() -> iced::Result {
             what if what.starts_with("artist-about:") => Preview::ArtistAbout(what[13..].to_string()),
             what if what.starts_with("discography:") => Preview::Discography(what[12..].to_string()),
             what if what.starts_with("tag:") => Preview::Tag(what[4..].to_string()),
+            "search-history" => Preview::SearchHistory,
             query => Preview::Search(query.to_string()),
         }),
         _ => None,
