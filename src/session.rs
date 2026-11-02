@@ -15,6 +15,8 @@ const PLACE_FILE: &str = "place.json";
 pub struct Saved {
     pub tracks: Vec<Track>,
     pub title: String,
+    /// Зёрна волны, если играла волна, а не список.
+    pub wave: Option<Vec<String>>,
     pub current: usize,
     pub position: Duration,
 }
@@ -76,23 +78,31 @@ fn load_from(dir: &Path) -> Option<Saved> {
         return None;
     }
     let position = Duration::from_secs_f64(position).min(tracks[current].duration);
-    Some(Saved { title: queue["title"].as_str().unwrap_or_default().to_string(), tracks, current, position })
+    let wave = serde_json::from_value(queue["wave"].clone()).ok();
+    Some(Saved { title: queue["title"].as_str().unwrap_or_default().to_string(), wave, tracks, current, position })
 }
 
 pub fn load() -> Option<Saved> {
     load_from(&api::data_dir())
 }
 
-/// Запись идёт в фоне, чтобы диск не задерживал музыку.
-pub fn save_queue(tracks: Vec<Track>, title: String) {
-    std::thread::spawn(move || {
+/// Запись идёт в фоне, чтобы диск не задерживал музыку. При выходе её надо дождаться.
+fn run(wait: bool, job: impl FnOnce() + Send + 'static) {
+    let job = std::thread::spawn(job);
+    if wait {
+        let _ = job.join();
+    }
+}
+
+pub fn save_queue(tracks: Vec<Track>, title: String, wave: Option<Vec<String>>, wait: bool) {
+    run(wait, move || {
         let tracks: Vec<Value> = tracks.iter().map(track_value).collect();
-        write(&api::data_dir(), QUEUE_FILE, &json!({ "title": title, "tracks": tracks }));
+        write(&api::data_dir(), QUEUE_FILE, &json!({ "title": title, "wave": wave, "tracks": tracks }));
     });
 }
 
-pub fn save_place(current: usize, position: Duration) {
-    std::thread::spawn(move || write(&api::data_dir(), PLACE_FILE, &json!({ "current": current, "seconds": position.as_secs_f64() })));
+pub fn save_place(current: usize, position: Duration, wait: bool) {
+    run(wait, move || write(&api::data_dir(), PLACE_FILE, &json!({ "current": current, "seconds": position.as_secs_f64() })));
 }
 
 pub fn clear() {
@@ -138,6 +148,20 @@ mod tests {
         assert_eq!(saved.tracks, tracks);
         assert_eq!(saved.current, 1);
         assert_eq!(saved.position, Duration::from_secs_f64(42.5));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remembers_that_a_wave_was_playing() {
+        let dir = folder("wave");
+        let tracks = vec![track_value(&track("1", 100))];
+        write(&dir, QUEUE_FILE, &json!({ "title": "Волна", "wave": ["user:onyourwave"], "tracks": tracks }));
+        assert_eq!(load_from(&dir).unwrap().wave, Some(vec!["user:onyourwave".to_string()]));
+        // Ни списку, ни файлу прошлой версии зёрна не положены.
+        write(&dir, QUEUE_FILE, &json!({ "title": "Лист", "wave": null, "tracks": tracks }));
+        assert_eq!(load_from(&dir).unwrap().wave, None);
+        write(&dir, QUEUE_FILE, &json!({ "title": "Лист", "tracks": tracks }));
+        assert_eq!(load_from(&dir).unwrap().wave, None);
         let _ = fs::remove_dir_all(&dir);
     }
 

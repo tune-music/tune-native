@@ -262,6 +262,7 @@ enum Section {
     Dislikes,
     Search,
     Lyrics,
+    Settings,
 }
 
 /// Окно поверх страницы.
@@ -369,6 +370,10 @@ enum Preview {
     TrackInfo,
     Account,
     LogoutAsk,
+    /// Вкладка настроек.
+    Settings,
+    /// Очередь, сохранённая при прошлом выходе.
+    Restored,
     PinMenu,
     /// Нажатие на закреп под этим номером, без звука.
     PinPlay(usize),
@@ -536,6 +541,8 @@ struct App {
     /// Какая очередь уже на диске и когда запоминали место.
     session_key: Option<u64>,
     session_at: Option<Instant>,
+    /// «Меньше ИИ»; пока не знаем ответа сервера, переключатель не работает.
+    ai_less: Option<bool>,
     /// Какую волну ждём: опоздавший ответ о прежней не должен её заменить.
     wave_wanted: Vec<String>,
     last_frame: Option<Instant>,
@@ -622,6 +629,13 @@ enum Message {
     PinMenu(usize),
     PinTracks(u64, Playlist, String, Result<Vec<Track>, String>),
     OpenLink(&'static str),
+    /// Окно закрывают: сначала надо запомнить, что играло.
+    Quit,
+    /// Новая сессия для волны, восстановленной после запуска.
+    WaveResumed(Vec<String>, Result<api::Wave, String>),
+    AiLessLoaded(Result<bool, String>),
+    AiLessSet(bool),
+    AiLessSaved(Result<(), String>),
     PinsLoaded(Result<Vec<Pin>, String>),
     PlaylistLoaded(String, Result<Vec<Track>, String>),
     SimilarLoaded(String, Result<Vec<HomeItem>, String>),
@@ -798,6 +812,7 @@ impl App {
             resume_seek: None,
             session_key: None,
             session_at: None,
+            ai_less: None,
             wave_wanted: Vec::new(),
             last_frame: None,
             error,
@@ -1041,6 +1056,7 @@ impl App {
         self.resume_seek = None;
         self.session_key = None;
         session::clear();
+        self.ai_less = None;
         self.pins.clear();
         self.pin_menu = None;
         self.wave_queue = false;
@@ -1155,33 +1171,45 @@ impl App {
     }
 
     /// Возвращает очередь прошлого запуска. Музыка не включается сама.
-    fn restore(&mut self, saved: session::Saved) {
+    fn restore(&mut self, saved: session::Saved) -> Task<Message> {
         self.session_key = Some(queue_key(&saved.tracks, &saved.title));
         self.queue = saved.tracks;
-        self.queue_title = Some(saved.title);
         self.queue_from = QueueFrom::Unknown;
-        self.wave_queue = false;
         self.current = Some(saved.current);
         self.position = saved.position;
         self.resume = Some(saved.position);
+        let Some(seeds) = saved.wave else {
+            self.queue_title = Some(saved.title);
+            self.wave_queue = false;
+            return Task::none();
+        };
+        self.queue_title = None;
+        self.wave_title = Some(saved.title).filter(|title| !title.is_empty());
+        self.wave_queue = true;
+        self.wave_base = seeds.clone();
+        self.wave_wanted = seeds.clone();
+        // Старая сессия на сервере могла закончиться, а новая нужна, чтобы волна шла дальше.
+        let Some(token) = self.token() else { return Task::none() };
+        let mut asked = seeds.clone();
+        asked.extend(settings::wave_seeds(self.wave_tuning));
+        Task::perform(background(move || api::wave_new(&asked, &token)), move |result| Message::WaveResumed(seeds.clone(), result))
     }
 
-    /// Запоминает очередь и место. Волну не хранит: при запуске начнётся новая.
+    /// Запоминает очередь и место, волну вместе с её зёрнами.
     fn save_session(&mut self) {
+        self.session_store(false);
+    }
+
+    fn session_store(&mut self, wait: bool) {
         self.session_at = Some(Instant::now());
-        if self.wave_queue {
-            self.session_key = None;
-            session::clear();
-            return;
-        }
         let Some(current) = self.current else { return };
-        let title = self.queue_title.clone().unwrap_or_default();
+        let title = if self.wave_queue { self.wave_title.clone() } else { self.queue_title.clone() }.unwrap_or_default();
         let key = queue_key(&self.queue, &title);
         if self.session_key != Some(key) {
             self.session_key = Some(key);
-            session::save_queue(self.queue.clone(), title);
+            session::save_queue(self.queue.clone(), title, self.wave_queue.then(|| self.wave_base.clone()), wait);
         }
-        session::save_place(current, self.position);
+        session::save_place(current, self.position, wait);
     }
 
     fn play(&mut self, index: usize) -> Task<Message> {
@@ -1411,12 +1439,16 @@ impl App {
             Section::History => &self.history_tracks,
             Section::Dislikes => &self.disliked_list,
             Section::Queue => self.current.and_then(|i| self.queue.get(i + 1..)).unwrap_or(&[]),
-            Section::Lyrics => &[],
+            Section::Lyrics | Section::Settings => &[],
             Section::Search => &self.results,
         }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if let Message::Quit = message {
+            self.session_store(true);
+            return iced::exit();
+        }
         if let Message::Frame(now) = message {
             let elapsed = self.last_frame.map_or(0.0, |last| now.duration_since(last).as_secs_f32()).min(FRAME_LIMIT);
             self.page_veil = (self.page_veil - elapsed / PAGE_FADE).max(0.0);
@@ -1526,7 +1558,7 @@ impl App {
             Section::Likes | Section::Playlists if self.filtering() => true,
             Section::Home => !self.home.blocks.is_empty(),
             Section::Wave => self.current_track().is_some(),
-            Section::Collection => true,
+            Section::Collection | Section::Settings => true,
             Section::Lyrics => self.lyrics.as_ref().is_some_and(|(id, _)| self.current_track().is_some_and(|track| track.id == *id)),
             Section::Albums => !self.liked_albums.is_empty(),
             Section::Artists => !self.liked_artists.is_empty(),
@@ -1628,6 +1660,15 @@ impl App {
                         // Отдельным сообщением: смена страницы очищает поиск уже после этого обработчика.
                         Task::batch([page, Task::done(Message::Filter(query))])
                     }
+                    Some(Preview::Settings) => {
+                        self.preview = None;
+                        self.update(Message::Open(Section::Settings))
+                    }
+                    Some(Preview::Restored) => {
+                        self.preview = None;
+                        self.section = Section::Queue;
+                        session::load().map_or(Task::none(), |saved| self.restore(saved))
+                    }
                     Some(Preview::Account) => {
                         self.preview = None;
                         self.update(Message::DialogOpen(Dialog::Account))
@@ -1646,10 +1687,7 @@ impl App {
                     None if self.section == Section::Likes => self.likes_more(),
                     // Главная сразу показывает трек и управление, как в оригинале.
                     None if self.queue.is_empty() => match session::load() {
-                        Some(saved) => {
-                            self.restore(saved);
-                            Task::none()
-                        }
+                        Some(saved) => self.restore(saved),
                         None => self.token().map_or(Task::none(), |token| Task::perform(background(move || api::wave_last(&token)), Message::WaveLast)),
                     },
                     None => Task::none(),
@@ -1726,6 +1764,36 @@ impl App {
                 let (x, y) = *CURSOR.lock().unwrap();
                 self.pin_menu = Some((index, x, y));
             }
+            Message::Quit => {}
+            Message::WaveResumed(seeds, result) => {
+                // Если волну так и не удалось продолжить, очередь всё равно доиграет.
+                let Ok(wave) = result else { return Task::none() };
+                if !self.wave_queue || self.wave_base != seeds || self.wave.is_some() || self.wave_pending.is_some() {
+                    return Task::none();
+                }
+                if !self.active {
+                    self.wave_pending = Some(wave.session);
+                    return Task::none();
+                }
+                self.wave = Some(wave.session);
+                self.feedback("radioStarted", None, None);
+                return self.wave_refill();
+            }
+            Message::AiLessLoaded(result) => match result {
+                Ok(enabled) => self.ai_less = Some(enabled),
+                Err(e) => return self.fail_retry(e, Message::Open(Section::Settings)),
+            },
+            Message::AiLessSet(enabled) => {
+                let Some(token) = self.token() else { return Task::none() };
+                self.ai_less = Some(enabled);
+                return Task::perform(background(move || api::set_ai_reduction(enabled, &token)), Message::AiLessSaved);
+            }
+            Message::AiLessSaved(result) => {
+                if let Err(e) = result {
+                    self.ai_less = self.ai_less.map(|enabled| !enabled);
+                    return self.fail(e);
+                }
+            }
             Message::OpenLink(link) => {
                 // Покупки и настройки аккаунта живут на сайтах Яндекса.
                 if let Err(e) = std::process::Command::new("explorer").arg(link).spawn() {
@@ -1784,6 +1852,10 @@ impl App {
                     Section::Likes if self.liked.is_empty() => self.likes_more(),
                     Section::Playlists if self.playlists.is_empty() => self.playlists_load(),
                     Section::Search => operation::focus(Id::new(SEARCH_INPUT)),
+                    Section::Settings if self.ai_less.is_none() => {
+                        let Some(token) = self.token() else { return Task::none() };
+                        Task::perform(background(move || api::ai_reduction(&token)), Message::AiLessLoaded)
+                    }
                     _ => Task::none(),
                 };
             }
@@ -2839,6 +2911,7 @@ impl App {
             Section::Home => self.view_home(),
             Section::Queue => self.view_queue(),
             Section::Lyrics => self.view_lyrics(),
+            Section::Settings => self.view_settings(),
             Section::History => self.view_track_page("История", &self.history_tracks, "Здесь появятся треки, которые вы слушали", Section::History),
             Section::Dislikes => self.view_track_page("Дизлайки", &self.disliked_list, "Здесь появятся треки, которые вам не понравились", Section::Dislikes),
             Section::Wave => self.view_wave(),
@@ -3347,7 +3420,8 @@ impl App {
             account = account.push(container(text("Плюс").size(12).font(ui::font_medium())).padding([1, 8]).style(ui::plus));
         }
         let who = glow(button(row![self.avatar(AVATAR_SIZE, 18.0), account].spacing(10).align_y(Alignment::Center)).width(Length::Fill).padding(4).style(ui::row).on_press(Message::DialogOpen(Dialog::Account)), 8.0);
-        let profile = row![who, glow(button(ui::icon(ui::LOGOUT, 18.0, ui::MUTED)).padding(6).style(ui::ghost).on_press(Message::DialogOpen(Dialog::Logout)), 20.0)].spacing(4).align_y(Alignment::Center);
+        let gear = if self.section == Section::Settings { ui::TEXT } else { ui::MUTED };
+        let profile = row![who, glow(button(ui::icon(ui::SETTINGS, 18.0, gear)).padding(6).style(ui::ghost).on_press(Message::Open(Section::Settings)), 20.0), glow(button(ui::icon(ui::LOGOUT, 18.0, ui::MUTED)).padding(6).style(ui::ghost).on_press(Message::DialogOpen(Dialog::Logout)), 20.0)].spacing(4).align_y(Alignment::Center);
         container(
             column![
                 container(text("Tune").size(26).font(ui::font_headline()).color(ui::ACCENT)).padding(Padding::new(0.0).left(12)),
@@ -3536,6 +3610,48 @@ impl App {
             placeholder("Пока пусто", Some(empty))
         };
         column![title, center].spacing(16).height(Length::Fill).into()
+    }
+
+    fn view_settings(&self) -> Element<'_, Message> {
+        let title = |label| text(label).size(20).font(ui::font_medium()).color(ui::TEXT);
+        let choice = |label, chosen, press| shine(button(text(label)).padding([9, 18]).style(if chosen { ui::accent } else { ui::secondary }).on_press(press), 20.0);
+        let link = |label, press| shine(button(text(label)).padding([9, 18]).style(ui::secondary).on_press(press), 20.0);
+
+        let quality = Quality::ALL.into_iter().fold(row![].spacing(8), |line, quality| line.push(choice(quality.label(), quality == self.quality, Message::QualitySet(quality))));
+        let mut sound = column![title("Качество звука"), quality].spacing(12);
+        if let Some(codec) = &self.codec {
+            sound = sound.push(text(format!("Сейчас играет: {}", codec_name(codec))).size(13).color(ui::MUTED));
+        }
+
+        let ai = row![
+            column![text("Меньше ИИ").color(ui::TEXT), text("В рекомендациях будет реже встречаться музыка, созданная с помощью ИИ").size(13).color(ui::MUTED)].spacing(2).width(Length::Fill),
+            view_switch(self.ai_less),
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center);
+        let ai = glow(button(ai).width(Length::Fill).padding(8).style(ui::row).on_press_maybe(self.ai_less.map(|enabled| Message::AiLessSet(!enabled))), 8.0);
+
+        let keys = [("Пауза и продолжение", "Пробел"), ("Закрыть меню или окно", "Esc"), ("Назад", "Боковая кнопка мыши"), ("Пауза, следующий и предыдущий трек", "Медиаклавиши")];
+        let keys = keys.into_iter().fold(column![title("Горячие клавиши")].spacing(10), |list, (action, key)| {
+            list.push(row![text(action).color(ui::TEXT).width(Length::Fill), container(text(key).size(13).color(ui::TEXT)).padding([3, 10]).style(ui::tile)].align_y(Alignment::Center))
+        });
+
+        let page = column![
+            text("Настройки").size(36).font(ui::font_headline()).color(ui::TEXT),
+            sound,
+            column![title("Рекомендации"), ai].spacing(8),
+            keys,
+            column![title("Аккаунт"), row![link("Управление аккаунтом", Message::DialogOpen(Dialog::Account)), link("Выйти", Message::DialogOpen(Dialog::Logout))].spacing(8)].spacing(12),
+            column![
+                title("О приложении"),
+                text(format!("Tune Native, версия {}", env!("CARGO_PKG_VERSION"))).color(ui::MUTED),
+                row![link("Помощь", Message::OpenLink("https://yandex.ru/support/music/")), link("Условия использования", Message::OpenLink("https://yandex.ru/legal/music_termsofuse/"))].spacing(8),
+            ]
+            .spacing(12),
+        ]
+        .spacing(28)
+        .max_width(680);
+        ui::scroll(page).height(Length::Fill).into()
     }
 
     fn view_collection(&self) -> Element<'_, Message> {
@@ -4382,12 +4498,28 @@ impl PipeMedia for Subscription<Message> {
                 None
             }
             Event::Window(window::Event::Resized(size)) => Some(Message::WindowSize(size)),
+            Event::Window(window::Event::CloseRequested) => Some(Message::Quit),
             Event::Keyboard(keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Escape), .. }) => Some(Message::MenuClose),
             Event::Keyboard(keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Space), .. }) if status == event::Status::Ignored => Some(Message::Toggle),
             _ => None,
         });
         Subscription::batch([self, back, Subscription::run(media::events).map(Message::Media)])
     }
+}
+
+/// Переключатель. Пока значение неизвестно, он блёклый и стоит в положении «выключено».
+fn view_switch<'a>(state: Option<bool>) -> Element<'a, Message> {
+    let on = state == Some(true);
+    let (back, front) = if on { (ui::ACCENT, ui::ON_ACCENT) } else { (ui::CONTROL, ui::MUTED) };
+    let alpha = if state.is_some() { 1.0 } else { 0.4 };
+    let knob = container(Space::new()).width(18).height(18).style(move |_| container::Style::default().background(front.scale_alpha(alpha)).border(iced::border::rounded(9.0)));
+    container(knob)
+        .width(40)
+        .height(22)
+        .padding(2)
+        .align_x(if on { Alignment::End } else { Alignment::Start })
+        .style(move |_| container::Style::default().background(back.scale_alpha(alpha)).border(iced::border::rounded(11.0)))
+        .into()
 }
 
 /// Запускает окно входа отдельным процессом и ждёт, пока его закроют.
@@ -4479,6 +4611,18 @@ fn smoke_lyrics(ids: &str) -> Result<(), String> {
 }
 
 /// Проверка без окна и без звука: каждое качество запускается и перематывается.
+/// Переключает «Меньше ИИ» туда и обратно и каждый раз читает, что запомнил сервер.
+fn smoke_settings() -> Result<(), String> {
+    let token = api::load_token().ok_or("нет токена")?;
+    let before = api::ai_reduction(&token)?;
+    println!("Было: {before}");
+    api::set_ai_reduction(!before, &token)?;
+    println!("После переключения: {}", api::ai_reduction(&token)?);
+    api::set_ai_reduction(before, &token)?;
+    println!("После возврата: {}", api::ai_reduction(&token)?);
+    Ok(())
+}
+
 fn smoke_quality(query: &str) -> Result<(), String> {
     let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
     let tracks = api::search(query, &token)?;
@@ -4610,12 +4754,13 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
                 "--smoke-wave" => smoke_wave(query),
                 "--smoke-lyrics" => smoke_lyrics(query),
+                "--smoke-settings" => smoke_settings(),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
@@ -4643,6 +4788,8 @@ fn main() -> iced::Result {
             "menu" => Preview::Menu,
             "track-info" => Preview::TrackInfo,
             "account" => Preview::Account,
+            "settings" => Preview::Settings,
+            "restored" => Preview::Restored,
             "logout-ask" => Preview::LogoutAsk,
             "pin-menu" => Preview::PinMenu,
             "pin-play-0" => Preview::PinPlay(0),
@@ -4674,7 +4821,7 @@ fn main() -> iced::Result {
         .theme(ui::theme())
         .default_font(ui::font())
         .subscription(App::subscription)
-        .window(window::Settings { size: Size::new(1280.0, 820.0), min_size: Some(Size::new(900.0, 600.0)), ..window::Settings::default() })
+        .window(window::Settings { size: Size::new(1280.0, 820.0), min_size: Some(Size::new(900.0, 600.0)), exit_on_close_request: false, ..window::Settings::default() })
         .run()
 }
 

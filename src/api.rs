@@ -344,6 +344,16 @@ pub fn raw(path: &str, token: &str) -> Result<String, String> {
     get(path, &[], token).map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
 }
 
+/// Включено ли «Меньше ИИ» в аккаунте.
+pub fn ai_reduction(token: &str) -> Result<bool, String> {
+    let v = get("account/settings", &[], token)?;
+    Ok(result(&v)["aiContentReductionEnabled"].as_bool().unwrap_or(false))
+}
+
+pub fn set_ai_reduction(enabled: bool, token: &str) -> Result<(), String> {
+    post(&format!("account/settings?aiContentReductionEnabled={enabled}"), "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
+}
+
 pub fn profile(token: &str) -> Result<Profile, String> {
     let v = get("account/status", &[], token)?;
     let v = result(&v);

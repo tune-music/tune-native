@@ -1,6 +1,6 @@
 [package]
 name = "tune-native"
-version = "0.0.0"
+version = "0.1.0"
 description = "Нативный клиент Яндекс Музыки на Rust"
 edition = "2021"
 publish = false
