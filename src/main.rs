@@ -2516,7 +2516,7 @@ impl App {
         }
         lines = lines.push(Space::new().height(if lyrics.synced() { room } else { 0.0 }));
         let hidden = scrollable::Direction::Vertical(scrollable::Scrollbar::new().width(0).scroller_width(0));
-        column![header, scrollable(lines).id(LIST).direction(hidden).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).height(Length::Fill)].spacing(16).height(Length::Fill).into()
+        column![header, ui::scroll(lines).id(LIST).direction(hidden).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).height(Length::Fill)].spacing(16).height(Length::Fill).into()
     }
 
     /// Запрашивает текст, когда открыта его страница и сменился трек.
@@ -2574,7 +2574,7 @@ impl App {
             }
             let shown = own.len().min(MENU_LISTS) as f32 * MENU_ITEM;
             let items = own.iter().fold(column![], |items, list| items.push(item(ui::QUEUE, list.title.as_str(), Message::TrackAdd(track.clone(), (*list).clone()))));
-            return popup(scrollable(items).height(shown).into(), x, y, MENU_WIDTH, shown, alpha, live);
+            return popup(ui::scroll(items).height(shown).style(ui::scroll_still).into(), x, y, MENU_WIDTH, shown, alpha, live);
         }
         let liked = self.liked_set.contains(&track.id);
         let disliked = self.disliked.contains(&track.id);
@@ -2648,7 +2648,7 @@ impl App {
             list = list.push(self.view_queue_row(index, &self.queue[index]));
         }
         list = list.push(Space::new().height((total - range.end) as f32 * ROW));
-        scrollable(list).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).height(Length::Fill).into()
+        ui::scroll(list).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).height(Length::Fill).into()
     }
 
     fn view_queue_row<'a>(&'a self, index: usize, track: &'a Track) -> Element<'a, Message> {
@@ -2949,7 +2949,7 @@ impl App {
             let shown = &self.liked_artists[..self.liked_artists.len().min(COLLECTION_CARDS)];
             page = page.push(Space::new().height(8)).push(self.block_title("Исполнители", Section::Artists)).push(self.view_cards(shown, ARTIST_COVER, true, open_artist));
         }
-        scrollable(page).height(Length::Fill).into()
+        ui::scroll(page).height(Length::Fill).into()
     }
 
     fn view_card_page<'a>(&'a self, title: &'a str, cards: &'a [Card], prefix: &str, round: bool, empty: &'a str) -> Element<'a, Message> {
@@ -2959,7 +2959,7 @@ impl App {
             placeholder("Пока пусто", Some(empty))
         } else {
             let open = if round { open_artist } else { open_album };
-            scrollable(container(self.view_cards(cards, prefix, round, open)).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).height(Length::Fill).into()
+            ui::scroll(container(self.view_cards(cards, prefix, round, open)).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).height(Length::Fill).into()
         };
         column![head, center].spacing(16).height(Length::Fill).into()
     }
@@ -3052,7 +3052,7 @@ impl App {
         let create = shine(button(row![ui::icon(ui::PLUS, 20.0, ui::TEXT), text("Новый плейлист").color(ui::TEXT)].spacing(6).align_y(Alignment::Center)).padding([6, 14]).style(ui::secondary).on_press(Message::DialogOpen(Dialog::Create)), 24.0);
         let title = row![back, text("Плейлисты").size(36).font(ui::font_headline()).color(ui::TEXT), Space::new().width(Length::Fill), create].spacing(12).align_y(Alignment::Center);
         let center: Element<'_, Message> = if !self.playlists.is_empty() {
-            scrollable(container(self.view_playlist_cards(&self.playlists)).padding(Padding::ZERO.right(SCROLLBAR))).height(Length::Fill).into()
+            ui::scroll(container(self.view_playlist_cards(&self.playlists)).padding(Padding::ZERO.right(SCROLLBAR))).height(Length::Fill).into()
         } else if self.playlists_loading || self.uid.is_none() {
             skeleton_cards()
         } else {
@@ -3104,7 +3104,7 @@ impl App {
             if !found.playlists.is_empty() {
                 blocks = blocks.push(block("Плейлисты")).push(self.view_playlist_cards(&found.playlists));
             }
-            scrollable(blocks).id(LIST).height(Length::Fill).into()
+            ui::scroll(blocks).id(LIST).height(Length::Fill).into()
         };
         page.push(center).into()
     }
@@ -3135,7 +3135,7 @@ impl App {
             }
             blocks.push(body).push(Space::new().height(8))
         });
-        page.push(scrollable(blocks).id(LIST).height(Length::Fill)).into()
+        page.push(ui::scroll(blocks).id(LIST).height(Length::Fill)).into()
     }
 
     fn view_home_item<'a>(&self, item: &'a HomeItem) -> Element<'a, Message> {
@@ -3252,7 +3252,7 @@ impl App {
         if albums(&artist.similar) {
             page = page.push(Space::new().height(8)).push(block("Похожие исполнители")).push(self.view_cards(&artist.similar, ARTIST_COVER, true, open_artist));
         }
-        scrollable(page).id(LIST).height(Length::Fill).into()
+        ui::scroll(page).id(LIST).height(Length::Fill).into()
     }
 
     /// Строятся только видимые строки: остальные заменяет пустое место той же высоты.
@@ -3272,7 +3272,7 @@ impl App {
             });
         }
         list = list.push(Space::new().height((total - range.end) as f32 * ROW));
-        scrollable(list).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).height(Length::Fill).into()
+        ui::scroll(list).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).height(Length::Fill).into()
     }
 
     fn view_track<'a>(&'a self, section: Section, index: usize, track: &'a Track) -> Element<'a, Message> {

@@ -4,8 +4,10 @@ use iced::border::{self, Border};
 use iced::font::{Family, Weight};
 use iced::theme::Palette;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-use iced::widget::{button, container, svg, text_input};
+use iced::widget::{button, container, scrollable, svg, text_input, Scrollable};
 use iced::{color, Background, Color, Element, Font, Length, Shadow, Theme};
 
 pub const BLACK: Color = color!(0x000000);
@@ -270,4 +272,96 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
 /// Источник музыки над треком на главной.
 pub fn source_button(_: &Theme, _: button::Status) -> button::Style {
     flat(None, ACCENT, 20.0)
+}
+
+/// Полоса прокрутки: тонкий скруглённый бегунок без дорожки.
+const SCROLL_WIDTH: f32 = 6.0;
+const SCROLL_MARGIN: f32 = 4.0;
+/// Яркость бегунка: в покое, с курсором над списком, над бегунком и когда его тянут.
+const SCROLL_REST: f32 = 0.14;
+const SCROLL_OVER_LIST: f32 = 0.22;
+const SCROLL_OVER_BAR: f32 = 0.42;
+const SCROLL_DRAGGED: f32 = 0.6;
+/// За сколько секунд яркость проходит весь путь от покоя до максимума.
+const SCROLL_FADE: f32 = 0.16;
+/// Если полоса столько не рисовалась, переход брошен.
+const SCROLL_STALE: Duration = Duration::from_millis(300);
+
+struct ScrollGlow {
+    level: f32,
+    target: f32,
+    last: Option<Instant>,
+}
+
+/// Списки на странице видны по одному, поэтому яркость одна на всех.
+static SCROLL_GLOW: Mutex<ScrollGlow> = Mutex::new(ScrollGlow { level: SCROLL_REST, target: SCROLL_REST, last: None });
+
+/// Идёт ли ещё переход яркости: тогда нужны новые кадры.
+pub fn scroll_moving() -> bool {
+    let glow = SCROLL_GLOW.lock().unwrap();
+    // Если на странице больше нет полосы, стиль не вызывается и переход никогда не кончится.
+    glow.level != glow.target && glow.last.is_none_or(|last| last.elapsed() < SCROLL_STALE)
+}
+
+fn scroll_target(status: scrollable::Status) -> f32 {
+    match status {
+        scrollable::Status::Dragged { is_vertical_scrollbar_dragged: true, .. } => SCROLL_DRAGGED,
+        scrollable::Status::Hovered { is_vertical_scrollbar_hovered: true, .. } => SCROLL_OVER_BAR,
+        scrollable::Status::Hovered { .. } => SCROLL_OVER_LIST,
+        _ => SCROLL_REST,
+    }
+}
+
+fn scroll_step(level: f32, target: f32, elapsed: f32) -> f32 {
+    let delta = elapsed / SCROLL_FADE * (SCROLL_DRAGGED - SCROLL_REST);
+    if level < target {
+        (level + delta).min(target)
+    } else {
+        (level - delta).max(target)
+    }
+}
+
+fn scroll_look(theme: &Theme, status: scrollable::Status, alpha: f32) -> scrollable::Style {
+    let rail = scrollable::Rail {
+        background: None,
+        border: Border::default(),
+        scroller: scrollable::Scroller { background: Background::Color(Color { a: alpha, ..WHITE }), border: border::rounded(SCROLL_WIDTH / 2.0) },
+    };
+    scrollable::Style { vertical_rail: rail, horizontal_rail: rail, ..scrollable::default(theme, status) }
+}
+
+/// Стиль списка: яркость плавно идёт к нужной при каждой отрисовке.
+fn scroll_style(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
+    let now = Instant::now();
+    let mut glow = SCROLL_GLOW.lock().unwrap();
+    let elapsed = glow.last.map_or(0.0, |last| now.duration_since(last).as_secs_f32());
+    glow.target = scroll_target(status);
+    glow.level = scroll_step(glow.level, glow.target, elapsed);
+    glow.last = (glow.level != glow.target).then_some(now);
+    scroll_look(theme, status, glow.level)
+}
+
+/// Для меню поверх страницы: у него своя постоянная яркость, чтобы не спорить со страницей.
+pub fn scroll_still(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
+    scroll_look(theme, status, SCROLL_OVER_LIST)
+}
+
+/// Прокручиваемая область с общей полосой.
+pub fn scroll<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Scrollable<'a, M> {
+    let bar = scrollable::Scrollbar::new().width(SCROLL_WIDTH).scroller_width(SCROLL_WIDTH).margin(SCROLL_MARGIN);
+    Scrollable::new(content).direction(scrollable::Direction::Vertical(bar)).style(scroll_style)
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    #[test]
+    fn glow_reaches_target_and_stops() {
+        assert_eq!(scroll_target(scrollable::Status::Active { is_horizontal_scrollbar_disabled: true, is_vertical_scrollbar_disabled: false }), SCROLL_REST);
+        let halfway = scroll_step(SCROLL_REST, SCROLL_DRAGGED, SCROLL_FADE / 2.0);
+        assert!(halfway > SCROLL_REST && halfway < SCROLL_DRAGGED);
+        assert_eq!(scroll_step(SCROLL_REST, SCROLL_DRAGGED, SCROLL_FADE), SCROLL_DRAGGED);
+        assert_eq!(scroll_step(SCROLL_DRAGGED, SCROLL_REST, SCROLL_FADE), SCROLL_REST);
+    }
 }

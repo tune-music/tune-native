@@ -185,6 +185,9 @@ fn wheel_part(elapsed: f32) -> f32 {
 struct SmoothState {
     /// Сколько ещё прокрутить.
     left: Vector,
+    /// Что-то внутри попросило кадр: стиль полосы прокрутки узнает о новом состоянии только
+    /// при отрисовке, поэтому после неё нужен ещё один кадр, чтобы начать переход.
+    kick: bool,
     last: Option<Instant>,
 }
 
@@ -239,8 +242,14 @@ impl Widget<Message, Theme, Renderer> for Smooth<'_> {
             return;
         }
         self.content.as_widget_mut().update(&mut tree.children[0], event, layout, cursor, renderer, clipboard, shell, viewport);
+        if !matches!(event, Event::Window(window::Event::RedrawRequested(_))) && shell.redraw_request() != window::RedrawRequest::Wait {
+            tree.state.downcast_mut::<SmoothState>().kick = true;
+        }
         if let Event::Window(window::Event::RedrawRequested(now)) = event {
             let state = tree.state.downcast_mut::<SmoothState>();
+            if std::mem::take(&mut state.kick) || crate::ui::scroll_moving() {
+                shell.request_redraw();
+            }
             if state.left == Vector::ZERO {
                 state.last = None;
                 return;
