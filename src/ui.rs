@@ -236,22 +236,6 @@ pub fn card(_: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-/// Ссылка в подписи: светлеет при наведении.
-pub fn link(_: &Theme, status: button::Status) -> button::Style {
-    match status {
-        button::Status::Hovered | button::Status::Pressed => flat(None, WHITE, 0.0),
-        button::Status::Active | button::Status::Disabled => flat(None, MUTED, 0.0),
-    }
-}
-
-/// Название трека: ведёт к альбому и при наведении меняет цвет.
-pub fn title_link(color: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |_, status| match status {
-        button::Status::Hovered | button::Status::Pressed => flat(None, if color == ACCENT { WHITE } else { ACCENT }, 0.0),
-        button::Status::Active | button::Status::Disabled => flat(None, color, 0.0),
-    }
-}
-
 /// Значок explicit.
 pub fn explicit(_: &Theme) -> container::Style {
     container::Style { border: border::rounded(3), ..fill(CONTROL_PRESSED) }

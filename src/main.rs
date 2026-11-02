@@ -97,6 +97,8 @@ const LYRICS_SIZE: f32 = 26.0;
 const LYRICS_SPEED: f32 = 5.0;
 /// На сколько увеличена звучащая строка и как гаснут остальные с каждой строкой расстояния.
 const LYRICS_GROW: f32 = 0.08;
+/// Насколько яркой становится строка под курсором.
+const LYRICS_HOVER: f32 = 0.85;
 const LYRICS_DIM_NEAR: f32 = 0.5;
 const LYRICS_DIM_STEP: f32 = 0.08;
 const LYRICS_DIM_FAR: f32 = 0.16;
@@ -2502,7 +2504,7 @@ impl App {
                     let focus = (1.0 - distance).clamp(0.0, 1.0);
                     let dim = (LYRICS_DIM_NEAR - LYRICS_DIM_STEP * (distance - 1.0).max(0.0)).max(LYRICS_DIM_FAR);
                     let color = ui::WHITE.scale_alpha(dim + (1.0 - dim) * focus);
-                    let line = hover_line(container(line).width(Length::Fill).padding([2, 24]), color, Message::LyricsSeek(*time));
+                    let line = hover_line(container(line).width(Length::Fill).padding([2, 24]), color, ui::WHITE.scale_alpha(color.a.max(LYRICS_HOVER)), Message::LyricsSeek(*time));
                     reveal(line).scale(1.0 + LYRICS_GROW * focus, 0.5, 0.5).into()
                 }
                 None => container(line.color(ui::TEXT)).padding([0, 24]).into(),
@@ -2660,7 +2662,7 @@ impl App {
         let names: Element<'a, Message> = if track.artist_list.is_empty() {
             text(&track.artists).color(ui::MUTED).wrapping(Wrapping::None).into()
         } else {
-            artist_links(&track.artist_list, 16.0, ui::font(), ui::link, ui::MUTED).into()
+            artist_links(&track.artist_list, 16.0, ui::font(), ui::MUTED).into()
         };
         let mut line = row![
             cover,
@@ -2811,7 +2813,7 @@ impl App {
         let names: Element<'_, Message> = if track.artist_list.is_empty() {
             text(&track.artists).size(18).color(ui::MUTED).wrapping(Wrapping::None).into()
         } else {
-            artist_links(&track.artist_list, 18.0, ui::font(), ui::link, ui::MUTED).into()
+            artist_links(&track.artist_list, 18.0, ui::font(), ui::MUTED).into()
         };
         let about = column![track_title(track, name_size, ui::font_headline(), ui::WHITE), names].spacing(4).align_x(Alignment::Center);
         let info = row![self.like_button(track, 24.0), container(about).center_x(Length::Fill).clip(true), self.more_button(track, 22.0)].spacing(12).align_y(Alignment::Center).width(line);
@@ -3205,7 +3207,7 @@ impl App {
         let actions = self.page_actions(Section::Playlists, format!("album:{}", album.id), &album.title);
         let liked = self.liked_albums.iter().any(|c| c.id == album.id);
         let actions = actions.push(self.page_like(liked, Message::AlbumLike)).push(self.page_tools(PinRef::Album(album.id.clone()), format!("https://music.yandex.ru/album/{}", album.id)));
-        let links = artist_links(&album.artists, 16.0, ui::font(), ui::link, ui::MUTED);
+        let links = artist_links(&album.artists, 16.0, ui::font(), ui::MUTED);
         let header = self.page_header("Альбом", playlist.title.clone(), format!("{ALBUM_COVER}{}", album.id), false, Some(links), about.join(" · "), actions);
         self.view_list(Section::Playlists, Some(header))
     }
@@ -3288,7 +3290,7 @@ impl App {
         let names: Element<'a, Message> = if track.artist_list.is_empty() {
             text(&track.artists).color(ui::MUTED).wrapping(Wrapping::None).into()
         } else {
-            artist_links(&track.artist_list, 16.0, ui::font(), ui::link, ui::MUTED).into()
+            artist_links(&track.artist_list, 16.0, ui::font(), ui::MUTED).into()
         };
         let mut line = row![
             cover,
@@ -3369,7 +3371,7 @@ impl App {
         } else if track.artist_list.is_empty() {
             text(&track.artists).color(ui::MUTED).wrapping(Wrapping::None).into()
         } else {
-            artist_links(&track.artist_list, 16.0, ui::font(), ui::link, ui::MUTED).into()
+            artist_links(&track.artist_list, 16.0, ui::font(), ui::MUTED).into()
         };
         let mut about = row![].spacing(12).align_y(Alignment::Center);
         if zone >= BAR_ZONE_COVER {
@@ -3463,7 +3465,7 @@ fn queue_key(tracks: &[Track], title: &str) -> u64 {
 fn track_title<'a>(track: &'a Track, size: f32, font: iced::Font, color: iced::Color) -> Element<'a, Message> {
     let label = text(&track.title).size(size).font(font).wrapping(Wrapping::None);
     let title: Element<'a, Message> = if track.album.is_some() {
-        button(label).padding(0).style(ui::title_link(color)).on_press(Message::OpenAlbum(track.clone())).into()
+        hover_line(label, color, if color == ui::ACCENT { ui::WHITE } else { ui::ACCENT }, Message::OpenAlbum(track.clone())).into()
     } else {
         label.color(color).into()
     };
@@ -3536,10 +3538,10 @@ fn pick_artist(artists: &[Card], name: &str) -> Option<String> {
 }
 
 /// Все исполнители через запятую, каждый ведёт на свою страницу.
-fn artist_links<'a>(artists: &[(String, String)], size: f32, font: iced::Font, style: fn(&iced::Theme, button::Status) -> button::Style, comma: iced::Color) -> iced::widget::Row<'a, Message> {
+fn artist_links<'a>(artists: &[(String, String)], size: f32, font: iced::Font, comma: iced::Color) -> iced::widget::Row<'a, Message> {
     artists.iter().enumerate().fold(row![], |line, (index, (name, id))| {
         let label = if index + 1 < artists.len() { format!("{name},") } else { name.clone() };
-        let line = line.push(button(text(label).size(size).font(font).wrapping(Wrapping::None)).padding(0).style(style).on_press(artist_message(name, id)));
+        let line = line.push(hover_line(text(label).size(size).font(font).wrapping(Wrapping::None), comma, ui::WHITE, artist_message(name, id)));
         if index + 1 < artists.len() {
             line.push(text(" ").size(size).color(comma))
         } else {

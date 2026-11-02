@@ -272,26 +272,28 @@ impl Widget<Message, Theme, Renderer> for Smooth<'_> {
     }
 }
 
-/// За сколько секунд строка текста откликается на наведение.
+/// За сколько секунд ссылка откликается на наведение.
 const LINE_FADE: f32 = 0.16;
 
 #[derive(Default)]
 struct LineState {
     level: f32,
     hovered: bool,
+    pressed: bool,
     last: Option<Instant>,
 }
 
-/// Строка текста песни: цвет плавно меняется при наведении, клик перематывает.
-/// Обычная кнопка меняет цвет мгновенно, поэтому цвет здесь передаётся при отрисовке.
+/// Текст-ссылка: имя исполнителя, название трека, строка песни. Обычная кнопка меняет цвет
+/// мгновенно, поэтому цвет здесь считается сам и передаётся при отрисовке.
 pub struct HoverLine<'a> {
     content: Element<'a, Message>,
-    color: Color,
+    rest: Color,
+    hover: Color,
     on_press: Message,
 }
 
-pub fn hover_line<'a>(content: impl Into<Element<'a, Message>>, color: Color, on_press: Message) -> HoverLine<'a> {
-    HoverLine { content: content.into(), color, on_press }
+pub fn hover_line<'a>(content: impl Into<Element<'a, Message>>, rest: Color, hover: Color, on_press: Message) -> HoverLine<'a> {
+    HoverLine { content: content.into(), rest, hover, on_press }
 }
 
 impl Widget<Message, Theme, Renderer> for HoverLine<'_> {
@@ -335,7 +337,15 @@ impl Widget<Message, Theme, Renderer> for HoverLine<'_> {
                 }
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if hovered => {
-                shell.publish(self.on_press.clone());
+                // Событие забираем сразу, чтобы не сработала строка, внутри которой стоит ссылка.
+                state.pressed = true;
+                shell.capture_event();
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.pressed => {
+                state.pressed = false;
+                if hovered {
+                    shell.publish(self.on_press.clone());
+                }
                 shell.capture_event();
             }
             _ if hovered != state.hovered => {
@@ -356,8 +366,8 @@ impl Widget<Message, Theme, Renderer> for HoverLine<'_> {
 
     fn draw(&self, tree: &Tree, renderer: &mut Renderer, theme: &Theme, _: &renderer::Style, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle) {
         let level = ease_out(tree.state.downcast_ref::<LineState>().level);
-        let bright = self.color.a.max(LINE_BRIGHT);
-        let color = Color { a: self.color.a + (bright - self.color.a) * level, ..self.color };
+        let mix = |from: f32, to: f32| from + (to - from) * level;
+        let color = Color { r: mix(self.rest.r, self.hover.r), g: mix(self.rest.g, self.hover.g), b: mix(self.rest.b, self.hover.b), a: mix(self.rest.a, self.hover.a) };
         self.content.as_widget().draw(&tree.children[0], renderer, theme, &renderer::Style { text_color: color }, layout, cursor, viewport);
     }
 }
@@ -367,9 +377,6 @@ impl<'a> From<HoverLine<'a>> for Element<'a, Message> {
         Element::new(line)
     }
 }
-
-/// Насколько яркой становится строка под курсором.
-const LINE_BRIGHT: f32 = 0.85;
 
 #[cfg(test)]
 mod tests {
