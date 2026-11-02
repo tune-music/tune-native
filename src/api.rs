@@ -364,6 +364,24 @@ pub fn tracks_by_ids(ids: &[String], token: &str) -> Result<Vec<Track>, String> 
     Ok(ids.iter().filter_map(|id| found.iter().find(|t| t.id == *id).cloned()).collect())
 }
 
+/// Сколько найденных треков показываем при поиске внутри списка.
+const FILTER_LIMIT: usize = 300;
+const FILTER_PAGE: usize = 100;
+
+fn parse_filter_ids(v: &Value) -> Vec<String> {
+    result(v)["playlistTrackIds"].as_array().into_iter().flatten().filter_map(|id| id.as_str()).take(FILTER_LIMIT).map(str::to_string).collect()
+}
+
+/// Поиск внутри плейлиста на сервере. Лайки для него тоже плейлист.
+pub fn search_playlist(uid: &str, kind: &str, part: &str, token: &str) -> Result<Vec<Track>, String> {
+    let v = get(&format!("search-playlist/{uid}/{kind}"), &[("part", part)], token)?;
+    let mut tracks = Vec::new();
+    for page in parse_filter_ids(&v).chunks(FILTER_PAGE) {
+        tracks.extend(tracks_by_ids(page, token)?);
+    }
+    Ok(tracks)
+}
+
 pub fn set_liked(uid: &str, track_id: &str, liked: bool, token: &str) -> Result<(), String> {
     let path = if liked {
         format!("users/{uid}/likes/tracks/add?track-id={track_id}")
@@ -1143,6 +1161,14 @@ mod tests {
         assert!(cache.entries.len() <= CACHE_SIZE);
         assert_eq!(cache.get("k0", now + CACHE_TIME / 2), None);
         assert!(!cacheable("music-history") && !cacheable("get-file-info") && cacheable("albums/1/with-tracks"));
+    }
+
+    #[test]
+    fn parses_filter_ids() {
+        let ids = |json: &str| parse_filter_ids(&serde_json::from_str(json).unwrap());
+        // Похожие треки из suggestedTrackIds в результат не входят.
+        assert_eq!(ids(r#"{"result":{"playlistTrackIds":["1","a-b"],"suggestedTrackIds":["2"]}}"#), ["1", "a-b"]);
+        assert!(ids(r#"{"result":{"playlistTrackIds":[]}}"#).is_empty());
     }
 
     #[test]

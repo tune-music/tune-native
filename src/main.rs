@@ -80,6 +80,11 @@ const LIKE: f32 = 32.0;
 /// Постоянное место под полосу прокрутки: колонка времени не прыгает на коротких списках.
 const SCROLLBAR: f32 = 14.0;
 const SEARCH_INPUT: &str = "search";
+const FILTER_INPUT: &str = "filter";
+const FILTER_WIDTH: f32 = 240.0;
+const FILTER_WIDTH_SMALL: f32 = 180.0;
+/// Уже этого заголовку нужно больше места, и поле поиска становится короче.
+const FILTER_WIDE: f32 = 800.0;
 const COVER_WORKERS: usize = 6;
 const LIKES_PAGE: usize = 100;
 /// Сколько треков до конца очереди оставить, прежде чем просить у волны новые.
@@ -324,6 +329,8 @@ enum Preview {
     /// Открытое меню первого трека.
     Menu,
     Search(String),
+    /// Поиск внутри лайков.
+    Filter(String),
 }
 
 struct App {
@@ -360,6 +367,11 @@ struct App {
     dialog_text: String,
     history_tracks: Vec<Track>,
     history_loading: bool,
+    /// Поиск внутри открытого плейлиста или лайков.
+    filter: String,
+    filter_tracks: Vec<Track>,
+    filter_loading: bool,
+    filter_id: u64,
     disliked_list: Vec<Track>,
     liked_lists: Vec<Playlist>,
     /// Описание и приватность открытого плейлиста.
@@ -478,6 +490,9 @@ enum Message {
     Search,
     Found(u64, Result<Found, String>),
     SearchTyped(u64),
+    Filter(String),
+    FilterTyped(u64),
+    FilterLoaded(u64, Result<Vec<Track>, String>),
     SearchTabSet(SearchTab),
     ListOpen(Playlist),
     HomeLoaded(usize, Result<Home, String>),
@@ -622,6 +637,10 @@ impl App {
             dialog_text: String::new(),
             history_tracks: Vec::new(),
             history_loading: false,
+            filter: String::new(),
+            filter_tracks: Vec::new(),
+            filter_loading: false,
+            filter_id: 0,
             disliked_list: Vec::new(),
             liked_lists: Vec::new(),
             list_meta: None,
@@ -736,7 +755,7 @@ impl App {
     fn row_count(&self, section: Section) -> usize {
         match section {
             // Ещё не загруженные лайки занимают своё место: полоса прокрутки не прыгает.
-            Section::Likes => self.liked.len() + self.liked_ids.len().saturating_sub(self.likes_from),
+            Section::Likes if !self.filtering() => self.liked.len() + self.liked_ids.len().saturating_sub(self.likes_from),
             _ => self.list(section).len(),
         }
     }
@@ -1177,8 +1196,29 @@ impl App {
         }
     }
 
+    fn filtering(&self) -> bool {
+        !self.filter.trim().is_empty()
+    }
+
+    fn filter_reset(&mut self) {
+        self.filter.clear();
+        self.filter_tracks.clear();
+        self.filter_loading = false;
+        self.filter_id += 1;
+    }
+
+    /// Где искать: в лайках или в открытом плейлисте.
+    fn filter_place(&self) -> Option<(String, String)> {
+        match self.section {
+            Section::Likes => Some((self.uid.clone()?, FAVORITES_KIND.to_string())),
+            Section::Playlists => self.playlist.as_ref().filter(|p| p.source == Source::Playlist).map(|p| (p.owner.clone(), p.kind.clone())),
+            _ => None,
+        }
+    }
+
     fn list(&self, section: Section) -> &[Track] {
         match section {
+            Section::Likes | Section::Playlists if self.filtering() => &self.filter_tracks,
             Section::Wave => &self.queue,
             Section::Likes | Section::Collection => &self.liked,
             Section::Playlists => &self.playlist_tracks,
@@ -1233,6 +1273,7 @@ impl App {
             Task::none()
         } else {
             self.list_offset = 0.0;
+            self.filter_reset();
             self.page_veil = 1.0;
             self.lyrics_shown = -1.0;
             self.lyrics_target = -1.0;
@@ -1258,7 +1299,7 @@ impl App {
         let lyrics = self.lyrics_sync();
         self.lyrics_follow();
         // Лайки догружаются, когда до конца загруженного остаётся немного.
-        let more = if self.section == Section::Likes && self.visible().end + ROW_MARGIN >= self.liked.len() && !matches!(self.retry, Some(Message::LikesMore)) {
+        let more = if self.section == Section::Likes && !self.filtering() && self.visible().end + ROW_MARGIN >= self.liked.len() && !matches!(self.retry, Some(Message::LikesMore)) {
             self.likes_more()
         } else {
             Task::none()
@@ -1294,6 +1335,7 @@ impl App {
     /// Есть ли что показать на странице, или она ещё ждёт данных.
     fn page_ready(&self) -> bool {
         match self.section {
+            Section::Likes | Section::Playlists if self.filtering() => true,
             Section::Home => !self.home.blocks.is_empty(),
             Section::Wave => self.current_track().is_some(),
             Section::Collection => true,
@@ -1385,6 +1427,12 @@ impl App {
                     Some(Preview::Artist(id)) => {
                         self.preview = None;
                         self.update(Message::ArtistOpen(id))
+                    }
+                    Some(Preview::Filter(query)) => {
+                        self.preview = None;
+                        let page = self.update(Message::Open(Section::Likes));
+                        // Отдельным сообщением: смена страницы очищает поиск уже после этого обработчика.
+                        Task::batch([page, Task::done(Message::Filter(query))])
                     }
                     Some(Preview::Search(query)) => {
                         self.section = Section::Search;
@@ -1497,6 +1545,40 @@ impl App {
                 }
             }
             Message::Search => return self.search_run(),
+            Message::Filter(filter) => {
+                self.filter = filter;
+                // Новая буква отменяет поиск, который ещё ждёт паузы или ответа.
+                self.filter_id += 1;
+                self.list_offset = 0.0;
+                let snap = operation::snap_to(Id::new(LIST), scrollable::RelativeOffset::START);
+                if !self.filtering() {
+                    self.filter_tracks.clear();
+                    self.filter_loading = false;
+                    return snap;
+                }
+                self.filter_loading = true;
+                let id = self.filter_id;
+                return Task::batch([snap, Task::perform(background(|| std::thread::sleep(SEARCH_DELAY)), move |()| Message::FilterTyped(id))]);
+            }
+            Message::FilterTyped(id) => {
+                let (Some((owner, kind)), Some(token)) = (self.filter_place(), self.token()) else { return Task::none() };
+                if id == self.filter_id {
+                    let part = self.filter.trim().to_string();
+                    return Task::perform(background(move || api::search_playlist(&owner, &kind, &part, &token)), move |r| Message::FilterLoaded(id, r));
+                }
+            }
+            Message::FilterLoaded(id, result) => {
+                if id == self.filter_id {
+                    self.filter_loading = false;
+                    self.list_offset = 0.0;
+                    // Сервер не ответил — ищем хотя бы среди загруженного.
+                    self.filter_tracks = result.unwrap_or_else(|_| {
+                        let loaded = if self.section == Section::Likes { &self.liked } else { &self.playlist_tracks };
+                        loaded.iter().filter(|track| track_matches(track, &self.filter)).cloned().collect()
+                    });
+                    return operation::snap_to(Id::new(LIST), scrollable::RelativeOffset::START);
+                }
+            }
             Message::SearchTabSet(tab) => {
                 if self.search_tab != tab {
                     self.search_tab = tab;
@@ -2015,6 +2097,7 @@ impl App {
                 let kind = list.kind.clone();
                 list.count = list.count.saturating_sub(1);
                 self.playlist_tracks.retain(|t| t.id != track.id);
+                self.filter_tracks.retain(|t| t.id != track.id);
                 return Task::perform(background(move || api::remove_from_playlist(&uid, &kind, &track, &token)), Message::TrackRemoved);
             }
             Message::TrackRemoved(Ok(())) => {
@@ -3006,19 +3089,43 @@ impl App {
         cards.wrap().into()
     }
 
+    /// Крестик лежит внутри поля, чтобы при вводе оно не сдвигалось.
+    fn view_filter<'a>(&self) -> Element<'a, Message> {
+        let width = if self.main_width() < FILTER_WIDE { FILTER_WIDTH_SMALL } else { FILTER_WIDTH };
+        let input = text_input("Поиск по трекам", &self.filter).id(FILTER_INPUT).on_input(Message::Filter).padding(Padding { top: 8.0, right: 34.0, bottom: 8.0, left: 16.0 }).size(14).width(width).style(ui::input);
+        if self.filter.is_empty() {
+            return input.into();
+        }
+        let clear = glow(button(ui::icon(ui::CLOSE, 16.0, ui::MUTED)).padding(4).style(ui::ghost).on_press(Message::Filter(String::new())), 14.0);
+        stack![input, container(clear).padding(Padding::ZERO.right(8)).align_right(width).height(Length::Fill).align_y(Alignment::Center)].width(width).into()
+    }
+
+    fn view_filter_list<'a>(&'a self, section: Section) -> Element<'a, Message> {
+        if !self.filter_tracks.is_empty() {
+            self.view_list(section, None)
+        } else if self.filter_loading {
+            skeleton_list()
+        } else {
+            placeholder("Ничего не нашлось", Some("Попробуйте другое название или исполнителя"))
+        }
+    }
+
     fn view_likes(&self) -> Element<'_, Message> {
         let count = match self.liked_ids.len() {
             0 => String::new(),
             n => format!("{n} {}", tracks_word(n)),
         };
+        let name = row![text("Мне нравится").size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None), text(count).color(ui::MUTED).wrapping(Wrapping::None)].spacing(12).align_y(Alignment::Center);
         let title = row![
             glow(button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0),
-            text("Мне нравится").size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None),
-            text(count).color(ui::MUTED).wrapping(Wrapping::None),
+            container(name).width(Length::Fill).clip(true),
+            self.view_filter(),
         ]
         .spacing(12)
         .align_y(Alignment::Center);
-        let center: Element<'_, Message> = if !self.liked.is_empty() {
+        let center: Element<'_, Message> = if self.filtering() {
+            self.view_filter_list(Section::Likes)
+        } else if !self.liked.is_empty() {
             self.view_list(Section::Likes, None)
         } else if self.likes_loading || self.uid.is_none() {
             skeleton_list()
@@ -3034,13 +3141,16 @@ impl App {
             if playlist.source == Source::Album {
                 return self.view_album(playlist);
             }
-            let title = row![
-                back,
+            let name = row![
                 text(&playlist.title).size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None),
-                text(if self.playlist_tracks.is_empty() { String::new() } else { format!("{} {}", playlist.count, tracks_word(playlist.count as usize)) }).color(ui::MUTED),
+                text(if self.playlist_tracks.is_empty() { String::new() } else { format!("{} {}", playlist.count, tracks_word(playlist.count as usize)) }).color(ui::MUTED).wrapping(Wrapping::None),
             ]
             .spacing(12)
             .align_y(Alignment::Center);
+            let mut title = row![back, container(name).width(Length::Fill).clip(true)].spacing(12).align_y(Alignment::Center);
+            if playlist.source == Source::Playlist && !self.playlist_tracks.is_empty() {
+                title = title.push(self.view_filter());
+            }
             let mut head = column![title].spacing(10);
             if playlist.source == Source::Playlist {
                 let meta = self.list_meta.as_ref();
@@ -3063,7 +3173,9 @@ impl App {
                 head = head.push(tools.wrap().vertical_spacing(8));
             }
             let title = head;
-            let center: Element<'_, Message> = if !self.playlist_tracks.is_empty() {
+            let center: Element<'_, Message> = if self.filtering() {
+                self.view_filter_list(Section::Playlists)
+            } else if !self.playlist_tracks.is_empty() {
                 self.view_list(Section::Playlists, None)
             } else if playlist.count == 0 {
                 placeholder("В этом плейлисте пока нет треков", None)
@@ -3620,6 +3732,12 @@ fn codec_name(codec: &str) -> String {
 }
 
 /// Заглушка строки, пока трек не загружен.
+/// Подходит ли трек под поиск: по названию, исполнителям или альбому, без учёта регистра.
+fn track_matches(track: &Track, filter: &str) -> bool {
+    let filter = filter.trim().to_lowercase();
+    [&track.title, &track.artists, &track.album_title].iter().any(|field| field.to_lowercase().contains(&filter))
+}
+
 fn skeleton_bar<'a>(width: f32, height: f32) -> iced::widget::Container<'a, Message> {
     container(Space::new()).width(width).height(height).style(ui::tile)
 }
@@ -3973,6 +4091,7 @@ fn main() -> iced::Result {
             "playlists" => Preview::Playlists,
             "playlist" => Preview::Playlist,
             "playlist-home" => Preview::PlaylistHome,
+            what if what.starts_with("filter:") => Preview::Filter(what[7..].to_string()),
             what if what.starts_with("album:") => Preview::Album(what[6..].to_string()),
             what if what.starts_with("artist:") => Preview::Artist(what[7..].to_string()),
             query => Preview::Search(query.to_string()),
