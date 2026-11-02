@@ -5,7 +5,7 @@ use iced::font::{Family, Weight};
 use iced::theme::Palette;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use iced::widget::{button, container, slider, svg, text_input};
+use iced::widget::{button, container, svg, text_input};
 use iced::{color, Background, Color, Element, Font, Length, Shadow, Theme};
 
 pub const BLACK: Color = color!(0x000000);
@@ -252,14 +252,6 @@ pub fn title_link(color: Color) -> impl Fn(&Theme, button::Status) -> button::St
     }
 }
 
-/// Строка текста песни: при наведении становится ярче.
-pub fn lyric_line(color: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |_, status| match status {
-        button::Status::Hovered | button::Status::Pressed => flat(None, Color { a: color.a.max(0.8), ..WHITE }, 0.0),
-        button::Status::Active | button::Status::Disabled => flat(None, color, 0.0),
-    }
-}
-
 /// Значок explicit.
 pub fn explicit(_: &Theme) -> container::Style {
     container::Style { border: border::rounded(3), ..fill(CONTROL_PRESSED) }
@@ -294,17 +286,4 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
 /// Источник музыки над треком на главной.
 pub fn source_button(_: &Theme, _: button::Status) -> button::Style {
     flat(None, ACCENT, 20.0)
-}
-
-pub fn volume(_: &Theme, status: slider::Status) -> slider::Style {
-    let shown = !matches!(status, slider::Status::Active);
-    slider::Style {
-        rail: slider::Rail { backgrounds: (Background::Color(TEXT), Background::Color(CONTROL_PRESSED)), width: 4.0, border: border::rounded(2) },
-        handle: slider::Handle {
-            shape: slider::HandleShape::Circle { radius: if shown { 6.0 } else { 0.0 } },
-            background: Background::Color(WHITE),
-            border_width: 0.0,
-            border_color: Color::TRANSPARENT,
-        },
-    }
 }

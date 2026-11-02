@@ -1,4 +1,4 @@
-//! Полоска перемотки: при наведении плавно становится толще и показывает бегунок.
+//! Полоска перемотки и громкости: при наведении плавно становится толще и показывает бегунок.
 
 use std::time::Instant;
 
@@ -17,6 +17,9 @@ const FADE: f32 = 0.12;
 pub struct Seek {
     pub value: f32,
     pub total: f32,
+    pub on_change: fn(f32) -> Message,
+    /// Что отправить, когда полоску отпустили.
+    pub on_done: Option<Message>,
 }
 
 #[derive(Default)]
@@ -40,12 +43,12 @@ impl canvas::Program<Message> for Seek {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let position = cursor.position_in(bounds).map(|_| cursor.position())??;
                 state.dragging = true;
-                Some(Action::publish(Message::Seek(value_at(position, bounds, self.total))).and_capture())
+                Some(Action::publish((self.on_change)(value_at(position, bounds, self.total))).and_capture())
             }
-            Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => Some(Action::publish(Message::Seek(value_at(*position, bounds, self.total)))),
+            Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => Some(Action::publish((self.on_change)(value_at(*position, bounds, self.total)))),
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.dragging => {
                 state.dragging = false;
-                Some(Action::publish(Message::SeekDone))
+                Some(self.on_done.clone().map_or_else(Action::request_redraw, Action::publish))
             }
             Event::Window(window::Event::RedrawRequested(now)) => {
                 let elapsed = state.last.map_or(0.0, |last| now.duration_since(last).as_secs_f32());

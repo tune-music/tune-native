@@ -23,8 +23,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use iced::futures::channel::{mpsc, oneshot};
 use iced::widget::text::Wrapping;
 use iced::keyboard;
-use iced::widget::{button, canvas, column, container, image, mouse_area, operation, row, scrollable, slider, stack, text, text_input, Id, Space};
-use anim::{reveal, Fade};
+use iced::widget::{button, canvas, column, container, image, mouse_area, operation, row, scrollable, stack, text, text_input, Id, Space};
+use anim::{hover_line, reveal, smooth, Fade};
 use glow::{glow, shine};
 use iced::{event, mouse, time, window, Alignment, Event, Element, Length, Padding, Size, Subscription, Task};
 
@@ -433,6 +433,8 @@ struct App {
     lyrics: Option<(String, Option<api::Lyrics>)>,
     lyrics_loading: Option<String>,
     lyrics_line: Option<usize>,
+    /// Текст только что открыт: на звучащую строку встаём сразу, без перемотки сверху.
+    lyrics_fresh: bool,
     /// Где фокус: номер строки, дробный посреди перехода. До первой строки это -1.
     lyrics_shown: f32,
     lyrics_target: f32,
@@ -664,6 +666,7 @@ impl App {
             lyrics: None,
             lyrics_loading: None,
             lyrics_line: None,
+            lyrics_fresh: true,
             lyrics_shown: -1.0,
             lyrics_target: -1.0,
             resume: None,
@@ -1187,7 +1190,7 @@ impl App {
             self.quality_fade.step(elapsed);
             self.dialog_fade.step(elapsed);
             self.notice_fade.step(elapsed);
-            let lyrics = if self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target {
+            let lyrics = if self.section == Section::Lyrics && (self.lyrics_shown != self.lyrics_target || self.page_veil > 0.0) {
                 self.lyrics_shown += (self.lyrics_target - self.lyrics_shown) * (elapsed * LYRICS_SPEED).min(1.0);
                 if (self.lyrics_target - self.lyrics_shown).abs() < 0.002 {
                     self.lyrics_shown = self.lyrics_target;
@@ -1216,6 +1219,7 @@ impl App {
             self.lyrics_shown = -1.0;
             self.lyrics_target = -1.0;
             self.lyrics_line = None;
+            self.lyrics_fresh = true;
             let down = back || (self.section as u8) < rank;
             self.page_shift = (0.0, if down { -PAGE_SHIFT } else { PAGE_SHIFT });
             operation::snap_to(Id::new(LIST), scrollable::RelativeOffset::START)
@@ -1751,14 +1755,20 @@ impl App {
                 self.lyrics_line = None;
                 self.lyrics_shown = -1.0;
                 self.lyrics_target = -1.0;
+                self.lyrics_fresh = true;
                 return match result {
                     Ok(found) => {
                         self.lyrics = Some((id, found));
                         Task::none()
                     }
+                    // Текст не главное: хватит надписи, что его нет. Важен только истёкший вход.
                     Err(e) => {
                         self.lyrics = Some((id, None));
-                        self.fail(e)
+                        if e == api::NEED_LOGIN {
+                            self.fail(e)
+                        } else {
+                            Task::none()
+                        }
                     }
                 };
             }
@@ -2415,7 +2425,7 @@ impl App {
                     .padding(Padding::new(0.0).top(16)),
             );
         }
-        layers.into()
+        smooth(layers)
     }
 
     /// Контекстное меню трека: те же пункты и названия, что в оригинале.
@@ -2492,7 +2502,7 @@ impl App {
                     let focus = (1.0 - distance).clamp(0.0, 1.0);
                     let dim = (LYRICS_DIM_NEAR - LYRICS_DIM_STEP * (distance - 1.0).max(0.0)).max(LYRICS_DIM_FAR);
                     let color = ui::WHITE.scale_alpha(dim + (1.0 - dim) * focus);
-                    let line = button(line).width(Length::Fill).padding([2, 24]).style(ui::lyric_line(color)).on_press(Message::LyricsSeek(*time));
+                    let line = hover_line(container(line).width(Length::Fill).padding([2, 24]), color, Message::LyricsSeek(*time));
                     reveal(line).scale(1.0 + LYRICS_GROW * focus, 0.5, 0.5).into()
                 }
                 None => container(line.color(ui::TEXT)).padding([0, 24]).into(),
@@ -2533,6 +2543,10 @@ impl App {
         if line != self.lyrics_line {
             self.lyrics_target = line.map_or(-1.0, |index| index as f32);
             self.lyrics_line = line;
+        }
+        if self.lyrics_fresh {
+            self.lyrics_shown = self.lyrics_target;
+            self.lyrics_fresh = false;
         }
     }
 
@@ -2864,7 +2878,7 @@ impl App {
         let shown = if self.muted { 0.0 } else { self.volume };
         let mut line = row![glow(button(ui::icon(if self.muted { ui::VOLUME_OFF } else { ui::VOLUME }, icon, ui::MUTED)).padding(4).style(ui::ghost).on_press(Message::ToggleMute), 20.0)].spacing(6).align_y(Alignment::Center);
         if let Some(width) = width {
-            line = line.push(slider(0.0..=1.0, shown, Message::Volume).step(0.01).width(width).style(ui::volume));
+            line = line.push(canvas(seek::Seek { value: shown, total: 1.0, on_change: Message::Volume, on_done: None }).width(width).height(SEEK_HEIGHT));
         }
         line.into()
     }
@@ -3315,7 +3329,7 @@ impl App {
         let time = |value: Duration| text(clock(value)).size(12).color(ui::MUTED).wrapping(Wrapping::None);
         row![
             container(time(Duration::from_secs_f32(shown))).width(SEEK_TIME),
-            canvas(seek::Seek { value: shown, total }).width(Length::Fill).height(SEEK_HEIGHT),
+            canvas(seek::Seek { value: shown, total, on_change: Message::Seek, on_done: Some(Message::SeekDone) }).width(Length::Fill).height(SEEK_HEIGHT),
             container(time(track.duration)).align_right(SEEK_TIME),
         ]
         .spacing(8)
