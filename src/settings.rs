@@ -52,6 +52,25 @@ impl Quality {
     }
 }
 
+/// Настройки волны: название группы и варианты. Первый вариант в группе значит «любое»,
+/// у него нет зерна. Номера вариантов хранятся в настройках приложения.
+pub const WAVE_GROUPS: [(&str, &[(&str, &str)]); 4] = [
+    ("Занятие", &[("Любое", ""), ("Просыпаюсь", "activity:wake-up"), ("В дороге", "activity:road-trip"), ("Работаю", "activity:work-background"), ("Тренируюсь", "activity:workout"), ("Засыпаю", "activity:fall-asleep")]),
+    ("По характеру", &[("Любое", ""), ("Любимое", "settingDiversity:favorite"), ("Незнакомое", "settingDiversity:discover"), ("Популярное", "settingDiversity:popular")]),
+    ("Под настроение", &[("Любое", ""), ("Бодрое", "settingMoodEnergy:active"), ("Весёлое", "settingMoodEnergy:fun"), ("Спокойное", "settingMoodEnergy:calm"), ("Грустное", "settingMoodEnergy:sad")]),
+    ("По языку", &[("Любой", ""), ("Русский", "settingLanguage:russian"), ("Иностранный", "settingLanguage:not-russian"), ("Без слов", "settingLanguage:without-words")]),
+];
+
+/// Зёрна выбранных настроек волны.
+pub fn wave_seeds(tuning: [usize; 4]) -> Vec<String> {
+    WAVE_GROUPS.iter().zip(tuning).filter_map(|((_, options), choice)| options.get(choice)).filter(|(_, seed)| !seed.is_empty()).map(|(_, seed)| seed.to_string()).collect()
+}
+
+/// Названия выбранных настроек волны.
+pub fn wave_names(tuning: [usize; 4]) -> Vec<&'static str> {
+    WAVE_GROUPS.iter().zip(tuning).filter_map(|((_, options), choice)| options.get(choice)).filter(|(_, seed)| !seed.is_empty()).map(|(name, _)| *name).collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
     pub volume: f32,
@@ -59,6 +78,7 @@ pub struct Settings {
     pub repeat: Repeat,
     pub shuffle: bool,
     pub quality: Quality,
+    pub wave: [usize; 4],
 }
 
 fn parse(v: &Value) -> Settings {
@@ -71,6 +91,7 @@ fn parse(v: &Value) -> Settings {
             _ => Repeat::Off,
         },
         shuffle: v["shuffle"].as_bool().unwrap_or(false),
+        wave: std::array::from_fn(|group| v["wave"][group].as_u64().map_or(0, |choice| choice as usize).min(WAVE_GROUPS[group].1.len() - 1)),
         quality: Quality::ALL.into_iter().find(|q| v["quality"].as_str() == Some(q.code())).unwrap_or(Quality::Normal),
     }
 }
@@ -87,7 +108,7 @@ pub fn save(settings: Settings) {
         Repeat::All => "all",
         Repeat::One => "one",
     };
-    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code() });
+    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave });
     let dir = api::data_dir();
     if fs::create_dir_all(&dir).is_ok() {
         let _ = fs::write(dir.join("settings.json"), value.to_string());
@@ -101,9 +122,9 @@ mod tests {
     #[test]
     fn reads_saved_and_broken_values() {
         let saved = parse(&json!({ "volume": 0.25, "muted": true, "repeat": "one", "shuffle": true, "quality": "lossless" }));
-        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, quality: Quality::Lossless });
+        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless });
         let empty = parse(&Value::Null);
-        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, quality: Quality::Normal });
+        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal });
         assert_eq!(parse(&json!({ "volume": 7 })).volume, 1.0);
     }
 }

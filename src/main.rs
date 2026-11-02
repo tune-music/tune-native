@@ -90,6 +90,12 @@ const ROW: f32 = 58.0;
 /// Сколько строк держать готовыми за краем экрана.
 const ROW_MARGIN: usize = 6;
 const LIST: &str = "list";
+/// Ширина окна настроек волны.
+const TUNE_WIDTH: f32 = 560.0;
+/// Страница текста: размер строк и как быстро она догоняет звучащую строку.
+const LYRICS_SIZE: f32 = 26.0;
+const LYRICS_SPEED: f32 = 7.0;
+const LYRICS_CHROME: f32 = 300.0;
 /// Как часто запоминать место в треке.
 const SESSION_SAVE: Duration = Duration::from_secs(10);
 const DIALOG_INPUT: &str = "dialog";
@@ -217,6 +223,7 @@ enum Section {
     History,
     Dislikes,
     Search,
+    Lyrics,
 }
 
 /// Окно поверх страницы.
@@ -226,6 +233,7 @@ enum Dialog {
     Rename(Playlist),
     Describe(Playlist),
     Delete(Playlist),
+    WaveTune,
 }
 
 /// Вкладка поиска.
@@ -282,6 +290,8 @@ enum Preview {
     WaveSeek,
     /// Волна по исполнителю.
     WaveSeeded,
+    WaveTune,
+    Lyrics,
     Collection,
     Likes,
     /// Открытые очередь и выбор качества.
@@ -411,6 +421,15 @@ struct App {
     notice_fade: Fade<String>,
     /// От чего запущена волна; пусто у обычной Моей волны.
     wave_title: Option<String>,
+    /// Выбранные настройки волны и зёрна, к которым они добавляются.
+    wave_tuning: [usize; 4],
+    wave_base: Vec<String>,
+    /// Текст: для какого трека он загружен, что загружается, куда прокручена страница.
+    lyrics: Option<(String, Option<api::Lyrics>)>,
+    lyrics_loading: Option<String>,
+    lyrics_line: Option<usize>,
+    lyrics_shown: f32,
+    lyrics_target: f32,
     /// Место в треке после перезапуска: действует, пока трек не запустили.
     resume: Option<Duration>,
     /// Куда перемотать, как только трек запустится.
@@ -474,6 +493,14 @@ enum Message {
     Like(Track),
     LikeSaved(Track, bool, Result<(), String>),
     WaveStart,
+    /// Обратно к Моей волне без настроек.
+    WaveReset,
+    /// Группа настроек и выбранный вариант.
+    WaveTune(usize, usize),
+    WaveTuneReset,
+    LyricsToggle,
+    LyricsLoaded(String, Result<Option<api::Lyrics>, String>),
+    LyricsSeek(f32),
     /// Зёрна волны и подпись, откуда она запущена.
     WaveStartSeeds(Vec<String>, Option<String>),
     WaveStarted(bool, Vec<String>, Option<String>, Result<Wave, String>),
@@ -626,6 +653,13 @@ impl App {
             dialog_fade: Fade::new(DIALOG_OPEN, DIALOG_CLOSE),
             notice_fade: Fade::new(NOTICE_OPEN, NOTICE_CLOSE),
             wave_title: None,
+            wave_tuning: saved.wave,
+            wave_base: vec![api::MY_WAVE.to_string()],
+            lyrics: None,
+            lyrics_loading: None,
+            lyrics_line: None,
+            lyrics_shown: 0.0,
+            lyrics_target: 0.0,
             resume: None,
             resume_seek: None,
             session_key: None,
@@ -640,7 +674,7 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        self.page_veil > 0.0 || self.track_veil > 0.0 || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.dialog_fade.busy() || self.notice_fade.busy()
+        self.page_veil > 0.0 || self.track_veil > 0.0 || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.dialog_fade.busy() || self.notice_fade.busy()
     }
 
     /// Сколько места занимает основная часть окна.
@@ -661,7 +695,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -1072,7 +1106,8 @@ impl App {
         self.wave_loading = true;
         self.error = None;
         self.wave_wanted = seeds.clone();
-        let asked = seeds.clone();
+        let mut asked = seeds.clone();
+        asked.extend(settings::wave_seeds(self.wave_tuning));
         Task::perform(background(move || api::wave_new(&asked, &token)), move |r| Message::WaveStarted(autoplay, seeds.clone(), title.clone(), r))
     }
 
@@ -1128,6 +1163,7 @@ impl App {
             Section::History => &self.history_tracks,
             Section::Dislikes => &self.disliked_list,
             Section::Queue => self.current.and_then(|i| self.queue.get(i + 1..)).unwrap_or(&[]),
+            Section::Lyrics => &[],
             Section::Search => &self.results,
         }
     }
@@ -1145,8 +1181,17 @@ impl App {
             self.quality_fade.step(elapsed);
             self.dialog_fade.step(elapsed);
             self.notice_fade.step(elapsed);
+            let lyrics = if self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target {
+                self.lyrics_shown += (self.lyrics_target - self.lyrics_shown) * (elapsed * LYRICS_SPEED).min(1.0);
+                if (self.lyrics_target - self.lyrics_shown).abs() < 0.0005 {
+                    self.lyrics_shown = self.lyrics_target;
+                }
+                operation::snap_to(Id::new(LIST), scrollable::RelativeOffset { x: 0.0, y: self.lyrics_shown })
+            } else {
+                Task::none()
+            };
             self.last_frame = Some(now).filter(|_| self.animating());
-            return self.visible_covers();
+            return Task::batch([lyrics, self.visible_covers()]);
         }
         let place = self.list_place();
         let back = matches!(message, Message::Back);
@@ -1160,6 +1205,9 @@ impl App {
         } else {
             self.list_offset = 0.0;
             self.page_veil = 1.0;
+            self.lyrics_shown = 0.0;
+            self.lyrics_target = 0.0;
+            self.lyrics_line = None;
             let down = back || (self.section as u8) < rank;
             self.page_shift = (0.0, if down { -PAGE_SHIFT } else { PAGE_SHIFT });
             operation::snap_to(Id::new(LIST), scrollable::RelativeOffset::START)
@@ -1177,6 +1225,8 @@ impl App {
             }
         }
         self.sync_overlays();
+        let lyrics = self.lyrics_sync();
+        self.lyrics_follow();
         // Лайки догружаются, когда до конца загруженного остаётся немного.
         let more = if self.section == Section::Likes && self.visible().end + ROW_MARGIN >= self.liked.len() && !matches!(self.retry, Some(Message::LikesMore)) {
             self.likes_more()
@@ -1193,7 +1243,7 @@ impl App {
         if let Some(media) = &mut self.media {
             media.sync(track.as_ref(), playing, position);
         }
-        Task::batch([task, snap, more, covers])
+        Task::batch([task, snap, more, covers, lyrics])
     }
 
     /// Открытые меню и окна: каждое появляется само и дорисовывает исчезновение после закрытия.
@@ -1269,6 +1319,13 @@ impl App {
                 let pins = Task::batch([pins, self.liked_pages_load()]);
                 let page = match self.preview.clone() {
                     Some(Preview::Wave | Preview::WaveSeek) => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
+                    Some(Preview::Lyrics) => self.wave_load(vec!["artist:3121".to_string()], None, false),
+                    Some(Preview::WaveTune) => {
+                        self.preview = None;
+                        self.section = Section::Wave;
+                        let wave = self.wave_load(vec![api::MY_WAVE.to_string()], None, false);
+                        Task::batch([wave, self.update(Message::DialogOpen(Dialog::WaveTune))])
+                    }
                     Some(Preview::WaveSeeded) => self.wave_load(vec!["artist:3121".to_string()], Some(wave_label("artist:3121", "Metallica")), false),
                     Some(Preview::Likes | Preview::LikesEnd | Preview::Menu | Preview::Panels) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
@@ -1657,6 +1714,47 @@ impl App {
                 return self.fail(e);
             }
             Message::WaveStart => return self.update(Message::WaveStartSeeds(vec![api::MY_WAVE.to_string()], None)),
+            Message::WaveReset => {
+                self.wave_tuning = [0; 4];
+                self.save_settings();
+                return self.update(Message::WaveStart);
+            }
+            Message::WaveTune(group, choice) => {
+                self.wave_tuning[group] = choice;
+                self.save_settings();
+                return self.update(Message::WaveStartSeeds(self.wave_base.clone(), self.wave_title.clone()));
+            }
+            Message::WaveTuneReset => {
+                self.wave_tuning = [0; 4];
+                self.save_settings();
+                return self.update(Message::WaveStartSeeds(self.wave_base.clone(), self.wave_title.clone()));
+            }
+            Message::LyricsToggle => {
+                if self.section == Section::Lyrics {
+                    return self.handle(Message::Back);
+                }
+                return self.handle(Message::Open(Section::Lyrics));
+            }
+            Message::LyricsLoaded(id, result) => {
+                if self.lyrics_loading.as_deref() == Some(id.as_str()) {
+                    self.lyrics_loading = None;
+                }
+                self.lyrics_line = None;
+                return match result {
+                    Ok(found) => {
+                        self.lyrics = Some((id, found));
+                        Task::none()
+                    }
+                    Err(e) => {
+                        self.lyrics = Some((id, None));
+                        self.fail(e)
+                    }
+                };
+            }
+            Message::LyricsSeek(time) => {
+                self.seeking = Some(time);
+                return self.update(Message::SeekDone);
+            }
             Message::WaveStartSeeds(seeds, title) => {
                 if self.section != Section::Wave {
                     self.remember();
@@ -1672,7 +1770,7 @@ impl App {
                         return self.notify("Для этой волны у Яндекса нет треков".to_string());
                     }
                     // Пока грузилась фоновая волна, пользователь мог включить свой список.
-                    Ok(_) if !autoplay && self.current.is_some() && !matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded)) => {}
+                    Ok(_) if !autoplay && self.current.is_some() && !matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded | Preview::Lyrics)) => {}
                     Ok(wave) => {
                         if let Some(p) = &self.player {
                             p.stop();
@@ -1683,6 +1781,7 @@ impl App {
                         self.wave_pending = Some(wave.session);
                         self.queue_title = None;
                         self.wave_title = title;
+                        self.wave_base = seeds;
                         self.queue = wave.tracks;
                         self.wave_queue = true;
                         self.unshuffled = None;
@@ -1693,7 +1792,12 @@ impl App {
                         if matches!(self.preview, Some(Preview::WaveSeek)) {
                             self.seeking = Some(5.0);
                         }
-                        if matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded)) {
+                        if matches!(self.preview, Some(Preview::Lyrics)) {
+                            self.section = Section::Lyrics;
+                            self.current = self.queue.iter().position(|track| track.lyrics).or(self.current);
+                            self.position = Duration::from_secs(40);
+                        }
+                        if matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded | Preview::Lyrics)) {
                             self.preview = None;
                         }
                         if autoplay {
@@ -1790,7 +1894,7 @@ impl App {
                     Dialog::Describe(_) => self.list_meta.as_ref().map_or_else(String::new, |meta| meta.1.clone()),
                     _ => String::new(),
                 };
-                let focus = !matches!(dialog, Dialog::Delete(_));
+                let focus = !matches!(dialog, Dialog::Delete(_) | Dialog::WaveTune);
                 self.dialog = Some(dialog);
                 if focus {
                     return operation::focus(Id::new(DIALOG_INPUT));
@@ -1805,6 +1909,7 @@ impl App {
                 }
                 self.dialog = None;
                 return match dialog {
+                    Dialog::WaveTune => Task::none(),
                     Dialog::Create => Task::perform(background(move || api::create_playlist(&uid, &title, &token)), Message::PlaylistCreated),
                     Dialog::Rename(list) => {
                         let kind = list.kind;
@@ -2238,6 +2343,7 @@ impl App {
         let page: Element<'_, Message> = match self.section {
             Section::Home => self.view_home(),
             Section::Queue => self.view_queue(),
+            Section::Lyrics => self.view_lyrics(),
             Section::History => self.view_track_page("История", &self.history_tracks, "Здесь появятся треки, которые вы слушали", Section::History),
             Section::Dislikes => self.view_track_page("Дизлайки", &self.disliked_list, "Здесь появятся треки, которые вам не понравились", Section::Dislikes),
             Section::Wave => self.view_wave(),
@@ -2304,6 +2410,7 @@ impl App {
     /// Контекстное меню трека: те же пункты и названия, что в оригинале.
     fn view_dialog<'a>(&'a self, dialog: &'a Dialog) -> Element<'a, Message> {
         let (title, confirm, danger): (String, &str, bool) = match dialog {
+            Dialog::WaveTune => return self.view_wave_tune(),
             Dialog::Create => ("Новый плейлист".to_string(), "Создать", false),
             Dialog::Rename(_) => ("Название плейлиста".to_string(), "Сохранить", false),
             Dialog::Describe(_) => ("Описание плейлиста".to_string(), "Сохранить", false),
@@ -2324,6 +2431,90 @@ impl App {
         // Затемнение ловит клики, чтобы страница под окном не реагировала.
         let dim = ui::BLACK.scale_alpha(0.6 * alpha);
         reveal(mouse_area(container(mouse_area(window).on_press(Message::DialogInput(self.dialog_text.clone()))).center(Length::Fill).style(move |_| container::Style::default().background(dim))).on_press(Message::MenuClose)).inert(!self.dialog_fade.live).into()
+    }
+
+    /// Настройки волны: каждый выбор сразу запускает волну заново.
+    fn view_wave_tune(&self) -> Element<'_, Message> {
+        let alpha = self.dialog_fade.shown();
+        let mut body = column![text("Настроить волну").size(20).font(ui::font_medium()).color(ui::TEXT.scale_alpha(alpha))].spacing(16);
+        for (group, (title, options)) in settings::WAVE_GROUPS.iter().enumerate() {
+            let chips = options.iter().enumerate().fold(row![].spacing(8), |chips, (choice, (name, _))| {
+                let active = self.wave_tuning[group] == choice;
+                chips.push(shine(button(text(*name).wrapping(Wrapping::None)).padding([7, 14]).style(ui::chip_faded(active, alpha)).on_press(Message::WaveTune(group, choice)), 18.0))
+            });
+            body = body.push(column![text(*title).size(14).color(ui::MUTED.scale_alpha(alpha)), chips.wrap().vertical_spacing(8)].spacing(8));
+        }
+        let buttons = row![
+            shine(button(text("Сбросить").color(ui::TEXT.scale_alpha(alpha))).padding([8, 18]).style(ui::button_faded(ui::secondary, alpha)).on_press(Message::WaveTuneReset), 24.0),
+            Space::new().width(Length::Fill),
+            shine(button(text("Готово").font(ui::font_medium()).color(ui::ON_ACCENT.scale_alpha(alpha))).padding([8, 18]).style(ui::button_faded(ui::accent, alpha)).on_press(Message::MenuClose), 24.0),
+        ];
+        let window = reveal(container(body.push(buttons)).width(TUNE_WIDTH).padding(24).style(ui::popover_faded(alpha))).scale(0.94 + 0.06 * alpha, 0.5, 0.5).shift(0.0, 10.0 * (1.0 - alpha));
+        let dim = ui::BLACK.scale_alpha(0.6 * alpha);
+        reveal(mouse_area(container(mouse_area(window).on_press(Message::DialogInput(self.dialog_text.clone()))).center(Length::Fill).style(move |_| container::Style::default().background(dim))).on_press(Message::MenuClose)).inert(!self.dialog_fade.live).into()
+    }
+
+    /// Текст песни: звучащая строка стоит посередине, клик по строке перематывает.
+    fn view_lyrics(&self) -> Element<'_, Message> {
+        let back = glow(button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0);
+        let Some(track) = self.current_track() else {
+            return column![back, placeholder("Сейчас ничего не играет", None)].spacing(16).height(Length::Fill).into();
+        };
+        let about = column![text(&track.title).size(24).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None), text(&track.artists).color(ui::MUTED).wrapping(Wrapping::None)];
+        let header = row![back, container(about).width(Length::Fill).clip(true)].spacing(12).align_y(Alignment::Center);
+        let found = self.lyrics.as_ref().filter(|(id, _)| *id == track.id);
+        let Some(lyrics) = found.and_then(|(_, lyrics)| lyrics.as_ref()) else {
+            let label = if found.is_some() { "У этого трека нет текста" } else { "Загружаем текст…" };
+            return column![header, placeholder(label, None)].spacing(16).height(Length::Fill).into();
+        };
+        // Запас сверху и снизу на половину страницы: первая и последняя строки тоже встают посередине.
+        let room = ((WINDOW.lock().unwrap().1 - LYRICS_CHROME) / 2.0).max(0.0);
+        let mut lines = column![Space::new().height(if lyrics.synced() { room } else { 0.0 })].spacing(14).width(Length::Fill).padding(Padding::ZERO.right(SCROLLBAR));
+        for (index, (time, words)) in lyrics.lines.iter().enumerate() {
+            let line = text(words).size(LYRICS_SIZE).font(ui::font_headline());
+            let line: Element<'_, Message> = match time {
+                Some(time) => {
+                    let color = if self.lyrics_line == Some(index) { ui::WHITE } else { ui::MUTED };
+                    button(line).padding(0).style(ui::title_link(color)).on_press(Message::LyricsSeek(*time)).into()
+                }
+                None => line.color(ui::TEXT).into(),
+            };
+            lines = lines.push(line);
+        }
+        if !lyrics.authors.is_empty() {
+            lines = lines.push(text(format!("Авторы: {}", lyrics.authors.join(", "))).size(14).color(ui::MUTED));
+        }
+        lines = lines.push(Space::new().height(if lyrics.synced() { room } else { 0.0 }));
+        column![header, scrollable(lines).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).height(Length::Fill)].spacing(16).height(Length::Fill).into()
+    }
+
+    /// Запрашивает текст, когда открыта его страница и сменился трек.
+    fn lyrics_sync(&mut self) -> Task<Message> {
+        if self.section != Section::Lyrics {
+            return Task::none();
+        }
+        let (Some(track), Some(token)) = (self.current_track(), self.token()) else { return Task::none() };
+        let id = track.id.clone();
+        if self.lyrics.as_ref().is_some_and(|(known, _)| *known == id) || self.lyrics_loading.as_ref() == Some(&id) {
+            return Task::none();
+        }
+        self.lyrics_loading = Some(id.clone());
+        self.lyrics_line = None;
+        let wanted = id.clone();
+        Task::perform(background(move || api::lyrics(&id, &token)), move |result| Message::LyricsLoaded(wanted.clone(), result))
+    }
+
+    /// Находит звучащую строку и задаёт, куда прокрутить страницу.
+    fn lyrics_follow(&mut self) {
+        if self.section != Section::Lyrics {
+            return;
+        }
+        let Some((_, Some(lyrics))) = self.lyrics.as_ref().filter(|(id, _)| self.current_track().is_some_and(|t| t.id == *id)) else { return };
+        let line = lyrics.line_at(self.position.as_secs_f32());
+        if line != self.lyrics_line {
+            self.lyrics_target = line.map_or(0.0, |index| (index as f32 + 0.5) / lyrics.lines.len().max(1) as f32);
+            self.lyrics_line = line;
+        }
     }
 
     fn view_menu<'a>(&'a self, track: &'a Track, x: f32, y: f32, artists: bool, lists: bool) -> Element<'a, Message> {
@@ -2463,6 +2654,9 @@ impl App {
         if quality {
             tools = tools.push(tool(ui::TUNE, self.quality == Quality::Lossless, Message::QualityOpen));
         }
+        if self.current_track().is_some_and(|track| track.lyrics) {
+            tools = tools.push(tool(ui::LYRICS, self.section == Section::Lyrics, Message::LyricsToggle));
+        }
         tools.push(tool(ui::QUEUE, self.section == Section::Queue, Message::QueueToggle)).into()
     }
 
@@ -2589,13 +2783,23 @@ impl App {
         let about = column![track_title(track, name_size, ui::font_headline(), ui::WHITE), names].spacing(4).align_x(Alignment::Center);
         let info = row![self.like_button(track, 24.0), container(about).center_x(Length::Fill).clip(true), self.more_button(track, 22.0)].spacing(12).align_y(Alignment::Center).width(line);
 
-        let source = if self.wave_queue { self.wave_title.as_ref() } else { self.queue_title.as_ref() };
+        let tuned = settings::wave_names(self.wave_tuning).join(", ");
+        let source = if self.wave_queue {
+            match (&self.wave_title, tuned.is_empty()) {
+                (Some(title), _) => Some(title.clone()),
+                (None, false) => Some(format!("Моя волна · {tuned}")),
+                (None, true) => None,
+            }
+        } else {
+            self.queue_title.clone()
+        };
+        let close = if self.wave_queue { Message::WaveReset } else { Message::WaveStart };
         let top: Element<'_, Message> = match source {
             _ if self.wave_loading => text("Настраиваем волну…").size(18).font(ui::font_headline()).color(ui::MUTED).wrapping(Wrapping::None).into(),
             // Крестик возвращает к обычной Моей волне.
             Some(source) => {
-                let back = row![text(clipped(source, WAVE_LABEL)).size(18).font(ui::font_headline()).color(ui::ACCENT).wrapping(Wrapping::None), ui::icon(ui::CLOSE, 20.0, ui::ACCENT)].spacing(8).align_y(Alignment::Center);
-                glow(button(back).padding([6, 14]).style(ui::source_button).on_press(Message::WaveStart), 20.0)
+                let back = row![text(clipped(&source, WAVE_LABEL)).size(18).font(ui::font_headline()).color(ui::ACCENT).wrapping(Wrapping::None), ui::icon(ui::CLOSE, 20.0, ui::ACCENT)].spacing(8).align_y(Alignment::Center);
+                glow(button(back).padding([6, 14]).style(ui::source_button).on_press(close), 20.0)
             }
             None => text("Моя волна").size(18).font(ui::font_headline()).color(ui::ACCENT).wrapping(Wrapping::None).into(),
         };
@@ -2627,7 +2831,13 @@ impl App {
             transport,
         ]
         .align_x(Alignment::Center);
-        let tools = row![Space::new().width(Length::Fill), self.view_tools(22.0, true), self.view_volume(22.0, Some((space - 130.0).clamp(50.0, 130.0)))].spacing(10).align_y(Alignment::Center);
+        let tune: Element<'_, Message> = if self.wave_queue {
+            let tint = if tuned.is_empty() { ui::TEXT } else { ui::ACCENT };
+            shine(button(row![ui::icon(ui::WAVE, 20.0, tint), text("Настроить").color(tint)].spacing(8).align_y(Alignment::Center)).padding([8, 16]).style(ui::secondary).on_press(Message::DialogOpen(Dialog::WaveTune)), 24.0)
+        } else {
+            Space::new().into()
+        };
+        let tools = row![tune, Space::new().width(Length::Fill), self.view_tools(22.0, true), self.view_volume(22.0, Some((space - 130.0).clamp(50.0, 130.0)))].spacing(10).align_y(Alignment::Center);
         column![container(top).center_x(Length::Fill).padding(Padding::ZERO.top(8)), container(body).center(Length::Fill), tools].height(Length::Fill).into()
     }
 
@@ -3148,8 +3358,9 @@ impl App {
             buttons = buttons.push(mode(icon, self.repeat != Repeat::Off, Message::RepeatNext));
         }
 
-        let quality = zone >= 2.0 * BAR_TOOL + 6.0;
-        let tools = if quality { 2.0 * BAR_TOOL + 6.0 } else { BAR_TOOL };
+        let lyrics = if track.lyrics { BAR_TOOL + 6.0 } else { 0.0 };
+        let quality = zone >= 2.0 * BAR_TOOL + 6.0 + lyrics;
+        let tools = lyrics + if quality { 2.0 * BAR_TOOL + 6.0 } else { BAR_TOOL };
         let slider_room = zone - tools - BAR_VOLUME_ICON - 14.0;
         let mut right = row![self.view_tools(22.0, quality)].spacing(8).align_y(Alignment::Center);
         if slider_room >= 0.0 {
@@ -3445,7 +3656,9 @@ fn smoke_wave(seeds: &str) -> Result<(), String> {
     let mine: HashSet<String> = api::wave_new(&[api::MY_WAVE.to_string()], &token)?.tracks.into_iter().map(|t| t.id).collect();
     println!("{}: {} треков", api::MY_WAVE, mine.len());
     for seed in seeds.split(',') {
-        match api::wave_new(&[seed.to_string()], &token) {
+        // Плюс объединяет зёрна в одну волну.
+        let asked: Vec<String> = seed.split('+').map(str::to_string).collect();
+        match api::wave_new(&asked, &token) {
             Ok(wave) => {
                 let same = wave.tracks.iter().filter(|t| mine.contains(&t.id)).count();
                 println!("{seed}: {} треков, совпало с Моей волной: {same}", wave.tracks.len());
@@ -3454,6 +3667,18 @@ fn smoke_wave(seeds: &str) -> Result<(), String> {
                 }
             }
             Err(e) => println!("{seed}: ошибка {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// Проверка текста: только число строк, сам текст не печатаем.
+fn smoke_lyrics(ids: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    for id in ids.split(',') {
+        match api::lyrics(id, &token)? {
+            Some(lyrics) => println!("{id}: строк {}, синхронный: {}, авторов {}", lyrics.lines.len(), lyrics.synced(), lyrics.authors.len()),
+            None => println!("{id}: текста нет"),
         }
     }
     Ok(())
@@ -3591,11 +3816,12 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
                 "--smoke-wave" => smoke_wave(query),
+                "--smoke-lyrics" => smoke_lyrics(query),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
@@ -3612,6 +3838,8 @@ fn main() -> iced::Result {
             "dialog" => Preview::Dialog,
             "wave-seek" => Preview::WaveSeek,
             "wave-seeded" => Preview::WaveSeeded,
+            "wave-tune" => Preview::WaveTune,
+            "lyrics" => Preview::Lyrics,
             "likes" => Preview::Likes,
             "likes-end" => Preview::LikesEnd,
             "panels" => Preview::Panels,

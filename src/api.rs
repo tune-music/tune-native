@@ -37,6 +37,8 @@ pub struct Track {
     pub artist_list: Vec<(String, String)>,
     /// С ненормативной лексикой.
     pub explicit: bool,
+    /// У Яндекса есть текст песни.
+    pub lyrics: bool,
     /// Пачка волны, из которой пришёл трек.
     pub batch: Option<String>,
 }
@@ -195,7 +197,7 @@ fn forget_cache() {
 
 /// История и ссылки на файлы всегда нужны свежими.
 fn cacheable(path: &str) -> bool {
-    !path.starts_with("music-history") && !path.contains("file-info") && !path.starts_with("rotor")
+    !path.starts_with("music-history") && !path.contains("file-info") && !path.starts_with("rotor") && !path.ends_with("/lyrics")
 }
 
 fn get(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, String> {
@@ -316,6 +318,7 @@ fn parse_track(v: &Value) -> Option<Track> {
         album_title: v["albums"][0]["title"].as_str().unwrap_or_default().to_string(),
         artist_list: parse_track_artists(v),
         explicit: v["contentWarning"].as_str() == Some("explicit"),
+        lyrics: v["lyricsInfo"]["hasAvailableSyncLyrics"].as_bool() == Some(true) || v["lyricsInfo"]["hasAvailableTextLyrics"].as_bool() == Some(true),
         batch: None,
     })
 }
@@ -969,10 +972,75 @@ pub fn wave_feedback(session: &str, kind: &str, track: Option<&Track>, played: O
     post(&format!("rotor/session/{session}/feedback/"), "application/json", body.to_string(), token).map(|_| ())
 }
 
-fn sign(data: &str) -> String {
+/// Текст песни. У синхронного у каждой строки есть время.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Lyrics {
+    pub lines: Vec<(Option<f32>, String)>,
+    pub authors: Vec<String>,
+}
+
+impl Lyrics {
+    pub fn synced(&self) -> bool {
+        self.lines.iter().any(|(time, _)| time.is_some())
+    }
+
+    /// Строка, которая звучит в момент `position`.
+    pub fn line_at(&self, position: f32) -> Option<usize> {
+        self.lines.iter().rposition(|(time, _)| time.is_some_and(|time| time <= position))
+    }
+}
+
+/// Строка LRC: `[01:23.45] текст`. Без метки времени остаётся обычным текстом.
+fn parse_lrc(text: &str) -> Vec<(Option<f32>, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let timed = line.strip_prefix('[').and_then(|rest| rest.split_once(']')).and_then(|(stamp, words)| {
+                let (minutes, seconds) = stamp.split_once(':')?;
+                Some((minutes.parse::<f32>().ok()? * 60.0 + seconds.parse::<f32>().ok()?, words.trim()))
+            });
+            match timed {
+                Some((_, "")) => None,
+                Some((time, words)) => Some((Some(time), words.to_string())),
+                None if line.is_empty() => None,
+                None => Some((None, line.to_string())),
+            }
+        })
+        .collect()
+}
+
+fn lyrics_in(id: &str, format: &str, token: &str) -> Result<Option<Lyrics>, String> {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs().to_string();
+    // Текст подписывается целиком, в отличие от запроса файла.
+    let signature = sign_full(&format!("{id}{ts}"));
+    let v = match get(&format!("tracks/{id}/lyrics"), &[("format", format), ("timeStamp", &ts), ("sign", &signature)], token) {
+        // Так Яндекс отвечает, когда текста в этом виде просто нет.
+        Err(e) if e.starts_with("Яндекс ответил 404") => return Ok(None),
+        other => other?,
+    };
+    let v = result(&v);
+    let Some(url) = v["downloadUrl"].as_str() else { return Ok(None) };
+    let text = agent().get(url).call().map_err(|e| format!("Не удалось загрузить текст: {e}"))?.into_body().read_to_string().map_err(|e| e.to_string())?;
+    let authors = v["writers"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(str::to_string)).collect();
+    Ok(Some(Lyrics { lines: parse_lrc(&text), authors }).filter(|lyrics| !lyrics.lines.is_empty()))
+}
+
+/// Сначала синхронный текст, потом обычный. У многих треков есть только один из них.
+pub fn lyrics(id: &str, token: &str) -> Result<Option<Lyrics>, String> {
+    match lyrics_in(id, "LRC", token)? {
+        Some(found) => Ok(Some(found)),
+        None => lyrics_in(id, "TEXT", token),
+    }
+}
+
+fn sign_full(data: &str) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(SIGN_KEY).expect("ключ HMAC любой длины");
     mac.update(data.as_bytes());
-    let mut s = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+fn sign(data: &str) -> String {
+    let mut s = sign_full(data);
     // Как в оригинале: подпись без последнего символа.
     s.pop();
     s
@@ -1059,6 +1127,18 @@ mod tests {
         assert!(cache.entries.len() <= CACHE_SIZE);
         assert_eq!(cache.get("k0", now + CACHE_TIME / 2), None);
         assert!(!cacheable("music-history") && !cacheable("get-file-info") && cacheable("albums/1/with-tracks"));
+    }
+
+    #[test]
+    fn parses_lyrics() {
+        let lines = parse_lrc("[00:01.50] раз\n[00:03.00]\n[01:00.00] два\n\nбез времени");
+        assert_eq!(lines, [(Some(1.5), "раз".to_string()), (Some(60.0), "два".to_string()), (None, "без времени".to_string())]);
+        let lyrics = Lyrics { lines, authors: Vec::new() };
+        assert!(lyrics.synced());
+        assert_eq!(lyrics.line_at(0.5), None);
+        assert_eq!(lyrics.line_at(2.0), Some(0));
+        assert_eq!(lyrics.line_at(90.0), Some(1));
+        assert!(!Lyrics { lines: parse_lrc("текст"), authors: Vec::new() }.synced());
     }
 
     #[test]

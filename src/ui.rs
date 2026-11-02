@@ -49,6 +49,7 @@ pub fn theme() -> Theme {
     Theme::custom("Tune", Palette { background: BLACK, text: TEXT, primary: ACCENT, success: ACCENT, warning: ACCENT, danger: DANGER })
 }
 
+pub const LYRICS: &str = "M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z";
 pub const PLAY: &str = "M8 5v14l11-7z";
 pub const PAUSE: &str = "M6 19h4V5H6v14zm8-14v14h4V5h-4z";
 pub const NEXT: &str = "M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z";
@@ -215,6 +216,15 @@ pub fn chip(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
         (true, _) => flat(Some(TEXT), BLACK, 18.0),
         (false, button::Status::Pressed) => flat(Some(CONTROL_HOVER), TEXT, 18.0),
         (false, _) => flat(Some(CONTROL), TEXT, 18.0),
+    }
+}
+
+/// Фильтр во всплывающем окне посреди появления.
+pub fn chip_faded(active: bool, alpha: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
+    let style = chip(active);
+    move |theme, status| {
+        let base = style(theme, status);
+        button::Style { background: base.background.map(|back| back.scale_alpha(alpha)), text_color: base.text_color.scale_alpha(alpha), ..base }
     }
 }
 

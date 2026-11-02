@@ -30,6 +30,7 @@ fn track_value(track: &Track) -> Value {
         "albumTitle": track.album_title,
         "artistList": track.artist_list,
         "explicit": track.explicit,
+        "lyrics": track.lyrics,
     })
 }
 
@@ -44,6 +45,7 @@ fn track_from(v: &Value) -> Option<Track> {
         album_title: v["albumTitle"].as_str().unwrap_or_default().to_string(),
         artist_list: serde_json::from_value(v["artistList"].clone()).unwrap_or_default(),
         explicit: v["explicit"].as_bool().unwrap_or(false),
+        lyrics: v["lyrics"].as_bool().unwrap_or(false),
         batch: None,
     })
 }
@@ -114,6 +116,7 @@ mod tests {
             album_title: "Альбом".to_string(),
             artist_list: vec![("Группа".to_string(), "5".to_string())],
             explicit: true,
+            lyrics: true,
             batch: None,
         }
     }
