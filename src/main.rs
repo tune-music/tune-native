@@ -168,6 +168,13 @@ const PRELOAD_BEFORE: Duration = Duration::from_secs(30);
 const QUEUE_HEADER: f32 = 200.0;
 const QUALITY_WIDTH: f32 = 250.0;
 const SKELETON_ROWS: usize = 10;
+const SKELETON_BLOCKS: usize = 3;
+/// Высота строк настоящей страницы, чтобы после загрузки ничего не сдвигалось.
+const SKELETON_HEAD: f32 = 32.0;
+const SKELETON_TITLE: f32 = 21.0;
+const SKELETON_SUBTITLE: f32 = 17.0;
+const SKELETON_TAB: f32 = 35.0;
+const SKELETON_TABS: [f32; 3] = [86.0, 112.0, 96.0];
 /// После скольких обложек убирать те, что далеко от экрана.
 const COVERS_LIMIT: usize = 400;
 const COVERS_AROUND: usize = 100;
@@ -3126,12 +3133,15 @@ impl App {
     }
 
     fn view_home(&self) -> Element<'_, Message> {
-        let tabs = self.home.tabs.iter().enumerate().fold(row![].spacing(8), |tabs, (index, title)| {
+        let mut tabs = self.home.tabs.iter().enumerate().fold(row![].spacing(8), |tabs, (index, title)| {
             tabs.push(shine(button(text(title)).padding([7, 16]).style(ui::chip(index == self.home_tab)).on_press(Message::HomeTab(index)), 18.0))
         });
+        if self.home_loading && self.home.tabs.is_empty() {
+            tabs = SKELETON_TABS.iter().fold(tabs, |tabs, &width| tabs.push(container(Space::new()).width(width).height(SKELETON_TAB).style(skeleton_round(SKELETON_TAB / 2.0))));
+        }
         let page = column![text("Главная").size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None), tabs].spacing(16).height(Length::Fill);
         if self.home_loading || self.home.blocks.is_empty() {
-            return page.push(if self.home_loading { skeleton_cards() } else { placeholder("Пока здесь пусто", None) }).into();
+            return page.push(if self.home_loading { skeleton_home(self.cards_in_row()) } else { placeholder("Пока здесь пусто", None) }).into();
         }
         let in_row = self.cards_in_row();
         let blocks = self.home.blocks.iter().enumerate().fold(column![].spacing(12).padding(Padding::ZERO.right(SCROLLBAR)), |blocks, (index, block)| {
@@ -3167,6 +3177,16 @@ impl App {
         };
         let body = column![cover, text(title).font(ui::font_medium()).color(ui::TEXT).wrapping(Wrapping::None), text(subtitle).size(13).color(ui::MUTED).wrapping(Wrapping::None)].spacing(6).width(CARD).clip(true);
         glow(button(body).padding(8).style(ui::card).on_press(Message::HomeOpen(item.clone())), 12.0)
+    }
+
+    /// Загружается альбом или исполнитель: шапка стоит там же, где будет настоящая.
+    fn skeleton_page<'a>(&self, round: bool) -> Element<'a, Message> {
+        let side = if self.main_width() < PAGE_COVER_WIDTH { PAGE_COVER_SMALL } else { PAGE_COVER };
+        let cover = container(Space::new()).width(side).height(side).style(skeleton_round(if round { side / 2.0 } else { 8.0 }));
+        let back = glow(button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0);
+        let info = column![skeleton_bar(70.0, 12.0), skeleton_bar(280.0, 34.0), skeleton_bar(160.0, 12.0)].spacing(14);
+        let head = container(row![container(back).height(PAGE_COVER), cover, container(info).center_y(PAGE_HEADER - 8.0)].spacing(16)).height(PAGE_HEADER).width(Length::Fill);
+        column![head, skeleton_list()].spacing(16).height(Length::Fill).into()
     }
 
     /// Шапка альбома и исполнителя: обложка, название, подписи и кнопки.
@@ -3214,8 +3234,7 @@ impl App {
 
     fn view_album<'a>(&'a self, playlist: &'a Playlist) -> Element<'a, Message> {
         let Some(album) = &self.album else {
-            let back = glow(button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0);
-            return column![back, skeleton_list()].spacing(16).height(Length::Fill).into();
+            return self.skeleton_page(false);
         };
         let count = self.playlist_tracks.len();
         let mut about: Vec<String> = album.year.map(|year| year.to_string()).into_iter().collect();
@@ -3245,8 +3264,7 @@ impl App {
 
     fn view_artist(&self) -> Element<'_, Message> {
         let Some(artist) = &self.artist else {
-            let back = glow(button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0);
-            return column![back, skeleton_list()].spacing(16).height(Length::Fill).into();
+            return self.skeleton_page(true);
         };
         let about = if artist.listeners > 0 { format!("Слушателей в месяц: {}", grouped(artist.listeners)) } else { String::new() };
         let actions = self.page_actions(Section::Artist, format!("artist:{}", artist.id), &artist.name).push(shine(button(text("Все треки").color(ui::TEXT)).padding([8, 18]).style(ui::secondary).on_press(Message::ArtistTracks), 24.0));
@@ -3602,21 +3620,52 @@ fn codec_name(codec: &str) -> String {
 }
 
 /// Заглушка строки, пока трек не загружен.
+fn skeleton_bar<'a>(width: f32, height: f32) -> iced::widget::Container<'a, Message> {
+    container(Space::new()).width(width).height(height).style(ui::tile)
+}
+
+fn skeleton_round(radius: f32) -> impl Fn(&iced::Theme) -> container::Style {
+    move |theme| container::Style { border: iced::border::rounded(radius), ..ui::tile(theme) }
+}
+
 fn skeleton_row<'a>() -> Element<'a, Message> {
-    let bar = |width: f32, height: f32| container(Space::new()).width(width).height(height).style(ui::tile);
-    container(row![bar(COVER, COVER), column![bar(180.0, 12.0), bar(110.0, 10.0)].spacing(8)].spacing(12).align_y(Alignment::Center))
+    container(row![skeleton_bar(COVER, COVER), column![skeleton_bar(180.0, 12.0), skeleton_bar(110.0, 10.0)].spacing(8)].spacing(12).align_y(Alignment::Center))
         .width(Length::Fill)
         .height(ROW)
         .padding([8, 8])
         .into()
 }
 
+/// Рамка скелетона: обрезает лишнее по краю панели. Обычный контейнер сжал бы последние
+/// строки под оставшуюся высоту, а прокручиваемая область без полосы отдаёт им полный размер.
+fn skeleton_frame<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    let bar = iced::widget::scrollable::Scrollbar::new().width(0).scroller_width(0).margin(0);
+    iced::widget::Scrollable::new(container(content).padding(Padding::ZERO.right(SCROLLBAR)).width(Length::Fill))
+        .direction(iced::widget::scrollable::Direction::Vertical(bar))
+        .height(Length::Fill)
+        .into()
+}
+
 fn skeleton_list<'a>() -> Element<'a, Message> {
-    (0..SKELETON_ROWS).fold(column![].padding(Padding::ZERO.right(SCROLLBAR)), |list, _| list.push(skeleton_row())).height(Length::Fill).into()
+    skeleton_frame((0..SKELETON_ROWS).fold(column![], |list, _| list.push(skeleton_row())))
+}
+
+/// Те же отступы и размеры, что у настоящей карточки: обложка и две строки текста.
+fn skeleton_card<'a>() -> Element<'a, Message> {
+    let line = |width, height, room| container(skeleton_bar(width, height)).center_y(room);
+    container(column![skeleton_bar(CARD, CARD).style(skeleton_round(8.0)), line(130.0, 13.0, SKELETON_TITLE), line(90.0, 10.0, SKELETON_SUBTITLE)].spacing(6).width(CARD)).padding(8).into()
 }
 
 fn skeleton_cards<'a>() -> Element<'a, Message> {
-    (0..SKELETON_ROWS).fold(row![].spacing(16), |cards, _| cards.push(container(Space::new()).width(CARD).height(CARD).style(ui::tile))).wrap().into()
+    skeleton_frame((0..SKELETON_ROWS).fold(row![].spacing(4), |cards, _| cards.push(skeleton_card())).wrap())
+}
+
+fn skeleton_home<'a>(in_row: usize) -> Element<'a, Message> {
+    skeleton_frame((0..SKELETON_BLOCKS).fold(column![].spacing(12), |blocks, _| {
+        let head = container(skeleton_bar(220.0, 20.0)).center_y(SKELETON_HEAD);
+        let cards = (0..in_row).fold(row![].spacing(4), |cards, _| cards.push(skeleton_card()));
+        blocks.push(column![head, cards].spacing(8)).push(Space::new().height(8))
+    }))
 }
 
 fn placeholder<'a>(title: &'a str, hint: Option<&'a str>) -> Element<'a, Message> {
