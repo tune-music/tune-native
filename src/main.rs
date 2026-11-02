@@ -142,6 +142,8 @@ const ARTIST_SEARCH: u32 = 5;
 const PAGE_FADE: f32 = 0.26;
 /// На сколько точек новая страница сдвинута в начале появления.
 const PAGE_SHIFT: f32 = 22.0;
+/// Как часто во время звучания уходит промежуточный отчёт о прослушивании.
+const LISTEN_REPORT: f32 = 30.0;
 /// За сколько секунд проявляется содержимое другой вкладки.
 const AREA_FADE: f32 = 0.2;
 /// Смена трека в Моей волне.
@@ -537,6 +539,13 @@ struct App {
     quality_menu: Option<(f32, f32)>,
     /// Что ещё закрывает новую страницу, от 1 до 0.
     page_veil: f32,
+    /// Текущее прослушивание для отчётов `plays`.
+    listen: Option<api::Listen>,
+    listen_tick: Option<Instant>,
+    /// После скольких секунд звучания уйдёт следующий промежуточный отчёт.
+    listen_next: f32,
+    /// Почему сменится трек: доиграл, пропущен, назад.
+    change_reason: Option<&'static str>,
     /// То же для области под вкладками поиска и главной.
     area_veil: f32,
     /// Откуда въезжает страница.
@@ -867,6 +876,10 @@ impl App {
             forward: Vec::new(),
             quality_menu: None,
             page_veil: 0.0,
+            listen: None,
+            listen_tick: None,
+            listen_next: LISTEN_REPORT,
+            change_reason: None,
             area_veil: 0.0,
             page_shift: (0.0, 0.0),
             bar_top: 0.0,
@@ -1281,6 +1294,58 @@ impl App {
         });
     }
 
+    /// Отчёт о прослушивании уходит в фоне; ошибка на музыку не влияет.
+    fn send_plays(&self, reports: Vec<serde_json::Value>) {
+        let Some(token) = self.token() else { return };
+        std::thread::spawn(move || {
+            let _ = api::plays(reports, &token);
+        });
+    }
+
+    /// Добавляет время звучания с прошлого замера.
+    fn listen_count(&mut self) {
+        let now = Instant::now();
+        let playing = self.active && self.player.as_ref().is_some_and(|p| !p.is_paused());
+        if let (Some(listen), Some(last), true) = (self.listen.as_mut(), self.listen_tick, playing) {
+            listen.played += now.duration_since(last).as_secs_f32();
+        }
+        self.listen_tick = Some(now);
+    }
+
+    /// Закрывает прослушивание прошлого трека с причиной смены.
+    fn listen_finish(&mut self) {
+        self.listen_count();
+        let reason = self.change_reason.take().unwrap_or("other_track");
+        let Some(listen) = self.listen.take().filter(|listen| listen.started.is_some()) else { return };
+        let position = if reason == "finish" { listen.length } else { self.player.as_ref().map_or(self.position, |p| p.position()).as_secs_f32() };
+        self.send_plays(vec![listen.report(position, Some(reason), false)]);
+    }
+
+    /// Откуда играет трек: контекст, его номер и страница, как их называет официальный клиент.
+    fn listen_new(&self, track: &Track) -> api::Listen {
+        let screen = |page: &str| format!("desktop-{page}_screen-default");
+        if self.wave_queue {
+            let mut listen = api::Listen::new(track, screen("wave_landing"), "radio", Some(self.wave_base.join(",")).filter(|seeds| !seeds.is_empty()));
+            listen.radio = self.wave.clone().map(|session| (session, track.batch.clone()));
+            return listen;
+        }
+        let (page, context, item, playlist) = match &self.queue_from {
+            QueueFrom::List(list) if list.source == Source::Album => ("album", "album", Some(list.kind.clone()), None),
+            QueueFrom::List(list) if !list.owner.is_empty() => {
+                let id = format!("{}:{}", list.owner, list.kind);
+                ("playlist", "playlist", Some(id.clone()), Some(id))
+            }
+            QueueFrom::Artist(id) => ("artist", "artist", Some(id.clone()), None),
+            QueueFrom::Search => ("search", "search", None, None),
+            QueueFrom::Likes | QueueFrom::Dislikes => ("playlist", "other", None, None),
+            QueueFrom::History => ("history", "other", None, None),
+            QueueFrom::List(_) | QueueFrom::Unknown => ("main", "other", None, None),
+        };
+        let mut listen = api::Listen::new(track, screen(page), context, item);
+        listen.playlist = playlist;
+        listen
+    }
+
     fn current_track(&self) -> Option<&Track> {
         self.queue.get(self.current?)
     }
@@ -1338,6 +1403,16 @@ impl App {
         let restart = self.restart.take();
         // Место прошлого запуска относится только к тому же треку.
         let resume = self.resume.take().filter(|_| self.current == Some(index));
+        // Прошлый трек закрывается, пока плеер ещё знает его место.
+        if restart.is_none() {
+            let again = self.change_reason == Some("finish") && self.listen.as_ref().is_some_and(|listen| listen.track == track.id);
+            self.listen_finish();
+            let mut listen = self.listen_new(&track);
+            listen.restored = resume.is_some();
+            listen.repeated = again;
+            self.listen = Some(listen);
+            self.listen_next = LISTEN_REPORT;
+        }
         self.retry = None;
         self.sound = None;
         let generation = player.stop();
@@ -3126,6 +3201,12 @@ impl App {
                     Ok(sound) => {
                         self.sound = Some(sound);
                         self.active = true;
+                        self.listen_tick = Some(Instant::now());
+                        if let Some(listen) = self.listen.as_mut().filter(|listen| listen.started.is_none()) {
+                            listen.started = Some(api::now_stamp());
+                            let report = listen.report(0.0, None, true);
+                            self.send_plays(vec![report]);
+                        }
                         self.failures = 0;
                         self.save_session();
                         if let Some(place) = self.resume_seek.take() {
@@ -3153,14 +3234,22 @@ impl App {
                 if let (false, false, Some(index)) = (self.active, self.starting, self.current) {
                     return self.play(index);
                 }
+                self.listen_count();
                 if let Some(p) = &self.player {
                     p.toggle();
+                    // Пауза у самого конца паузой не считается, как и в официальном клиенте.
+                    if p.is_paused() && self.current_track().is_some_and(|t| t.duration.saturating_sub(p.position()) > Duration::from_millis(200)) {
+                        if let Some(listen) = self.listen.as_mut() {
+                            listen.pause = true;
+                        }
+                    }
                 }
                 self.save_session();
             }
             Message::Next => {
                 if let Some(next) = self.next_index() {
                     self.skip_feedback();
+                    self.change_reason = Some("skip");
                     return self.play(next);
                 }
             }
@@ -3171,11 +3260,18 @@ impl App {
                 }
                 if let Some(i) = self.current.filter(|i| *i > 0) {
                     self.skip_feedback();
+                    self.change_reason = Some("back_skip");
                     return self.play(i - 1);
                 }
             }
             Message::Tick => {
                 self.preload_next();
+                self.listen_count();
+                if let Some(listen) = self.listen.as_ref().filter(|listen| listen.started.is_some() && listen.played >= self.listen_next) {
+                    let report = listen.report(self.position.as_secs_f32(), Some("in_progress"), false);
+                    self.listen_next += LISTEN_REPORT;
+                    self.send_plays(vec![report]);
+                }
                 if let (true, Some(p)) = (self.active, &self.player) {
                     self.position = p.position();
                     if self.session_at.is_none_or(|at| at.elapsed() >= SESSION_SAVE) {
@@ -3187,12 +3283,14 @@ impl App {
                         if let Some(track) = self.current_track().cloned() {
                             self.feedback("trackFinished", Some(&track), Some(track.duration.as_secs_f32()));
                         }
+                        self.change_reason = Some("finish");
                         if let (Repeat::One, false, Some(index)) = (self.repeat, self.wave_queue, self.current) {
                             return self.play(index);
                         }
                         if let Some(next) = self.next_index() {
                             return self.play(next);
                         }
+                        self.listen_finish();
                     }
                 }
             }
@@ -3209,6 +3307,12 @@ impl App {
                 if let (Some(value), Some(p)) = (self.seeking.take(), self.player.clone()) {
                     let position = Duration::from_secs_f32(value.max(0.0));
                     self.position = position;
+                    // Перемотка к месту прошлого запуска — не перемотка пользователя.
+                    if !self.unhold {
+                        if let Some(listen) = self.listen.as_mut() {
+                            listen.seek = true;
+                        }
+                    }
                     return Task::perform(background(move || p.seek(position)), Message::Seeked);
                 }
             }
@@ -5262,6 +5366,19 @@ fn smoke_settings() -> Result<(), String> {
     Ok(())
 }
 
+/// Шлёт стартовый отчёт о прослушивании для трека, на котором остановилась прошлая очередь.
+fn smoke_plays() -> Result<(), String> {
+    let token = api::load_token().ok_or("нет токена")?;
+    let saved = session::load().ok_or("нет сохранённой очереди")?;
+    let track = saved.tracks.get(saved.current).ok_or("нет трека")?;
+    let mut listen = api::Listen::new(track, "desktop-main_screen-default".into(), "other", None);
+    listen.started = Some(api::now_stamp());
+    listen.restored = true;
+    api::plays(vec![listen.report(0.0, None, true)], &token)?;
+    println!("Яндекс принял отчёт: {} — {}", track.artists, track.title);
+    Ok(())
+}
+
 fn smoke_quality(query: &str) -> Result<(), String> {
     let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
     let tracks = api::search(query, &token)?;
@@ -5404,13 +5521,14 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
                 "--smoke-wave" => smoke_wave(query),
                 "--smoke-lyrics" => smoke_lyrics(query),
                 "--smoke-settings" => smoke_settings(),
+                "--smoke-plays" => smoke_plays(),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {

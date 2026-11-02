@@ -24,7 +24,7 @@ const FROM: &str = "tune-native";
 /// Ошибка: токен отозвали или он истёк.
 pub const NEED_LOGIN: &str = "NEED_LOGIN";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Track {
     pub id: String,
     pub title: String,
@@ -303,8 +303,8 @@ fn fetch(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, Strin
 }
 
 fn post(path: &str, content_type: &str, body: String, token: &str) -> Result<Value, String> {
-    // Отзывы волны ничего из сохранённого не меняют.
-    if !path.starts_with("rotor") {
+    // Отзывы волны и отчёты о прослушивании ничего из сохранённого не меняют.
+    if !path.starts_with("rotor") && !path.starts_with("plays") {
         forget_cache();
     }
     let resp = agent()
@@ -1395,6 +1395,129 @@ pub fn wave_feedback(session: &str, kind: &str, track: Option<&Track>, played: O
     post(&format!("rotor/session/{session}/feedback/"), "application/json", body.to_string(), token).map(|_| ())
 }
 
+/// Одно прослушивание трека для отчёта `plays`: по ним Яндекс ведёт историю и подбирает
+/// рекомендации. Поля те же, что шлёт официальный клиент.
+#[derive(Clone, Debug)]
+pub struct Listen {
+    pub id: String,
+    pub track: String,
+    pub album: Option<String>,
+    pub length: f32,
+    pub from: String,
+    pub context: &'static str,
+    pub context_item: Option<String>,
+    pub playlist: Option<String>,
+    /// Сессия волны и пачка, из которой пришёл трек.
+    pub radio: Option<(String, Option<String>)>,
+    added: String,
+    pub started: Option<String>,
+    pub restored: bool,
+    pub repeated: bool,
+    pub seek: bool,
+    pub pause: bool,
+    /// Сколько секунд трек действительно звучал, без пауз и перемоток.
+    pub played: f32,
+}
+
+impl Listen {
+    pub fn new(track: &Track, from: String, context: &'static str, context_item: Option<String>) -> Self {
+        let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) + 1;
+        Self {
+            id: random_id(),
+            track: track.id.clone(),
+            album: track.album.clone(),
+            length: track.duration.as_secs_f32(),
+            from,
+            context,
+            context_item,
+            playlist: None,
+            radio: None,
+            added: format!("{}-{secs}", random_bits() % 10_u64.pow(16)),
+            started: None,
+            restored: false,
+            repeated: false,
+            seek: false,
+            pause: false,
+            played: 0.0,
+        }
+    }
+
+    /// Запись отчёта. Первая уходит при запуске, без прослушанного времени и причины.
+    pub fn report(&self, position: f32, reason: Option<&str>, first: bool) -> Value {
+        let round = |value: f32| (value * 1000.0).round() / 1000.0;
+        // Почти до конца — значит до конца: так же округляет официальный клиент.
+        let snap = |value: f32| if (self.length - value).abs() < 0.5 { self.length } else { value };
+        let (played, end) = if first { (0.0, 0.0) } else { (snap(self.played), snap(position)) };
+        let mut play = json!({
+            "playId": self.id,
+            "from": self.from,
+            "totalPlayedSeconds": round(played),
+            "endPositionSeconds": round(end),
+            "trackLengthSeconds": round(self.length),
+            "timestamp": now(),
+            "context": self.context,
+            "contextItem": self.context_item,
+            "addTracksToPlayerTime": self.added,
+            "fromCache": false,
+            "isRestored": self.restored,
+            "audioAuto": "none",
+            "audioOutputName": "Динамик",
+            "audioOutputType": "Speaker",
+            "trackId": self.track,
+            "seek": self.seek,
+            "pause": self.pause,
+            "isRepeated": self.repeated,
+            "isLivePlayableIndex": self.radio.is_some(),
+        });
+        if let Some(album) = &self.album {
+            play["albumId"] = json!(album);
+        }
+        if let Some(playlist) = &self.playlist {
+            play["playlistId"] = json!(playlist);
+        }
+        if let Some((session, batch)) = &self.radio {
+            play["radioSessionId"] = json!(session);
+            if let Some(batch) = batch {
+                play["batchId"] = json!(batch);
+            }
+        }
+        if let Some(started) = &self.started {
+            play["startTimestamp"] = json!(started);
+        }
+        if !first {
+            play["maxPlayerStage"] = json!("play");
+        }
+        if let Some(reason) = reason {
+            play["changeReason"] = json!(reason);
+        }
+        play
+    }
+}
+
+/// Случайные 64 бита: ключи `RandomState` каждый раз новые.
+fn random_bits() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    hasher.finish()
+}
+
+/// Случайный UUID версии 4.
+pub fn random_id() -> String {
+    let (a, b) = (random_bits(), random_bits());
+    format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}", a >> 32, (a >> 16) & 0xffff, (a & 0x0fff) | 0x4000, ((b >> 48) & 0x3fff) | 0x8000, b & 0xffff_ffff_ffff)
+}
+
+pub fn now_stamp() -> String {
+    now()
+}
+
+/// Отправляет отчёты о прослушивании.
+pub fn plays(reports: Vec<Value>, token: &str) -> Result<(), String> {
+    let client_now = now().replace(':', "%3A");
+    post(&format!("plays?clientNow={client_now}"), "application/json", json!({ "plays": reports }).to_string(), token).map(|_| ())
+}
+
 /// Текст песни. У синхронного у каждой строки есть время.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Lyrics {
@@ -1502,6 +1625,24 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listen_report_has_official_fields() {
+        let track = Track { id: "123".into(), album: Some("45".into()), duration: Duration::from_secs(200), ..Track::default() };
+        let mut listen = Listen::new(&track, "desktop-album_screen-default".into(), "album", Some("45".into()));
+        assert_eq!(listen.id.len(), 36);
+        assert_eq!(&listen.id[14..15], "4");
+        let start = listen.report(0.0, None, true);
+        assert_eq!(start["totalPlayedSeconds"], 0.0);
+        assert!(start.get("maxPlayerStage").is_none() && start.get("changeReason").is_none());
+        listen.played = 199.7;
+        let end = listen.report(199.8, Some("finish"), false);
+        assert_eq!(end["totalPlayedSeconds"], 200.0);
+        assert_eq!(end["endPositionSeconds"], 200.0);
+        assert_eq!(end["changeReason"], "finish");
+        assert_eq!(end["albumId"], "45");
+        assert_eq!(end["trackId"], "123");
+    }
 
     #[test]
     fn reads_artist_about_and_release_kind() {
