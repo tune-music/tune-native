@@ -43,6 +43,24 @@ pub struct Track {
     pub batch: Option<String>,
     /// Яндекс не даёт его слушать: нет прав или трек убран.
     pub unavailable: bool,
+    /// Точки плавного перехода в секундах: нарастание и затухание. Есть только у музыки.
+    pub fade: Option<Fade>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Fade {
+    pub in_start: f32,
+    pub in_stop: f32,
+    pub out_start: f32,
+    pub out_stop: f32,
+}
+
+impl Fade {
+    pub fn parse(v: &Value) -> Option<Fade> {
+        let point = |key: &str| v[key].as_f64().map(|x| x as f32).filter(|x| x.is_finite() && *x >= 0.0);
+        let fade = Fade { in_start: point("inStart")?, in_stop: point("inStop")?, out_start: point("outStart")?, out_stop: point("outStop")? };
+        (fade.in_stop >= fade.in_start && fade.out_stop > fade.out_start).then_some(fade)
+    }
 }
 
 impl Track {
@@ -377,6 +395,8 @@ fn parse_track(v: &Value) -> Option<Track> {
         lyrics: v["lyricsInfo"]["hasAvailableSyncLyrics"].as_bool() == Some(true) || v["lyricsInfo"]["hasAvailableTextLyrics"].as_bool() == Some(true),
         batch: None,
         unavailable: v["available"].as_bool() == Some(false),
+        // Как в оригинале: переход только между музыкальными треками, не подкастами и книгами.
+        fade: Fade::parse(&v["fade"]).filter(|_| v["type"].as_str() == Some("music")),
     })
 }
 

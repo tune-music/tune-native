@@ -9,6 +9,7 @@ mod media;
 mod player;
 mod seek;
 mod session;
+mod crossfade;
 mod equalizer;
 mod settings;
 mod ui;
@@ -525,6 +526,10 @@ struct App {
     player: Option<Player>,
     /// Эквалайзер: включён ли, пресет, предусиление и полосы.
     eq: equalizer::EqSettings,
+    /// Плавные переходы между треками.
+    crossfade: bool,
+    /// Следующий запуск — переход: где затихает играющий трек.
+    cross_out: Option<(f32, f32)>,
     /// Что играет: смена раздела и новый поиск не прерывают музыку.
     queue: Vec<Track>,
     /// Сессия волны, если очередь — это волна.
@@ -787,6 +792,7 @@ enum Message {
     Unavailable,
     /// Эквалайзер: открыть из трекбара, включить, выбрать пресет, сдвинуть полосу или предусиление, отпустить ползунок.
     EqOpen,
+    CrossfadeToggle,
     EqToggle,
     EqPreset(usize),
     EqBand(usize, f32),
@@ -936,6 +942,8 @@ impl App {
             unshuffled: None,
             quality: saved.quality,
             eq: saved.eq,
+            crossfade: saved.crossfade,
+            cross_out: None,
             sound: None,
             restart: None,
             unhold: false,
@@ -1096,7 +1104,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -1526,7 +1534,11 @@ impl App {
         }
         self.retry = None;
         self.sound = None;
-        let generation = player.stop();
+        // Переход: играющий трек затихает сам, новый нарастает поверх него.
+        let generation = match (self.cross_out.take(), track.fade) {
+            (Some(out), Some(fade)) if restart.is_none() && resume.is_none() => player.crossfade(out, (fade.in_start, fade.in_stop)),
+            _ => player.stop(),
+        };
         self.play_id = generation;
         self.current = Some(index);
         self.active = false;
@@ -1555,6 +1567,24 @@ impl App {
             move |result| Message::Started(generation, result),
         );
         Task::batch([start, self.wave_refill()])
+    }
+
+    /// Пора начинать переход к следующему треку: оба трека — музыка с точками перехода,
+    /// трек играет и дошёл до начала затухания. Повтор одного трека переходом не идёт.
+    fn cross_next(&self) -> Option<usize> {
+        if !self.crossfade || (self.repeat == Repeat::One && !self.wave_queue) || self.starting || self.seeking.is_some() || self.resume_seek.is_some() {
+            return None;
+        }
+        if self.player.as_ref().is_none_or(Player::is_paused) {
+            return None;
+        }
+        let fade = self.current_track()?.fade?;
+        let position = self.position.as_secs_f32();
+        if position < fade.out_start || position >= fade.out_stop {
+            return None;
+        }
+        let next = self.next_index().filter(|&next| Some(next) != self.current)?;
+        self.queue.get(next)?.fade.map(|_| next)
     }
 
     /// Незадолго до конца трека начинает качать следующий. Ошибка не важна: при запуске
@@ -3349,6 +3379,10 @@ impl App {
                 return Task::batch([iced::clipboard::write(track.share_link()), notice]);
             }
             Message::Unavailable => return self.notify(UNAVAILABLE.to_string()),
+            Message::CrossfadeToggle => {
+                self.crossfade = !self.crossfade;
+                self.save_settings();
+            }
             Message::EqOpen => self.eq_menu = Some(eq_place(*CURSOR.lock().unwrap())),
             Message::EqToggle => {
                 self.eq.enabled = !self.eq.enabled;
@@ -3547,6 +3581,14 @@ impl App {
                     self.position = p.position();
                     if self.session_at.is_none_or(|at| at.elapsed() >= SESSION_SAVE) {
                         self.save_session();
+                    }
+                    if let Some(next) = self.cross_next() {
+                        if let Some(track) = self.current_track().cloned() {
+                            self.feedback("trackFinished", Some(&track), Some(self.position.as_secs_f32()));
+                        }
+                        self.change_reason = Some("finish");
+                        self.cross_out = self.current_track().and_then(|track| track.fade).map(|fade| (fade.out_start, fade.out_stop));
+                        return self.play(next);
                     }
                     let Some(p) = &self.player else { return Task::none() };
                     if p.is_empty() {
@@ -4474,10 +4516,19 @@ impl App {
         .align_y(Alignment::Center);
         let ai = glow(button(ai).width(Length::Fill).padding(8).style(ui::row).on_press_maybe(self.ai_less.map(|enabled| Message::AiLessSet(!enabled))), 8.0);
 
+        let cross = row![
+            column![text("Плавные переходы между треками").color(ui::TEXT), text("Конец трека перетекает в начало следующего").size(13).color(ui::MUTED)].spacing(2).width(Length::Fill),
+            view_switch(Some(self.crossfade)),
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center);
+        let cross = glow(button(cross).width(Length::Fill).padding(8).style(ui::row).on_press(Message::CrossfadeToggle), 8.0);
+
         let page = column![
             text("Настройки").size(36).font(ui::font_headline()).color(ui::TEXT),
             sound,
             self.view_equalizer(),
+            cross,
             column![title("Рекомендации"), ai].spacing(8),
             view_hotkeys(),
             column![title("Аккаунт"), row![link("Управление аккаунтом", Message::DialogOpen(Dialog::Account)), link("Выйти", Message::DialogOpen(Dialog::Logout))].spacing(8)].spacing(12),
@@ -5835,6 +5886,32 @@ fn smoke_quality(query: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Переход между двумя найденными треками: старый должен затихнуть и кончиться на своей
+/// точке, новый — играть дальше. Звук выключен.
+fn smoke_crossfade(query: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let tracks: Vec<Track> = api::search(query, &token)?.into_iter().filter(|track| track.fade.is_some()).take(2).collect();
+    let [first, second] = &tracks[..] else { return Err("Нужны два трека с точками перехода".into()) };
+    let (out, fade_in) = (first.fade.unwrap(), second.fade.unwrap());
+    println!("{} — {}: затухание {:.1}–{:.1} с", first.artists, first.title, out.out_start, out.out_stop);
+    println!("{} — {}: нарастание {:.1}–{:.1} с", second.artists, second.title, fade_in.in_start, fade_in.in_stop);
+    let player = Player::new()?;
+    player.set_volume(0.0);
+    let generation = player.stop();
+    player.play(generation, &api::file_info(&first.id, Quality::Normal.code(), &token)?)?;
+    player.preload("следующий", &api::file_info(&second.id, Quality::Normal.code(), &token)?)?;
+    player.seek(Duration::from_secs_f32((out.out_start - 1.0).max(0.0)))?;
+    std::thread::sleep(Duration::from_secs(1));
+    let generation = player.crossfade((out.out_start, out.out_stop), (fade_in.in_start, fade_in.in_stop));
+    player.play_prepared(generation, "следующий").ok_or("Подготовленный файл потерялся")??;
+    let length = out.out_stop - out.out_start;
+    for step in 0..=((length + 2.0) * 2.0) as usize {
+        println!("{:4.1} с: старый звучит {}, новый на {:?}", step as f32 / 2.0, player.fading(), player.position());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Ok(())
+}
+
 /// Проверка без окна: лайки, волна и её обратная связь. Лайк ставится и сразу снимается,
 /// список «Мне нравится» остаётся прежним; из обратной связи волне уходит только запуск.
 fn smoke_library(query: &str) -> Result<(), String> {
@@ -5938,7 +6015,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-crossfade" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -5947,6 +6024,7 @@ fn main() -> iced::Result {
                 "--smoke-settings" => smoke_settings(),
                 "--smoke-plays" => smoke_plays(),
                 "--smoke-home" => smoke_home(),
+            "--smoke-crossfade" => smoke_crossfade(query),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {

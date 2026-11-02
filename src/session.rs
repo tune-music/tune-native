@@ -37,6 +37,7 @@ fn track_value(track: &Track) -> Value {
         "explicit": track.explicit,
         "lyrics": track.lyrics,
         "unavailable": track.unavailable,
+        "fade": track.fade.map(|fade| json!({ "inStart": fade.in_start, "inStop": fade.in_stop, "outStart": fade.out_start, "outStop": fade.out_stop })),
     })
 }
 
@@ -54,6 +55,7 @@ fn track_from(v: &Value) -> Option<Track> {
         lyrics: v["lyrics"].as_bool().unwrap_or(false),
         batch: None,
         unavailable: v["unavailable"].as_bool().unwrap_or(false),
+        fade: api::Fade::parse(&v["fade"]),
     })
 }
 
@@ -150,6 +152,7 @@ mod tests {
             lyrics: true,
             batch: None,
             unavailable: false,
+            fade: Some(api::Fade { in_start: 0.0, in_stop: 1.5, out_start: seconds as f32 - 5.0, out_stop: seconds as f32 }),
         }
     }
 

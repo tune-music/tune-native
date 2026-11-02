@@ -4,7 +4,7 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,6 +12,7 @@ use aes::cipher::{KeyIvInit, StreamCipher};
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink};
 
 use crate::api::FileInfo;
+use crate::crossfade::{FadeOut, Faded};
 use crate::equalizer::{EqSettings, Equalized, Shared};
 
 type Ctr128 = ctr::Ctr128BE<aes::Aes128>;
@@ -162,7 +163,14 @@ impl Prepared {
 /// Устройство вывода и плеер. Клонируется в фоновые задачи.
 #[derive(Clone)]
 pub struct Player {
-    output: Arc<rodio::Player>,
+    /// Два вывода: на переходе старый трек доигрывает на одном, новый начинается на другом.
+    outputs: Arc<[rodio::Player; 2]>,
+    active: Arc<AtomicUsize>,
+    /// Затухание играющего трека и нарастание следующего.
+    fade_out: Arc<Mutex<Option<FadeOut>>>,
+    fade_in: Arc<Mutex<Option<(f32, f32)>>>,
+    /// Загрузка и файл трека, который затихает после перехода.
+    fading: Arc<Mutex<Option<(Option<Arc<Progress>>, Option<PathBuf>)>>>,
     current: Arc<Mutex<Option<Arc<Progress>>>>,
     /// Файл играющего трека, если он был подготовлен заранее.
     current_file: Arc<Mutex<Option<PathBuf>>>,
@@ -184,9 +192,13 @@ impl Player {
     pub fn new() -> Result<Self, String> {
         let mut device = DeviceSinkBuilder::open_default_sink().map_err(|e| format!("Нет устройства вывода звука: {e}"))?;
         device.log_on_drop(false);
-        let output = rodio::Player::connect_new(device.mixer());
+        let outputs = [rodio::Player::connect_new(device.mixer()), rodio::Player::connect_new(device.mixer())];
         Ok(Self {
-            output: Arc::new(output),
+            outputs: Arc::new(outputs),
+            active: Arc::default(),
+            fade_out: Arc::default(),
+            fade_in: Arc::default(),
+            fading: Arc::default(),
             current: Arc::default(),
             current_file: Arc::default(),
             prepared: Arc::default(),
@@ -201,9 +213,29 @@ impl Player {
         std::env::temp_dir().join(format!("tune-native-{}-{generation}.part", std::process::id()))
     }
 
+    /// Вывод играющего трека.
+    fn output(&self) -> &rodio::Player {
+        &self.outputs[self.active.load(Ordering::Acquire)]
+    }
+
+    /// Убирает трек, который затихал после перехода, и его файл.
+    fn clear_fading(&self) {
+        self.outputs[1 - self.active.load(Ordering::Acquire)].clear();
+        if let Some((progress, file)) = self.fading.lock().unwrap().take() {
+            if let Some(progress) = progress {
+                progress.cancelled.store(true, Ordering::Release);
+            }
+            if let Some(file) = file {
+                let _ = std::fs::remove_file(file);
+            }
+        }
+    }
+
     /// Останавливает текущий трек и отменяет его загрузку. Вернёт номер нового запуска.
     pub fn stop(&self) -> u64 {
-        self.output.clear();
+        self.clear_fading();
+        self.fade_in.lock().unwrap().take();
+        self.output().clear();
         if let Some(old) = self.current.lock().unwrap().take() {
             old.cancelled.store(true, Ordering::Release);
         }
@@ -213,6 +245,24 @@ impl Player {
             let _ = std::fs::remove_file(file);
         }
         generation
+    }
+
+    /// Начинает переход: играющий трек затихает между `out` и там кончается, следующий
+    /// запуск нарастает между `fade_in` на другом выводе. Вернёт номер нового запуска.
+    pub fn crossfade(&self, out: (f32, f32), fade_in: (f32, f32)) -> u64 {
+        self.clear_fading();
+        if let Some(fade) = self.fade_out.lock().unwrap().take() {
+            fade.arm(out.0, out.1);
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        let progress = self.current.lock().unwrap().take();
+        let file = self.current_file.lock().unwrap().take().unwrap_or_else(|| Self::temp_path(generation));
+        *self.fading.lock().unwrap() = Some((progress, Some(file)));
+        self.active.fetch_xor(1, Ordering::AcqRel);
+        self.output().clear();
+        *self.fade_in.lock().unwrap() = Some(fade_in);
+        self.hold.store(false, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     /// Блокирует поток до начала звука, поэтому зовётся в фоне.
@@ -263,11 +313,19 @@ impl Player {
         if self.generation.load(Ordering::Acquire) != generation {
             return Ok(());
         }
-        self.output.append(Equalized::new(decoder, self.eq.clone()));
+        let fade_in = self.fade_in.lock().unwrap().take();
+        let fade_out = FadeOut::default();
+        *self.fade_out.lock().unwrap() = Some(fade_out.clone());
+        let output = self.output();
+        output.append(Faded::new(Equalized::new(decoder, self.eq.clone()), fade_in, fade_out));
+        // Если переход начинается не с нуля, новый трек сразу встаёт на свою точку.
+        if let Some((start, _)) = fade_in.filter(|(start, _)| *start > 0.05) {
+            let _ = output.try_seek(Duration::from_secs_f32(start));
+        }
         if self.hold.swap(false, Ordering::AcqRel) {
-            self.output.pause();
+            output.pause();
         } else {
-            self.output.play();
+            output.play();
         }
         Ok(())
     }
@@ -276,24 +334,33 @@ impl Player {
         self.hold.store(hold, Ordering::Release);
     }
 
+    /// Пауза останавливает и затихающий трек, чтобы переход продолжился с того же места.
     pub fn toggle(&self) {
-        if self.output.is_paused() {
-            self.output.play();
-        } else {
-            self.output.pause();
+        let paused = self.output().is_paused();
+        for output in self.outputs.iter() {
+            if paused {
+                output.play();
+            } else {
+                output.pause();
+            }
         }
     }
 
     pub fn is_paused(&self) -> bool {
-        self.output.is_paused()
+        self.output().is_paused()
+    }
+
+    /// Трек после перехода ещё затихает.
+    pub fn fading(&self) -> bool {
+        !self.outputs[1 - self.active.load(Ordering::Acquire)].empty()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.output.empty()
+        self.output().empty()
     }
 
     pub fn position(&self) -> Duration {
-        self.output.get_pos()
+        self.output().get_pos()
     }
 
     /// Новые настройки эквалайзера слышны сразу, в том числе в играющем треке.
@@ -302,19 +369,21 @@ impl Player {
     }
 
     pub fn set_volume(&self, volume: f32) {
-        self.output.set_volume(volume);
+        for output in self.outputs.iter() {
+            output.set_volume(volume);
+        }
     }
 
     /// Ждёт, пока докачается нужное место, поэтому зовётся в фоне.
     pub fn seek(&self, position: Duration) -> Result<(), String> {
-        self.output.try_seek(position).map_err(|e| format!("Не удалось перемотать: {e}"))
+        self.output().try_seek(position).map_err(|e| format!("Не удалось перемотать: {e}"))
     }
 }
 
 impl Drop for Player {
     fn drop(&mut self) {
         // Последняя копия: убираем временный файл.
-        if Arc::strong_count(&self.output) == 1 {
+        if Arc::strong_count(&self.outputs) == 1 {
             self.stop();
             if let Some(prepared) = self.prepared.lock().unwrap().take() {
                 prepared.discard();
