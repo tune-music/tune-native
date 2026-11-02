@@ -1217,6 +1217,21 @@ pub fn add_to_playlist(uid: &str, kind: &str, track: &Track, token: &str) -> Res
     change_playlist(uid, kind, &diff, state["revision"].as_u64().unwrap_or(0), token)
 }
 
+/// Переставляет трек в своём плейлисте. `from` и `to` — места в списке, который видно
+/// в окне; на сервере трек ищется по номеру, а сдвиг переносится как есть. `to` — где трек
+/// окажется после перестановки.
+pub fn move_in_playlist(uid: &str, kind: &str, track: &Track, from: usize, to: usize, token: &str) -> Result<(), String> {
+    let state = playlist_state(uid, kind, token)?;
+    let items = state["tracks"].as_array().cloned().unwrap_or_default();
+    let at = items.iter().position(|item| id_text(&item["track"]["id"]).or_else(|| id_text(&item["id"])).as_deref() == Some(track.id.as_str())).ok_or("Трека уже нет в плейлисте")?;
+    let target = (at as isize + to as isize - from as isize).clamp(0, items.len() as isize - 1) as usize;
+    if target == at {
+        return Ok(());
+    }
+    let diff = json!([{ "op": "move", "from": at, "to": target, "tracks": [track_ref(&track.id, track.album.as_deref())] }]);
+    change_playlist(uid, kind, &diff, state["revision"].as_u64().unwrap_or(0), token)
+}
+
 pub fn remove_from_playlist(uid: &str, kind: &str, track: &Track, token: &str) -> Result<(), String> {
     let state = playlist_state(uid, kind, token)?;
     let position = state["tracks"].as_array().into_iter().flatten().position(|item| id_text(&item["track"]["id"]).or_else(|| id_text(&item["id"])).as_deref() == Some(track.id.as_str())).ok_or("Трека уже нет в плейлисте")?;

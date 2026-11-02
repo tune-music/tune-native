@@ -306,6 +306,16 @@ enum Section {
     Tag,
 }
 
+/// Список, в котором перетаскивают трек.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DragList {
+    Queue,
+    Playlist,
+}
+
+/// Идёт перетаскивание: подписка ловит отпускание кнопки где угодно в окне.
+static DRAGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Окно поверх страницы.
 /// Откуда взята очередь: подпись на её странице и переход обратно.
 #[derive(Clone, Debug, Default)]
@@ -463,6 +473,8 @@ struct App {
     home_page: Section,
     /// Последняя открытая вкладка главной и книг с подкастами.
     landing_tabs: [usize; 2],
+    /// Перетаскивание: список, откуда взят трек, и над какой строкой он сейчас (ниже ли середины).
+    drag: Option<(DragList, usize, Option<(usize, bool)>)>,
     /// Где остановились в выпусках и книгах за этот запуск: свежее ответа сервера.
     progress: HashMap<String, f32>,
     /// Когда место в выпуске последний раз ушло Яндексу.
@@ -809,6 +821,11 @@ enum Message {
     Unavailable,
     /// Эквалайзер: открыть из трекбара, включить, выбрать пресет, сдвинуть полосу или предусиление, отпустить ползунок.
     EqOpen,
+    /// Перетаскивание трека: взяли за ручку, курсор над строкой (номер и высота в ней), отпустили.
+    DragStart(DragList, usize),
+    DragOver(usize, f32),
+    DragEnd,
+    TrackMoved(Result<(), String>),
     CrossfadeToggle,
     EqToggle,
     EqPreset(usize),
@@ -885,6 +902,7 @@ impl App {
             landing_tabs: [0; 2],
             progress: HashMap::new(),
             progress_at: None,
+            drag: None,
             home_pages: HashMap::new(),
             home_block_tabs: HashMap::new(),
             found: Found::default(),
@@ -1438,6 +1456,50 @@ impl App {
         let Some(listen) = self.listen.take().filter(|listen| listen.started.is_some()) else { return };
         let position = if reason == "finish" { listen.length } else { self.player.as_ref().map_or(self.position, |p| p.position()).as_secs_f32() };
         self.send_plays(vec![listen.report(position, Some(reason), false)]);
+    }
+
+    /// Переставляет трек: в очереди только в окне, в своём плейлисте ещё и на сервере.
+    fn move_track(&mut self, list: DragList, from: usize, to: usize) -> Task<Message> {
+        match list {
+            DragList::Queue => {
+                // Играющий трек и всё, что до него, не двигаются.
+                let floor = self.current.map_or(0, |current| current + 1);
+                if from < floor || to < floor || from >= self.queue.len() || to >= self.queue.len() {
+                    return Task::none();
+                }
+                let track = self.queue.remove(from);
+                self.queue.insert(to, track);
+                self.save_session();
+                Task::none()
+            }
+            DragList::Playlist => {
+                let (Some(uid), Some(token), Some(playlist)) = (self.uid.clone(), self.token(), self.playlist.clone()) else { return Task::none() };
+                if !self.is_own(&playlist) || from >= self.playlist_tracks.len() || to >= self.playlist_tracks.len() {
+                    return Task::none();
+                }
+                let track = self.playlist_tracks.remove(from);
+                self.playlist_tracks.insert(to, track.clone());
+                Task::perform(background(move || api::move_in_playlist(&uid, &playlist.kind, &track, from, to, &token)), Message::TrackMoved)
+            }
+        }
+    }
+
+    /// За эту ручку строку перетаскивают.
+    fn grip<'a>(&self, list: DragList, index: usize) -> Element<'a, Message> {
+        mouse_area(container(ui::icon(ui::GRIP, 18.0, ui::MUTED)).padding(6)).on_press(Message::DragStart(list, index)).interaction(mouse::Interaction::Grab).into()
+    }
+
+    /// Строка во время перетаскивания: ловит курсор, взятая строка бледнеет, место, куда трек
+    /// встанет, отмечено линией.
+    fn drag_target<'a>(&self, row: Element<'a, Message>, list: DragList, index: usize) -> Element<'a, Message> {
+        let Some((_, from, over)) = self.drag.filter(|(dragged, _, _)| *dragged == list) else { return row };
+        let row: Element<'a, Message> = if index == from { reveal(row).veil(ui::CONTENT.scale_alpha(0.6)).into() } else { row };
+        let mut layers = stack![mouse_area(row).on_move(move |point| Message::DragOver(index, point.y))];
+        if let Some((_, below)) = over.filter(|(at, below)| *at == index && drop_index(from, *at, *below).is_some()) {
+            let line = container(Space::new()).width(Length::Fill).height(2).style(|_| container::Style::default().background(ui::ACCENT));
+            layers = layers.push(container(line).height(ROW).align_y(if below { Alignment::End } else { Alignment::Start }));
+        }
+        layers.into()
     }
 
     /// Отдаёт Яндексу место в играющем выпуске или книге и запоминает его до конца запуска.
@@ -3438,6 +3500,27 @@ impl App {
                 return Task::batch([iced::clipboard::write(track.share_link()), notice]);
             }
             Message::Unavailable => return self.notify(UNAVAILABLE.to_string()),
+            Message::DragStart(list, index) => {
+                self.drag = Some((list, index, None));
+                DRAGGING.store(true, Ordering::Release);
+            }
+            Message::DragOver(index, y) => {
+                if let Some((_, _, over)) = self.drag.as_mut() {
+                    *over = Some((index, y > ROW / 2.0));
+                }
+            }
+            Message::DragEnd => {
+                DRAGGING.store(false, Ordering::Release);
+                let Some((list, from, Some((at, below)))) = self.drag.take() else { return Task::none() };
+                let Some(to) = drop_index(from, at, below) else { return Task::none() };
+                return self.move_track(list, from, to);
+            }
+            Message::TrackMoved(Ok(())) => {}
+            Message::TrackMoved(Err(e)) => {
+                // Порядок на сервере не поменялся: список перечитывается, чтобы окно не врало.
+                let reload = self.playlist.clone().map_or(Task::none(), |list| self.load_list(list));
+                return Task::batch([self.fail(e), reload]);
+            }
             Message::CrossfadeToggle => {
                 self.crossfade = !self.crossfade;
                 self.save_settings();
@@ -4269,13 +4352,15 @@ impl App {
         line = line.push(self.more_button(track, 18.0));
         if !current {
             line = line.push(glow(button(ui::icon(ui::CLOSE, 16.0, ui::MUTED)).padding(6).style(ui::ghost).on_press(Message::QueueRemove(index)), 20.0));
+            line = line.push(self.grip(DragList::Queue, index));
         }
         let press = match (current, track.unavailable) {
             (true, _) => Message::Toggle,
             (false, true) => Message::Unavailable,
             (false, false) => Message::QueuePlay(index),
         };
-        mouse_area(glow(button(line).width(Length::Fill).height(ROW).padding([8, 8]).style(ui::row).on_press(press), 8.0)).on_right_press(Message::MenuOpen(track.clone())).into()
+        let row = mouse_area(glow(button(line).width(Length::Fill).height(ROW).padding([8, 8]).style(ui::row).on_press(press), 8.0)).on_right_press(Message::MenuOpen(track.clone())).into();
+        if current { row } else { self.drag_target(row, DragList::Queue, index) }
     }
 
     /// Эквалайзер, открытый из трекбара: тот же, что в настройках, пресеты списком.
@@ -5179,11 +5264,17 @@ impl App {
     }
 
     fn view_track<'a>(&'a self, section: Section, index: usize, track: &'a Track) -> Element<'a, Message> {
-        self.view_numbered_row(Message::Play(section, index), track, self.album_place(section, index).map(|(_, number)| number))
+        let number = self.album_place(section, index).map(|(_, number)| number);
+        // Свой плейлист без поиска внутри можно переставлять.
+        if section == Section::Playlists && !self.filtering() && self.playlist.as_ref().is_some_and(|list| self.is_own(list)) {
+            let row = self.view_numbered_row(Message::Play(section, index), track, number, Some(self.grip(DragList::Playlist, index)));
+            return self.drag_target(row, DragList::Playlist, index);
+        }
+        self.view_numbered_row(Message::Play(section, index), track, number, None)
     }
 
     fn view_track_row<'a>(&'a self, play: Message, track: &'a Track) -> Element<'a, Message> {
-        self.view_numbered_row(play, track, None)
+        self.view_numbered_row(play, track, None, None)
     }
 
     /// Открыт альбом без поиска внутри: у трека есть диск и номер на диске, с единицы.
@@ -5200,7 +5291,7 @@ impl App {
     }
 
     /// Строка трека. В альбоме вместо одинаковых обложек стоят номера, как в оригинале.
-    fn view_numbered_row<'a>(&'a self, play: Message, track: &'a Track, number: Option<usize>) -> Element<'a, Message> {
+    fn view_numbered_row<'a>(&'a self, play: Message, track: &'a Track, number: Option<usize>, grip: Option<Element<'a, Message>>) -> Element<'a, Message> {
         let current = self.current_track().is_some_and(|t| t.id == track.id);
         let cover: Element<'_, Message> = if let Some(number) = number {
             let mark: Element<'_, Message> = if current {
@@ -5234,7 +5325,10 @@ impl App {
             let time_color = if track.duration.is_zero() { iced::Color::TRANSPARENT } else { names_color };
             line = line.push(text(clock(track.duration)).color(time_color));
         }
-        let line = line.push(self.more_button(track, 18.0));
+        let mut line = line.push(self.more_button(track, 18.0));
+        if let Some(grip) = grip {
+            line = line.push(grip);
+        }
         mouse_area(glow(button(line).width(Length::Fill).height(ROW).padding([8, 8]).style(ui::row).on_press(play), 8.0)).on_right_press(Message::MenuOpen(track.clone())).into()
     }
 
@@ -5398,6 +5492,14 @@ fn popup<'a>(content: Element<'a, Message>, x: f32, y: f32, width: f32, height: 
         .height(Length::Fill)
         .padding(Padding::new(0.0).left(placed_x).top(placed_y))
         .into()
+}
+
+/// Куда встанет трек, взятый с места `from`, если отпустить его над строкой `at` (выше или
+/// ниже её середины). `None` — трек остаётся на месте.
+fn drop_index(from: usize, at: usize, below: bool) -> Option<usize> {
+    let slot = at + usize::from(below);
+    let to = if slot > from { slot - 1 } else { slot };
+    (to != from).then_some(to)
 }
 
 /// Страница из блоков: главная и книги с подкастами устроены одинаково.
@@ -5668,6 +5770,7 @@ impl PipeMedia for Subscription<Message> {
     fn pipe_media(self) -> Self {
         let back = event::listen_with(|event, status, _| match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Back)) => Some(Message::Back),
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if DRAGGING.load(Ordering::Acquire) => Some(Message::DragEnd),
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Forward)) => Some(Message::Forward),
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 *CURSOR.lock().unwrap() = (position.x, position.y);
@@ -5991,6 +6094,34 @@ fn smoke_quality(query: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Перестановка трека в плейлисте: временный плейлист из трёх треков, первый уезжает в конец,
+/// потом плейлист удаляется.
+fn smoke_move(query: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let uid = api::profile(&token)?.uid;
+    let tracks: Vec<Track> = api::search(query, &token)?.into_iter().take(3).collect();
+    if tracks.len() < 3 {
+        return Err("Нужно три трека".into());
+    }
+    let list = api::create_playlist(&uid, &format!("Проверка Tune {}", random_seed()), &token)?;
+    let result = (|| {
+        for track in &tracks {
+            api::add_to_playlist(&uid, &list.kind, track, &token)?;
+        }
+        let titles = |tracks: Vec<Track>| tracks.into_iter().map(|t| t.title).collect::<Vec<_>>().join(" | ");
+        let before = api::playlist_tracks(&list, &token)?;
+        println!("До:    {}", titles(before.clone()));
+        api::move_in_playlist(&uid, &list.kind, &before[0], 0, 2, &token)?;
+        let after = api::playlist_tracks(&list, &token)?;
+        println!("После: {}", titles(after.clone()));
+        println!("Первый уехал в конец: {}", after.last().map(|t| &t.id) == Some(&before[0].id) && after[0].id == before[1].id);
+        Ok::<(), String>(())
+    })();
+    api::delete_playlist(&uid, &list.kind, &token)?;
+    println!("Временный плейлист удалён");
+    result
+}
+
 /// Переход между двумя найденными треками: старый должен затихнуть и кончиться на своей
 /// точке, новый — играть дальше. Звук выключен.
 fn smoke_crossfade(query: &str) -> Result<(), String> {
@@ -6120,7 +6251,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-crossfade" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-crossfade" || flag == "--smoke-move" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -6130,6 +6261,7 @@ fn main() -> iced::Result {
                 "--smoke-plays" => smoke_plays(),
                 "--smoke-home" => smoke_home(),
             "--smoke-crossfade" => smoke_crossfade(query),
+            "--smoke-move" => smoke_move(query),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
@@ -6232,6 +6364,20 @@ mod lyrics_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drop_lands_where_the_line_is() {
+        // Вниз: над нижней половиной третьей строки — встаёт третьей.
+        assert_eq!(drop_index(0, 2, true), Some(2));
+        assert_eq!(drop_index(0, 2, false), Some(1));
+        // Вверх: над верхней половиной первой строки — встаёт первой.
+        assert_eq!(drop_index(3, 0, false), Some(0));
+        assert_eq!(drop_index(3, 0, true), Some(1));
+        // Рядом с собой — без перестановки.
+        assert_eq!(drop_index(2, 2, true), None);
+        assert_eq!(drop_index(2, 1, true), None);
+        assert_eq!(drop_index(2, 3, false), None);
+    }
 
     #[test]
     fn errors_read_like_words() {
