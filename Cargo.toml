@@ -11,6 +11,8 @@ base64 = "0.23.1"
 ctr = "0.10.1"
 flate2 = "1.1.10"
 hmac = "0.13.0"
+# Та же версия, что внутри iced: обложки распаковываются в фоне, а не во время отрисовки кадра.
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 iced = { version = "0.14.0", default-features = false, features = ["tiny-skia", "smol", "image", "svg", "wgpu", "web-colors", "canvas", "advanced"] }
 raw-window-handle = "0.6"
 rodio = { version = "0.23.0", default-features = false, features = ["playback", "symphonia-mp3", "symphonia-aac", "symphonia-flac", "symphonia-isomp4"] }

@@ -5340,6 +5340,7 @@ dependencies = [
  "flate2",
  "hmac",
  "iced",
+ "image",
  "raw-window-handle",
  "rodio",
  "serde_json",

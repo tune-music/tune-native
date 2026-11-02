@@ -302,7 +302,7 @@ enum Dialog {
 }
 
 /// Вкладка поиска.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SearchTab {
     All,
     Tracks,
@@ -376,6 +376,8 @@ enum Preview {
     Tag(String),
     /// Пустой поиск с недавними запросами; в файл они не пишутся.
     SearchHistory,
+    /// Поиск сам перебирает вкладки: номер следующей.
+    SearchTabs(usize),
     /// Все релизы исполнителя.
     Discography(String),
     /// Первый плейлист в очереди, открыта главная.
@@ -421,6 +423,10 @@ struct App {
     search_tab: SearchTab,
     /// Что уже искали: для вкладок и подсказки.
     searched: bool,
+    /// Уже полученные вкладки текущего запроса: возврат на них не ждёт сети.
+    search_cache: HashMap<(String, SearchTab), Found>,
+    /// Вкладка сменилась, а её результаты ещё в пути: въезжать она будет, когда они придут.
+    search_slide: Option<f32>,
     liked_albums: Vec<Card>,
     liked_artists: Vec<Card>,
     searching: bool,
@@ -602,7 +608,7 @@ enum Message {
     Open(Section),
     Query(String),
     Search,
-    Found(u64, Result<Found, String>),
+    Found(u64, SearchTab, String, Result<Found, String>),
     SearchTyped(u64),
     MenuLyrics,
     TrackInfoLoaded(String, Result<api::TrackDetails, String>),
@@ -647,6 +653,7 @@ enum Message {
     QueueSource,
     PreviewQueueDown,
     PreviewArtistEnd,
+    PreviewSearchTab(usize),
     Frame(Instant),
     QueuePlay(usize),
     QueueRemove(usize),
@@ -667,7 +674,7 @@ enum Message {
     WaveStartSeeds(Vec<String>, Option<String>),
     WaveStarted(bool, Vec<String>, Option<String>, Result<Wave, String>),
     WaveMore(Result<Vec<Track>, String>),
-    Cover(String, Vec<u8>),
+    Cover(String, image::Handle),
     PlaylistsLoaded(Result<Vec<Playlist>, String>),
     PlaylistOpen(usize),
     PinOpen(usize),
@@ -781,6 +788,8 @@ impl App {
             found: Found::default(),
             search_tab: SearchTab::All,
             searched: false,
+            search_cache: HashMap::new(),
+            search_slide: None,
             liked_albums: Vec::new(),
             liked_artists: Vec::new(),
             searching: false,
@@ -1184,12 +1193,26 @@ impl App {
             self.found = Found::default();
             return Task::none();
         }
+        if let Some(found) = self.search_cache.get(&(text.clone(), self.search_tab)).cloned() {
+            self.searching = false;
+            self.search_slide = None;
+            return self.search_show(found);
+        }
         self.searching = true;
         self.error = None;
         let id = self.search_id;
         let tab = self.search_tab;
         let size = if tab == SearchTab::All { SEARCH_ALL } else { SEARCH_TAB };
-        Task::perform(background(move || api::search_mixed(&text, tab.types(), size, &token)), move |r| Message::Found(id, r))
+        let asked = text.clone();
+        Task::perform(background(move || api::search_mixed(&asked, tab.types(), size, &token)), move |r| Message::Found(id, tab, text.clone(), r))
+    }
+
+    fn search_show(&mut self, found: Found) -> Task<Message> {
+        self.results = found.tracks.clone();
+        self.found = found;
+        self.searched = true;
+        self.prune_covers();
+        self.fetch_card_covers(self.found.albums.iter(), self.found.artists.iter(), &self.found.playlists)
     }
 
     /// Экран волны показывает обложку крупно.
@@ -1209,14 +1232,14 @@ impl App {
             let (tx, jobs) = (tx.clone(), jobs.clone());
             std::thread::spawn(move || loop {
                 let Some((id, uri)) = jobs.lock().unwrap().pop() else { break };
-                if let Some(bytes) = api::cover(&uri, size) {
-                    if tx.unbounded_send((id, bytes)).is_err() {
+                if let Some(handle) = api::cover(&uri, size).and_then(|bytes| decoded(&bytes)) {
+                    if tx.unbounded_send((id, handle)).is_err() {
                         break;
                     }
                 }
             });
         }
-        Task::stream(rx).map(|(id, bytes)| Message::Cover(id, bytes))
+        Task::stream(rx).map(|(id, handle)| Message::Cover(id, handle))
     }
 
     /// Обложки остаются только у того, что на экране, рядом с ним и рядом в очереди.
@@ -1227,7 +1250,9 @@ impl App {
         let index = self.current.unwrap_or(0);
         let queue = self.queue.iter().skip(index.saturating_sub(QUEUE_COVERS_AROUND)).take(QUEUE_COVERS_AROUND * 2 + 1);
         let home = self.home.blocks.iter().flat_map(|block| block.tracks.iter().take(HOME_TRACKS));
-        let keep: HashSet<String> = around.chain(queue).chain(home).map(|t| t.id.clone()).collect();
+        // Вкладки поиска, где уже были, возвращаются с обложками, а не с пустыми карточками.
+        let searched = self.search_cache.values().flat_map(|found| found.tracks.iter().take(SEARCH_ALL_TRACKS * 2));
+        let keep: HashSet<String> = around.chain(queue).chain(home).chain(searched).map(|t| t.id.clone()).collect();
         let mut cards: HashSet<String> = HashSet::new();
         let page = self.artist.as_ref();
         cards.extend(self.liked_albums.iter().chain(&self.found.albums).chain(page.into_iter().flat_map(|a| a.albums.iter().chain(&a.also))).map(|c| format!("{ALBUM_COVER}{}", c.id)));
@@ -1237,6 +1262,10 @@ impl App {
         let album_cards = self.album.iter().flat_map(|a| &a.versions).chain(&self.album_others).chain(&self.discography);
         cards.extend(album_cards.map(|c| format!("{ALBUM_COVER}{}", c.id)));
         cards.extend(self.similar.iter().chain(&self.tag_lists).map(home_item_key));
+        for found in self.search_cache.values() {
+            cards.extend(found.albums.iter().map(|c| format!("{ALBUM_COVER}{}", c.id)));
+            cards.extend(found.artists.iter().map(|c| format!("{ARTIST_COVER}{}", c.id)));
+        }
         cards.extend(self.current_track().map(|t| format!("{WAVE_BIG}{}", t.id)));
         cards.extend(page.iter().map(|a| format!("{ARTIST_COVER}{}", a.id)));
         self.covers.retain(|id, _| id == AVATAR_COVER || id.starts_with(PLAYLIST_COVER) || id.starts_with(PIN_COVER_PREFIX) || cards.contains(id) || keep.contains(id));
@@ -1589,6 +1618,9 @@ impl App {
             return iced::exit();
         }
         if let Message::Frame(now) = message {
+            if self.page_veil > 0.0 && std::env::var_os("TUNE_FRAMES").is_some() {
+                eprintln!("кадр {:.1} мс, переход {:.2}", self.last_frame.map_or(0.0, |last| now.duration_since(last).as_secs_f32() * 1000.0), self.page_veil);
+            }
             let elapsed = self.last_frame.map_or(0.0, |last| now.duration_since(last).as_secs_f32()).min(FRAME_LIMIT);
             self.page_veil = (self.page_veil - elapsed / PAGE_FADE).max(0.0);
             self.track_veil = (self.track_veil - elapsed / TRACK_FADE).max(0.0);
@@ -1644,12 +1676,19 @@ impl App {
         if place == self.list_place() {
             let now = self.search_tab as u8;
             if self.section == Section::Search && now != tab {
-                // Вкладка въезжает с той стороны, где стоит.
-                self.page_veil = 1.0;
-                self.page_shift = (if now > tab { TAB_SHIFT } else { -TAB_SHIFT }, 0.0);
-            } else if !ready && self.page_ready() {
-                // Страница дождалась данных: они проявляются, а не выскакивают.
-                self.page_veil = self.page_veil.max(0.85);
+                // Вкладка въезжает с той стороны, где стоит, и сразу готовой:
+                // пока результаты в пути, на месте остаются прежние.
+                let shift = if now > tab { TAB_SHIFT } else { -TAB_SHIFT };
+                if self.searching {
+                    self.search_slide = Some(shift);
+                } else {
+                    self.page_veil = 1.0;
+                    self.page_shift = (shift, 0.0);
+                }
+            } else if !ready && self.page_ready() && self.page_veil == 0.0 {
+                // Страница дождалась данных: они проявляются, а не выскакивают. Если переход
+                // ещё идёт, второй не начинается, иначе страница дёрнется дважды.
+                self.page_veil = 0.85;
                 self.page_shift = (0.0, PAGE_SHIFT / 2.0);
             }
         }
@@ -1781,6 +1820,11 @@ impl App {
                     Some(Preview::Home) => {
                         self.preview = None;
                         self.update(Message::Open(Section::Home))
+                    }
+                    Some(Preview::SearchTabs(_)) => {
+                        self.section = Section::Search;
+                        self.query = "Queen".to_string();
+                        self.update(Message::Search)
                     }
                     Some(Preview::SearchHistory) => {
                         self.preview = None;
@@ -2087,6 +2131,9 @@ impl App {
                 };
             }
             Message::Query(query) => {
+                if query.trim() != self.query.trim() {
+                    self.search_cache.clear();
+                }
                 self.query = query;
                 // Новая буква отменяет поиск, который ещё ждёт паузы.
                 self.search_id += 1;
@@ -2227,22 +2274,28 @@ impl App {
                 let reload = self.liked_pages_load();
                 return Task::batch([reload, self.fail(e)]);
             }
-            Message::Found(id, result) => {
+            Message::Found(id, tab, text, result) => {
                 if id != self.search_id {
                     return Task::none();
                 }
                 self.searching = false;
+                if let Some(shift) = self.search_slide.take() {
+                    self.page_veil = 1.0;
+                    self.page_shift = (shift, 0.0);
+                }
                 match result {
                     Ok(found) => {
-                        self.results = found.tracks.clone();
-                        self.found = found;
-                        self.searched = true;
-                        self.prune_covers();
-                        if matches!(self.preview.take(), Some(Preview::Search(_))) {
-                            self.queue = self.results.clone();
-                            self.current = Some(0).filter(|_| !self.queue.is_empty());
+                        self.search_cache.insert((text, tab), found.clone());
+                        let covers = self.search_show(found);
+                        match self.preview.take() {
+                            Some(Preview::Search(_)) => {
+                                self.queue = self.results.clone();
+                                self.current = Some(0).filter(|_| !self.queue.is_empty());
+                            }
+                            Some(Preview::SearchTabs(step)) => return Task::batch([covers, Task::perform(background(|| std::thread::sleep(Duration::from_millis(1500))), move |()| Message::PreviewSearchTab(step))]),
+                            other => self.preview = other,
                         }
-                        return self.fetch_card_covers(self.found.albums.iter(), self.found.artists.iter(), &self.found.playlists);
+                        return covers;
                     }
                     Err(e) => return self.fail_retry(e, Message::Search),
                 }
@@ -2864,6 +2917,13 @@ impl App {
                     return self.play(index);
                 }
             }
+            Message::PreviewSearchTab(step) => {
+                // Вперёд по всем вкладкам и обратно: второй круг уже из кэша.
+                const ORDER: [usize; 9] = [1, 2, 3, 4, 3, 2, 1, 0, 2];
+                let Some(&tab) = ORDER.get(step - 1) else { return Task::none() };
+                let next = Task::perform(background(|| std::thread::sleep(Duration::from_millis(1500))), move |()| Message::PreviewSearchTab(step + 1));
+                return Task::batch([self.update(Message::SearchTabSet(SearchTab::ALL[tab])), next]);
+            }
             Message::PreviewArtistEnd => return operation::snap_to(Id::new(LIST), scrollable::RelativeOffset::END),
             Message::PreviewQueueDown => {
                 let down = operation::scroll_to(Id::new(LIST), scrollable::AbsoluteOffset { x: 0.0, y: 1200.0 });
@@ -3008,8 +3068,7 @@ impl App {
                     }
                 }
             }
-            Message::Cover(id, bytes) => {
-                let handle = image::Handle::from_bytes(bytes);
+            Message::Cover(id, handle) => {
                 // Крупная обложка заменяет уже видную мелкую, ей проявляться не нужно.
                 if !id.starts_with(WAVE_BIG) {
                     self.cover_fades.insert(handle.id(), 0.0);
@@ -4216,7 +4275,7 @@ impl App {
         }
         let found = &self.found;
         let nothing = found.tracks.is_empty() && found.albums.is_empty() && found.artists.is_empty() && found.playlists.is_empty();
-        let center: Element<'_, Message> = if self.searching {
+        let center: Element<'_, Message> = if self.searching && self.search_slide.is_none() {
             skeleton_list()
         } else if nothing {
             placeholder("Ничего не нашлось", Some("Попробуйте написать иначе"))
@@ -4988,6 +5047,14 @@ impl PipeMedia for Subscription<Message> {
     }
 }
 
+/// Готовые пиксели обложки. Сжатую картинку iced распаковал бы прямо во время кадра,
+/// и при смене страницы с десятком новых обложек анимация спотыкалась бы.
+fn decoded(bytes: &[u8]) -> Option<image::Handle> {
+    let picture = ::image::load_from_memory(bytes).ok()?.into_rgba8();
+    let (width, height) = picture.dimensions();
+    Some(image::Handle::from_rgba(width, height, picture.into_raw()))
+}
+
 /// Клавиши как в официальном клиенте. Буквы берутся по месту на клавиатуре,
 /// поэтому работают и в русской раскладке.
 fn hotkey(key: &keyboard::Key, physical: keyboard::key::Physical, modifiers: keyboard::Modifiers) -> Option<Message> {
@@ -5384,6 +5451,7 @@ fn main() -> iced::Result {
             what if what.starts_with("discography:") => Preview::Discography(what[12..].to_string()),
             what if what.starts_with("tag:") => Preview::Tag(what[4..].to_string()),
             "search-history" => Preview::SearchHistory,
+            "search-tabs" => Preview::SearchTabs(1),
             query => Preview::Search(query.to_string()),
         }),
         _ => None,
