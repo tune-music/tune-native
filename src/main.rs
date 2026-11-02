@@ -175,6 +175,8 @@ const ARTIST_COVER: &str = "artist:";
 const PRELOAD_BEFORE: Duration = Duration::from_secs(30);
 /// Высота шапки страницы очереди: заголовок, играющий трек и «Далее в очереди».
 const QUEUE_HEADER: f32 = 200.0;
+/// За сколько секунд очередь доезжает до начала, когда включили трек ниже.
+const QUEUE_SCROLL: f32 = 0.45;
 /// Подпись источника начинается под заголовком, правее кнопки «назад».
 const QUEUE_SOURCE_INSET: f32 = 48.0;
 const QUEUE_SOURCE_SIZE: f32 = 14.0;
@@ -356,6 +358,8 @@ enum Preview {
     Filter(String),
     /// Сведения о первом треке лайков.
     TrackInfo,
+    /// Очередь, прокрученная вниз, в которой включается трек ниже.
+    QueueJump,
 }
 
 struct App {
@@ -441,6 +445,8 @@ struct App {
     /// Откуда играет очередь, если это не волна.
     queue_title: Option<String>,
     queue_from: QueueFrom,
+    /// Плавный подъём очереди: откуда едем и как далеко прошли, от 0 до 1.
+    queue_scroll: Option<(f32, f32)>,
     /// В очереди треки волны. В режиме просмотра они есть и без сессии.
     wave_queue: bool,
     wave_loading: bool,
@@ -560,6 +566,7 @@ enum Message {
     QualitySet(Quality),
     QueueToggle,
     QueueSource,
+    PreviewQueueDown,
     Frame(Instant),
     QueuePlay(usize),
     QueueRemove(usize),
@@ -708,6 +715,7 @@ impl App {
             wave_pending: None,
             queue_title: None,
             queue_from: QueueFrom::Unknown,
+            queue_scroll: None,
             wave_queue: false,
             wave_loading: false,
             wave_fetching: false,
@@ -760,7 +768,7 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.dialog_fade.busy() || self.notice_fade.busy()
+        self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.dialog_fade.busy() || self.notice_fade.busy()
     }
 
     /// Сколько места занимает основная часть окна.
@@ -1303,8 +1311,9 @@ impl App {
             } else {
                 Task::none()
             };
+            let queue = self.queue_scroll_step(elapsed);
             self.last_frame = Some(now).filter(|_| self.animating());
-            return Task::batch([lyrics, self.visible_covers()]);
+            return Task::batch([lyrics, queue, self.visible_covers()]);
         }
         let place = self.list_place();
         let back = matches!(message, Message::Back);
@@ -1317,6 +1326,7 @@ impl App {
             Task::none()
         } else {
             self.list_offset = 0.0;
+            self.queue_scroll = None;
             self.filter_reset();
             self.page_veil = 1.0;
             self.lyrics_shown = -1.0;
@@ -1445,7 +1455,7 @@ impl App {
                         Task::batch([wave, self.update(Message::DialogOpen(Dialog::WaveTune))])
                     }
                     Some(Preview::WaveSeeded) => self.wave_load(vec!["artist:3121".to_string()], Some(wave_label("artist:3121", "Metallica")), false),
-                    Some(Preview::Likes | Preview::LikesEnd | Preview::Menu | Preview::Panels | Preview::TrackInfo) => self.update(Message::Open(Section::Likes)),
+                    Some(Preview::Likes | Preview::LikesEnd | Preview::Menu | Preview::Panels | Preview::TrackInfo | Preview::QueueJump) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
                     Some(Preview::Playlists | Preview::Playlist | Preview::PlaylistHome) => self.update(Message::Open(Section::Playlists)),
                     Some(Preview::Dislikes) => {
@@ -1846,6 +1856,16 @@ impl App {
                             if let Some(track) = self.liked.first().cloned() {
                                 return self.handle(Message::DialogOpen(Dialog::TrackInfo(track)));
                             }
+                        }
+                        if matches!(self.preview, Some(Preview::QueueJump)) {
+                            self.preview = None;
+                            self.queue = self.liked.clone();
+                            self.current = Some(0).filter(|_| !self.queue.is_empty());
+                            self.muted = true;
+                            self.apply_volume();
+                            let page = self.handle(Message::Open(Section::Queue));
+                            let down = Task::perform(background(|| std::thread::sleep(Duration::from_millis(800))), |()| Message::PreviewQueueDown);
+                            return Task::batch([page, down]);
                         }
                         if matches!(self.preview, Some(Preview::Panels)) {
                             self.preview = None;
@@ -2250,6 +2270,11 @@ impl App {
                 self.quality_menu = None;
                 self.save_settings();
             }
+            Message::PreviewQueueDown => {
+                let down = operation::scroll_to(Id::new(LIST), scrollable::AbsoluteOffset { x: 0.0, y: 1200.0 });
+                let press = Task::perform(background(|| std::thread::sleep(Duration::from_secs(1))), |()| Message::QueuePlay(25));
+                return Task::batch([down, press]);
+            }
             Message::QueueSource => {
                 return match self.queue_from.clone() {
                     QueueFrom::Unknown => Task::none(),
@@ -2269,7 +2294,10 @@ impl App {
             }
             Message::QueuePlay(index) => {
                 self.skip_feedback();
-                return self.play(index);
+                let moved = index.saturating_sub(self.current.unwrap_or(index));
+                let task = self.play(index);
+                let scroll = self.queue_scroll_start(moved);
+                return Task::batch([task, scroll]);
             }
             Message::QueueRemove(index) => {
                 self.menu = None;
@@ -2906,6 +2934,24 @@ impl App {
         }
         list = list.push(Space::new().height((total - range.end) as f32 * ROW));
         ui::scroll(list).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).height(Length::Fill).into()
+    }
+
+    /// Включили трек ниже: строки над ним уходят из списка. Оставшиеся сначала стоят на своих
+    /// местах, чтобы ничего не прыгнуло, а потом список плавно едет к началу.
+    fn queue_scroll_start(&mut self, moved: usize) -> Task<Message> {
+        let from = (self.list_offset - moved as f32 * ROW).max(0.0);
+        self.list_offset = from;
+        self.queue_scroll = Some((from, 0.0));
+        operation::scroll_to(Id::new(LIST), scrollable::AbsoluteOffset { x: 0.0, y: from })
+    }
+
+    fn queue_scroll_step(&mut self, elapsed: f32) -> Task<Message> {
+        let Some((from, passed)) = self.queue_scroll else { return Task::none() };
+        let passed = (passed + elapsed / QUEUE_SCROLL).min(1.0);
+        self.queue_scroll = (passed < 1.0).then_some((from, passed));
+        let y = from * (1.0 - smooth_step(passed));
+        self.list_offset = y;
+        operation::scroll_to(Id::new(LIST), scrollable::AbsoluteOffset { x: 0.0, y })
     }
 
     /// Откуда играет очередь. Название ведёт обратно к источнику.
@@ -4260,6 +4306,7 @@ fn main() -> iced::Result {
             "likes" => Preview::Likes,
             "likes-end" => Preview::LikesEnd,
             "panels" => Preview::Panels,
+            "queue-jump" => Preview::QueueJump,
             "menu" => Preview::Menu,
             "track-info" => Preview::TrackInfo,
             "collection" => Preview::Collection,
