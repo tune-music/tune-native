@@ -173,6 +173,10 @@ const ARTIST_COVER: &str = "artist:";
 const PRELOAD_BEFORE: Duration = Duration::from_secs(30);
 /// Высота шапки страницы очереди: заголовок, играющий трек и «Далее в очереди».
 const QUEUE_HEADER: f32 = 200.0;
+/// Подпись источника начинается под заголовком, правее кнопки «назад».
+const QUEUE_SOURCE_INSET: f32 = 48.0;
+const QUEUE_SOURCE_SIZE: f32 = 14.0;
+const QUEUE_SOURCE_LABEL: usize = 60;
 const QUALITY_WIDTH: f32 = 250.0;
 const SKELETON_ROWS: usize = 10;
 const SKELETON_BLOCKS: usize = 3;
@@ -250,6 +254,20 @@ enum Section {
 }
 
 /// Окно поверх страницы.
+/// Откуда взята очередь: подпись на её странице и переход обратно.
+#[derive(Clone, Debug, Default)]
+enum QueueFrom {
+    /// Подборка с главной или очередь, восстановленная после запуска.
+    #[default]
+    Unknown,
+    List(Playlist),
+    Artist(String),
+    Likes,
+    History,
+    Dislikes,
+    Search,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Dialog {
     Create,
@@ -420,6 +438,7 @@ struct App {
     wave_pending: Option<String>,
     /// Откуда играет очередь, если это не волна.
     queue_title: Option<String>,
+    queue_from: QueueFrom,
     /// В очереди треки волны. В режиме просмотра они есть и без сессии.
     wave_queue: bool,
     wave_loading: bool,
@@ -532,6 +551,7 @@ enum Message {
     QualityOpen,
     QualitySet(Quality),
     QueueToggle,
+    QueueSource,
     Frame(Instant),
     QueuePlay(usize),
     QueueRemove(usize),
@@ -679,6 +699,7 @@ impl App {
             wave: None,
             wave_pending: None,
             queue_title: None,
+            queue_from: QueueFrom::Unknown,
             wave_queue: false,
             wave_loading: false,
             wave_fetching: false,
@@ -891,6 +912,7 @@ impl App {
         self.wave = None;
         self.wave_pending = None;
         self.queue_title = None;
+        self.queue_from = QueueFrom::Unknown;
         self.wave_title = None;
         self.resume = None;
         self.resume_seek = None;
@@ -996,6 +1018,7 @@ impl App {
         self.session_key = Some(queue_key(&saved.tracks, &saved.title));
         self.queue = saved.tracks;
         self.queue_title = Some(saved.title);
+        self.queue_from = QueueFrom::Unknown;
         self.wave_queue = false;
         self.current = Some(saved.current);
         self.position = saved.position;
@@ -1618,6 +1641,7 @@ impl App {
             Message::HomePlay(block, index) => {
                 if let Some(block) = self.home.blocks.get(block) {
                     let (tracks, title) = (block.tracks.clone(), block.title.clone());
+                    self.queue_from = QueueFrom::Unknown;
                     return self.play_list(tracks, title, index);
                 }
             }
@@ -1810,6 +1834,8 @@ impl App {
                         if matches!(self.preview, Some(Preview::Panels)) {
                             self.preview = None;
                             self.queue = self.liked.clone();
+                            self.queue_title = Some("Мне нравится".to_string());
+                            self.queue_from = QueueFrom::Likes;
                             self.current = Some(20).filter(|i| *i < self.queue.len());
                             return self.update(Message::QueueToggle);
                         }
@@ -2208,6 +2234,17 @@ impl App {
                 self.quality_menu = None;
                 self.save_settings();
             }
+            Message::QueueSource => {
+                return match self.queue_from.clone() {
+                    QueueFrom::Unknown => Task::none(),
+                    QueueFrom::List(list) => self.open_list(list),
+                    QueueFrom::Artist(id) => self.handle(Message::ArtistOpen(id)),
+                    QueueFrom::Likes => self.handle(Message::Open(Section::Likes)),
+                    QueueFrom::History => self.handle(Message::Open(Section::History)),
+                    QueueFrom::Dislikes => self.handle(Message::Open(Section::Dislikes)),
+                    QueueFrom::Search => self.handle(Message::Open(Section::Search)),
+                };
+            }
             Message::QueueToggle => {
                 if self.section == Section::Queue {
                     return self.handle(Message::Back);
@@ -2347,12 +2384,24 @@ impl App {
                 } else {
                     let tracks = self.list(section).to_vec();
                     let title = match section {
-                        Section::Playlists => self.playlist.as_ref().map_or_else(|| "Плейлист".to_string(), |p| p.title.clone()),
+                        Section::Playlists => match (&self.playlist, &self.album) {
+                            (Some(list), Some(album)) if list.title.is_empty() => album.title.clone(),
+                            (Some(list), _) => list.title.clone(),
+                            _ => "Плейлист".to_string(),
+                        },
                         Section::Search => "Поиск".to_string(),
                         Section::Artist => self.artist.as_ref().map_or_else(String::new, |a| a.name.clone()),
                         Section::History => "История".to_string(),
                         Section::Dislikes => "Дизлайки".to_string(),
                         _ => "Мне нравится".to_string(),
+                    };
+                    self.queue_from = match section {
+                        Section::Playlists => self.playlist.clone().map_or(QueueFrom::Unknown, QueueFrom::List),
+                        Section::Artist => self.artist.as_ref().map_or(QueueFrom::Unknown, |artist| QueueFrom::Artist(artist.id.clone())),
+                        Section::Search => QueueFrom::Search,
+                        Section::History => QueueFrom::History,
+                        Section::Dislikes => QueueFrom::Dislikes,
+                        _ => QueueFrom::Likes,
                     };
                     return self.play_list(tracks, title, index);
                 }
@@ -2818,9 +2867,8 @@ impl App {
         let Some((current, track)) = self.current.zip(self.current_track()) else {
             return column![back, placeholder("Очередь пуста", Some("Включите трек, альбом или плейлист"))].spacing(16).height(Length::Fill).into();
         };
-        let source = if self.wave_queue { self.wave_title.as_deref().unwrap_or("Моя волна") } else { self.queue_title.as_deref().unwrap_or_default() };
-        let source = clipped(source, WAVE_LABEL);
-        let title = row![back, text("Сейчас играет").size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None), text(source).color(ui::MUTED).wrapping(Wrapping::None)].spacing(12).align_y(Alignment::Center);
+        let title = row![back, text("Сейчас играет").size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None)].spacing(12).align_y(Alignment::Center);
+        let title = column![title, container(self.view_queue_source()).padding(Padding::ZERO.left(QUEUE_SOURCE_INSET)).width(Length::Fill).clip(true)].spacing(4);
         let next = text("Далее в очереди").size(24).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None);
         let header = container(column![title, self.view_queue_row(current, track), next].spacing(12)).height(QUEUE_HEADER);
         let total = self.row_count(Section::Queue);
@@ -2832,6 +2880,24 @@ impl App {
         }
         list = list.push(Space::new().height((total - range.end) as f32 * ROW));
         ui::scroll(list).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).height(Length::Fill).into()
+    }
+
+    /// Откуда играет очередь. Название ведёт обратно к источнику.
+    fn view_queue_source<'a>(&'a self) -> Element<'a, Message> {
+        let name = if self.wave_queue { self.wave_title.as_deref().unwrap_or("Моя волна") } else { self.queue_title.as_deref().unwrap_or_default() };
+        let name = clipped(name, QUEUE_SOURCE_LABEL);
+        let plain = |label: String| text(label).size(QUEUE_SOURCE_SIZE).color(ui::MUTED).wrapping(Wrapping::None);
+        let link = |label: String| hover_line(text(label).size(QUEUE_SOURCE_SIZE).wrapping(Wrapping::None), ui::MUTED, ui::WHITE, Message::QueueSource);
+        let prefix = match &self.queue_from {
+            _ if self.wave_queue => return plain(name).into(),
+            QueueFrom::Unknown => return plain(name).into(),
+            QueueFrom::Search => return link("из поиска".to_string()).into(),
+            QueueFrom::History => return link("из истории".to_string()).into(),
+            QueueFrom::List(list) if list.source == Source::Album => "из альбома",
+            QueueFrom::List(_) | QueueFrom::Likes | QueueFrom::Dislikes => "из плейлиста",
+            QueueFrom::Artist(_) => "из популярных треков исполнителя",
+        };
+        row![plain(prefix.to_string()), link(name)].spacing(5).into()
     }
 
     fn view_queue_row<'a>(&'a self, index: usize, track: &'a Track) -> Element<'a, Message> {
