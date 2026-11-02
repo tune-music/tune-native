@@ -407,6 +407,8 @@ struct App {
     home_loading: bool,
     /// С какой карточки показан блок главной.
     home_pages: HashMap<usize, usize>,
+    /// Выбранная вкладка в блоках главной, у которых они есть.
+    home_block_tabs: HashMap<usize, usize>,
     found: Found,
     search_tab: SearchTab,
     /// Что уже искали: для вкладок и подсказки.
@@ -601,6 +603,8 @@ enum Message {
     HomeLoaded(usize, Result<Home, String>),
     HomeTab(usize),
     HomePage(usize, bool),
+    /// Вкладка внутри блока главной.
+    HomeBlockTab(usize, usize),
     HomePlay(usize, usize),
     HomeOpen(HomeItem),
     LikedPages(Result<(Vec<Card>, Vec<Card>), String>),
@@ -756,6 +760,7 @@ impl App {
             home_tab: 0,
             home_loading: false,
             home_pages: HashMap::new(),
+            home_block_tabs: HashMap::new(),
             found: Found::default(),
             search_tab: SearchTab::All,
             searched: false,
@@ -1075,6 +1080,7 @@ impl App {
         self.dialog = None;
         self.home = Home::default();
         self.home_pages.clear();
+        self.home_block_tabs.clear();
         self.found = Found::default();
         self.searched = false;
         self.liked_albums.clear();
@@ -1374,6 +1380,7 @@ impl App {
         self.home_tab = tab;
         self.home_loading = true;
         self.home_pages.clear();
+        self.home_block_tabs.clear();
         self.home.blocks.clear();
         self.error = None;
         Task::perform(background(move || api::home(tab, &token)), move |r| Message::HomeLoaded(tab, r))
@@ -2073,6 +2080,14 @@ impl App {
                 }
             }
             Message::HomeTab(tab) => return self.home_load(tab),
+            Message::HomeBlockTab(index, tab) => {
+                let Some(block) = self.home.blocks.get_mut(index) else { return Task::none() };
+                let Some((_, items)) = block.tabs.get(tab) else { return Task::none() };
+                block.items = items.clone();
+                self.home_block_tabs.insert(index, tab);
+                self.home_pages.remove(&index);
+                return self.home_covers();
+            }
             Message::HomePage(index, forward) => {
                 let step = self.cards_in_row();
                 let total = self.home.blocks.get(index).map_or(0, |b| b.items.len());
@@ -4151,6 +4166,13 @@ impl App {
                 head = head.push(arrow(ui::LEFT, shown.start > 0, false)).push(arrow(ui::RIGHT, shown.end < block.items.len(), true));
             }
             let mut body = column![head].spacing(8);
+            if !block.tabs.is_empty() {
+                let chosen = self.home_block_tabs.get(&index).copied().unwrap_or(0);
+                let chips = block.tabs.iter().enumerate().fold(row![].spacing(8), |chips, (at, (title, _))| {
+                    chips.push(shine(button(text(title).size(14)).padding([5, 14]).style(ui::chip(at == chosen)).on_press(Message::HomeBlockTab(index, at)), 16.0))
+                });
+                body = body.push(chips.wrap());
+            }
             if !shown.is_empty() {
                 body = body.push(block.items[shown].iter().fold(row![].spacing(4), |line, item| line.push(self.view_home_item(item))));
             }
@@ -4170,8 +4192,19 @@ impl App {
             HomeItem::Playlist(list) => (&list.title, if list.count > 0 { format!("{} {}", list.count, tracks_word(list.count as usize)) } else { "Плейлист".to_string() }, false),
             HomeItem::Wave { title, .. } => (title, "Волна".to_string(), true),
         };
+        let radius = if round { CARD / 2.0 } else { 8.0 };
+        let color = match item {
+            HomeItem::Wave { color, .. } => color.as_deref().and_then(ui::hex_color),
+            _ => None,
+        };
         let cover: Element<'a, Message> = match self.covers.get(&home_item_key(item)) {
-            Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle)).width(CARD).height(CARD).border_radius(if round { CARD / 2.0 } else { 8.0 }).into(),
+            Some(handle) => {
+                let picture = image(handle.clone()).opacity(self.cover_alpha(handle)).width(CARD).height(CARD).border_radius(radius);
+                match color {
+                    Some(color) => container(picture).style(move |_| container::Style::default().background(color).border(iced::border::rounded(radius))).into(),
+                    None => picture.into(),
+                }
+            }
             None => container(Space::new()).width(CARD).height(CARD).style(if round { ui::avatar } else { ui::tile }).into(),
         };
         let body = column![cover, text(title).font(ui::font_medium()).color(ui::TEXT).wrapping(Wrapping::None), text(subtitle).size(13).color(ui::MUTED).wrapping(Wrapping::None)].spacing(6).width(CARD).clip(true);

@@ -899,7 +899,8 @@ pub enum HomeItem {
     Album(Card),
     Artist(Card),
     Playlist(Playlist),
-    Wave { title: String, seeds: Vec<String>, cover: Option<String> },
+    /// У волны прозрачная картинка: под неё кладётся цвет.
+    Wave { title: String, seeds: Vec<String>, cover: Option<String>, color: Option<String> },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -907,6 +908,8 @@ pub struct HomeBlock {
     pub title: String,
     pub items: Vec<HomeItem>,
     pub tracks: Vec<Track>,
+    /// Вкладки внутри блока («топ», «настроение»…) с их карточками; `items` — выбранная.
+    pub tabs: Vec<(String, Vec<HomeItem>)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -942,7 +945,8 @@ fn parse_playlist_loose(v: &Value, owner: &str) -> Option<Playlist> {
 }
 
 fn parse_home_item(v: &Value) -> Option<HomeItem> {
-    let data = &v["data"];
+    // В блоках волн и «В стиле» карточка лежит сразу, без обёртки data.
+    let data = if v["data"].is_object() { &v["data"] } else { v };
     if data["playlist"].is_object() {
         return parse_home_playlist(&data["playlist"]);
     }
@@ -958,8 +962,10 @@ fn parse_home_item(v: &Value) -> Option<HomeItem> {
     if seeds.is_empty() {
         return None;
     }
-    let cover = data["backgroundImageUrl"].as_str().or(data["imageUrl"].as_str()).or(data["agent"]["cover"]["uri"].as_str()).map(str::to_string).or_else(|| cover_uri(data));
-    Some(HomeItem::Wave { title: data["title"].as_str().or(wave["name"].as_str())?.to_string(), seeds, cover })
+    // Фон у волн общий для всех, поэтому сначала своя картинка волны.
+    let cover = data["compactImageUrl"].as_str().or(data["agent"]["cover"]["uri"].as_str()).or(data["imageUrl"].as_str()).or(data["backgroundImageUrl"].as_str()).map(str::to_string).or_else(|| cover_uri(data));
+    let color = data["colors"]["average"].as_str().or(data["agent"]["cover"]["color"].as_str()).map(str::to_string);
+    Some(HomeItem::Wave { title: data["title"].as_str().or(wave["name"].as_str())?.to_string(), seeds, cover, color })
 }
 
 /// Куда ведёт ссылка на Яндекс Музыку.
@@ -1028,15 +1034,24 @@ fn parse_home_block(title: &str, v: &Value) -> HomeBlock {
     let mut items = Vec::new();
     items.extend(v["newReleases"].as_array().into_iter().flatten().filter_map(parse_release));
     items.extend(v["items"].as_array().into_iter().flatten().filter_map(parse_home_item));
-    for group in ["waves", "inStyleTabs"] {
-        // Вкладки блока пока не показываем: берём первую.
-        items.extend(v[group][0]["items"].as_array().into_iter().flatten().filter_map(parse_home_item));
+    let tabs: Vec<(String, Vec<HomeItem>)> = ["waves", "inStyleTabs"]
+        .iter()
+        .flat_map(|group| v[*group].as_array().into_iter().flatten())
+        .filter_map(|tab| {
+            let cards: Vec<HomeItem> = tab["items"].as_array().into_iter().flatten().filter_map(parse_home_item).collect();
+            Some((tab["title"].as_str().unwrap_or_default().to_string(), cards)).filter(|(_, cards)| !cards.is_empty())
+        })
+        .collect();
+    if let Some((_, first)) = tabs.first() {
+        items.extend(first.iter().cloned());
     }
+    // Одна вкладка — это просто блок, а вкладки без названий не на чем показать.
+    let tabs = if tabs.len() > 1 && tabs.iter().all(|(title, _)| !title.is_empty()) { tabs } else { Vec::new() };
     if v["playlist"].is_object() {
         items.extend(parse_home_playlist(&v["playlist"]));
     }
     let tracks = v["tracks"].as_array().into_iter().flatten().filter_map(|t| parse_track(if t["track"].is_object() { &t["track"] } else { t })).collect();
-    HomeBlock { title: title.to_string(), items, tracks }
+    HomeBlock { title: title.to_string(), items, tracks, tabs }
 }
 
 /// Главная: скелет страницы и все её блоки. Блоки грузятся одновременно, порядок сохраняется.
@@ -1479,6 +1494,20 @@ mod tests {
     }
 
     #[test]
+    fn reads_home_blocks_with_tabs() {
+        let wave = |title: &str| json!({"title": title, "seeds": [format!("mood:{title}")], "backgroundImageUrl": "bg/%%", "compactImageUrl": "own/%%", "colors": {"average": "#d65c5b"}});
+        let v = json!({"waves": [{"title": "топ", "items": [wave("a"), wave("b")]}, {"title": "настроение", "items": [wave("c")]}, {"title": "пусто", "items": []}]});
+        let block = parse_home_block("Волны", &v);
+        assert_eq!(block.tabs.iter().map(|(t, items)| (t.as_str(), items.len())).collect::<Vec<_>>(), vec![("топ", 2), ("настроение", 1)]);
+        assert_eq!(block.items.len(), 2);
+        assert!(matches!(&block.items[0], HomeItem::Wave { title, cover, color, .. } if title == "a" && cover.as_deref() == Some("own/%%") && color.as_deref() == Some("#d65c5b")));
+        let style = json!({"inStyleTabs": [{"title": "Группа", "items": [{"album": {"id": 7, "title": "Альбом", "year": 2020}}]}]});
+        let block = parse_home_block("В стиле", &style);
+        assert!(block.tabs.is_empty());
+        assert!(matches!(&block.items[0], HomeItem::Album(card) if card.id == "7"));
+    }
+
+    #[test]
     fn labels_sound() {
         let info = |codec: &str, bitrate| FileInfo { url: String::new(), key: None, codec: codec.to_string(), bitrate, quality: "nq".to_string() };
         assert_eq!(info("aac-mp4", 256).label(), "AAC, 256 кбит/с");
@@ -1599,7 +1628,7 @@ mod tests {
         ]}}"#;
         let items = parse_similar(&serde_json::from_str(json).unwrap());
         assert_eq!(items.len(), 2);
-        assert!(matches!(&items[0], HomeItem::Wave { title, seeds, cover } if title == "Рок" && seeds == &["playlist:x_1"] && cover.as_deref() == Some("a/%%")));
+        assert!(matches!(&items[0], HomeItem::Wave { title, seeds, cover, .. } if title == "Рок" && seeds == &["playlist:x_1"] && cover.as_deref() == Some("a/%%")));
         assert!(matches!(&items[1], HomeItem::Playlist(list) if list.owner == "103372440" && list.kind == "2311"));
     }
 
