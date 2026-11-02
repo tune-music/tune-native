@@ -41,6 +41,8 @@ pub struct Track {
     pub lyrics: bool,
     /// Пачка волны, из которой пришёл трек.
     pub batch: Option<String>,
+    /// Яндекс не даёт его слушать: нет прав или трек убран.
+    pub unavailable: bool,
 }
 
 impl Track {
@@ -374,6 +376,7 @@ fn parse_track(v: &Value) -> Option<Track> {
         explicit: v["contentWarning"].as_str() == Some("explicit"),
         lyrics: v["lyricsInfo"]["hasAvailableSyncLyrics"].as_bool() == Some(true) || v["lyricsInfo"]["hasAvailableTextLyrics"].as_bool() == Some(true),
         batch: None,
+        unavailable: v["available"].as_bool() == Some(false),
     })
 }
 

@@ -142,6 +142,10 @@ const ARTIST_SEARCH: u32 = 5;
 const PAGE_FADE: f32 = 0.26;
 /// На сколько точек новая страница сдвинута в начале появления.
 const PAGE_SHIFT: f32 = 22.0;
+const UNAVAILABLE: &str = "Трек недоступен для прослушивания";
+/// Подписи и обложка недоступного трека.
+const FAINT: iced::Color = iced::Color { r: 1.0, g: 1.0, b: 1.0, a: 0.3 };
+const UNAVAILABLE_COVER: f32 = 0.35;
 /// Как часто во время звучания уходит промежуточный отчёт о прослушивании.
 const LISTEN_REPORT: f32 = 30.0;
 /// За сколько секунд проявляется содержимое другой вкладки.
@@ -732,6 +736,8 @@ enum Message {
     TrackAdded(String, String, Result<(), String>),
     TrackRemove(Track),
     TrackRemoved(Result<(), String>),
+    /// Нажали на недоступный трек.
+    Unavailable,
     HistoryLoaded(Result<Vec<Track>, String>),
     DislikesLoaded(Result<Vec<Track>, String>),
     LikedLists(Result<Vec<Playlist>, String>),
@@ -1013,13 +1019,14 @@ impl App {
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
+    /// Недоступные треки пропускаются.
     fn next_index(&self) -> Option<usize> {
         let index = self.current?;
-        if index + 1 < self.queue.len() {
-            Some(index + 1)
-        } else {
-            (self.repeat == Repeat::All && !self.wave_queue && !self.queue.is_empty()).then_some(0)
+        let open = |i: &usize| self.queue.get(*i).is_some_and(|track| !track.unavailable);
+        if let Some(next) = (index + 1..self.queue.len()).find(open) {
+            return Some(next);
         }
+        (self.repeat == Repeat::All && !self.wave_queue).then(|| (0..=index).find(open)).flatten()
     }
 
     fn row_count(&self, section: Section) -> usize {
@@ -1393,6 +1400,13 @@ impl App {
     }
 
     fn play(&mut self, index: usize) -> Task<Message> {
+        // На недоступный трек попадают перемешиванием или сменой очереди: играет следующий доступный.
+        if self.queue.get(index).is_some_and(|track| track.unavailable) {
+            return match (index + 1..self.queue.len()).find(|&i| !self.queue[i].unavailable) {
+                Some(next) => self.play(next),
+                None => self.notify(UNAVAILABLE.to_string()),
+            };
+        }
         let (Some(player), Some(token), Some(track)) = (self.player.clone(), self.token(), self.queue.get(index).cloned()) else {
             return Task::none();
         };
@@ -3127,6 +3141,7 @@ impl App {
                 let notice = self.notify("Ссылка на трек скопирована".to_string());
                 return Task::batch([iced::clipboard::write(track.share_link()), notice]);
             }
+            Message::Unavailable => return self.notify(UNAVAILABLE.to_string()),
             Message::NoticeClear(id) => {
                 if self.notice.as_ref().is_some_and(|(current, _)| *current == id) {
                     self.notice = None;
@@ -3258,10 +3273,10 @@ impl App {
                     self.seeking = Some(0.0);
                     return self.update(Message::SeekDone);
                 }
-                if let Some(i) = self.current.filter(|i| *i > 0) {
+                if let Some(i) = self.current.and_then(|i| (0..i).rev().find(|&at| !self.queue[at].unavailable)) {
                     self.skip_feedback();
                     self.change_reason = Some("back_skip");
-                    return self.play(i - 1);
+                    return self.play(i);
                 }
             }
             Message::Tick => {
@@ -4730,7 +4745,7 @@ impl App {
             let mark: Element<'_, Message> = if current {
                 ui::icon(if self.is_playing() { ui::PAUSE } else { ui::PLAY }, 22.0, ui::ACCENT)
             } else {
-                text(number.to_string()).color(ui::MUTED).into()
+                text(number.to_string()).color(if track.unavailable { FAINT } else { ui::MUTED }).into()
             };
             container(mark).center(COVER).into()
         } else if current {
@@ -4739,20 +4754,23 @@ impl App {
         } else {
             self.cover(track, COVER)
         };
+        let (title_color, names_color) = if track.unavailable { (ui::MUTED, FAINT) } else { (ui::WHITE, ui::MUTED) };
         let names: Element<'a, Message> = if track.artist_list.is_empty() {
-            text(&track.artists).color(ui::MUTED).wrapping(Wrapping::None).into()
+            text(&track.artists).color(names_color).wrapping(Wrapping::None).into()
         } else {
-            artist_links(&track.artist_list, 16.0, ui::font(), ui::MUTED).into()
+            artist_links(&track.artist_list, 16.0, ui::font(), names_color).into()
         };
+        let play = if track.unavailable { Message::Unavailable } else { play };
         let mut line = row![
             cover,
-            column![track_title(track, 16.0, ui::font_medium(), ui::WHITE), names].width(Length::Fill).clip(true),
+            column![track_title(track, 16.0, ui::font_medium(), title_color), names].width(Length::Fill).clip(true),
             self.like_button(track, 20.0),
         ]
         .spacing(12)
         .align_y(Alignment::Center);
-        if self.main_width() >= TRACK_TIME_WIDTH {
-            line = line.push(text(clock(track.duration)).color(ui::MUTED));
+        // У недоступных треков Яндекс длительности не присылает: пустое место лучше «00:00».
+        if self.main_width() >= TRACK_TIME_WIDTH && !track.duration.is_zero() {
+            line = line.push(text(clock(track.duration)).color(names_color));
         }
         let line = line.push(self.more_button(track, 18.0));
         mouse_area(glow(button(line).width(Length::Fill).height(ROW).padding([8, 8]).style(ui::row).on_press(play), 8.0)).on_right_press(Message::MenuOpen(track.clone())).into()
@@ -4793,8 +4811,9 @@ impl App {
     }
 
     fn cover<'a>(&'a self, track: &Track, size: f32) -> Element<'a, Message> {
+        let dim = if track.unavailable { UNAVAILABLE_COVER } else { 1.0 };
         match self.covers.get(&track.id) {
-            Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle)).width(size).height(size).border_radius(6).into(),
+            Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle) * dim).width(size).height(size).border_radius(6).into(),
             None => container(Space::new()).width(size).height(size).style(ui::tile).into(),
         }
     }

@@ -36,6 +36,7 @@ fn track_value(track: &Track) -> Value {
         "artistList": track.artist_list,
         "explicit": track.explicit,
         "lyrics": track.lyrics,
+        "unavailable": track.unavailable,
     })
 }
 
@@ -52,6 +53,7 @@ fn track_from(v: &Value) -> Option<Track> {
         explicit: v["explicit"].as_bool().unwrap_or(false),
         lyrics: v["lyrics"].as_bool().unwrap_or(false),
         batch: None,
+        unavailable: v["unavailable"].as_bool().unwrap_or(false),
     })
 }
 
@@ -147,6 +149,7 @@ mod tests {
             explicit: true,
             lyrics: true,
             batch: None,
+            unavailable: false,
         }
     }
 
