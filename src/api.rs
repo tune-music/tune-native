@@ -1185,6 +1185,57 @@ pub fn create_playlist(uid: &str, title: &str, token: &str) -> Result<Playlist, 
     parse_playlist(result(&v), uid).ok_or_else(|| "Яндекс не создал плейлист".to_string())
 }
 
+/// Самая большая картинка, которую Яндекс берёт в обложку: больше — уменьшается здесь.
+const COVER_SIDE_MAX: u32 = 2000;
+/// Предел размера файла обложки, как в официальном клиенте.
+const COVER_BYTES_MAX: usize = 20_000_000;
+
+/// Картинка для обложки: JPEG и PNG как есть, слишком большая — уменьшенная копия в JPEG.
+pub fn cover_file(path: &std::path::Path) -> Result<(Vec<u8>, &'static str), String> {
+    let bytes = std::fs::read(path).map_err(|_| "Не удалось прочитать картинку".to_string())?;
+    let format = image::guess_format(&bytes).map_err(|_| "Это не картинка JPEG или PNG".to_string())?;
+    let mime = match format {
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::Png => "image/png",
+        _ => return Err("Обложкой может быть только картинка JPEG или PNG".into()),
+    };
+    let picture = image::load_from_memory(&bytes).map_err(|_| "Картинка повреждена".to_string())?;
+    if picture.width().max(picture.height()) <= COVER_SIDE_MAX && bytes.len() <= COVER_BYTES_MAX {
+        return Ok((bytes, mime));
+    }
+    let smaller = picture.resize(COVER_SIDE_MAX, COVER_SIDE_MAX, image::imageops::FilterType::Triangle).to_rgb8();
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90).encode_image(&smaller).map_err(|e| e.to_string())?;
+    Ok((out, "image/jpeg"))
+}
+
+/// Ставит картинку обложкой своего плейлиста. Вернёт адрес новой обложки.
+pub fn upload_cover(uid: &str, kind: &str, bytes: Vec<u8>, mime: &str, token: &str) -> Result<Option<String>, String> {
+    let boundary = format!("----tune{}", random_bits());
+    let extension = if mime == "image/png" { "png" } else { "jpg" };
+    let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"cover.{extension}\"\r\nContent-Type: {mime}\r\n\r\n").into_bytes();
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    forget_cache();
+    let resp = agent()
+        .post(format!("{API}/users/{uid}/playlists/{kind}/cover/upload"))
+        .header("Authorization", &format!("OAuth {token}"))
+        .header("X-Yandex-Music-Client", CLIENT)
+        .header("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
+        .send(&body[..])
+        .map_err(|e| format!("Не удалось связаться с Яндексом: {e}"))?;
+    let status = resp.status().as_u16();
+    if status == 401 {
+        return Err(NEED_LOGIN.into());
+    }
+    let text = resp.into_body().read_to_string().map_err(|e| e.to_string())?;
+    if status != 200 {
+        return Err(format!("Яндекс ответил {status}"));
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|_| "Яндекс прислал непонятный ответ".to_string())?;
+    Ok(result(&v)["cover"]["uri"].as_str().map(str::to_string))
+}
+
 pub fn rename_playlist(uid: &str, kind: &str, title: &str, token: &str) -> Result<(), String> {
     post(&format!("users/{uid}/playlists/{kind}/name?value={}", encode(title)), "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
 }

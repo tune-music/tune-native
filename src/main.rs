@@ -10,6 +10,7 @@ mod player;
 mod seek;
 mod session;
 mod crossfade;
+mod pick;
 mod equalizer;
 mod settings;
 mod ui;
@@ -473,6 +474,8 @@ struct App {
     home_page: Section,
     /// Последняя открытая вкладка главной и книг с подкастами.
     landing_tabs: [usize; 2],
+    /// Окно приложения: к нему привязываются системные окна.
+    hwnd: Option<isize>,
     /// Перетаскивание: список, откуда взят трек, и над какой строкой он сейчас (ниже ли середины).
     drag: Option<(DragList, usize, Option<(usize, bool)>)>,
     /// Где остановились в выпусках и книгах за этот запуск: свежее ответа сервера.
@@ -822,6 +825,10 @@ enum Message {
     /// Эквалайзер: открыть из трекбара, включить, выбрать пресет, сдвинуть полосу или предусиление, отпустить ползунок.
     EqOpen,
     /// Перетаскивание трека: взяли за ручку, курсор над строкой (номер и высота в ней), отпустили.
+    /// Своя обложка плейлиста: выбрать картинку и загрузить; ответ — адрес новой обложки,
+    /// `None` в нём — окно выбора закрыли.
+    CoverPick(Playlist),
+    CoverUploaded(Playlist, Result<Option<Option<String>>, String>),
     DragStart(DragList, usize),
     DragOver(usize, f32),
     DragEnd,
@@ -903,6 +910,7 @@ impl App {
             progress: HashMap::new(),
             progress_at: None,
             drag: None,
+            hwnd: None,
             home_pages: HashMap::new(),
             home_block_tabs: HashMap::new(),
             found: Found::default(),
@@ -3500,6 +3508,32 @@ impl App {
                 return Task::batch([iced::clipboard::write(track.share_link()), notice]);
             }
             Message::Unavailable => return self.notify(UNAVAILABLE.to_string()),
+            Message::CoverPick(list) => {
+                let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
+                let owner = self.hwnd;
+                let kind = list.kind.clone();
+                return Task::perform(
+                    background(move || {
+                        let Some(path) = pick::image(owner, "Обложка плейлиста") else { return Ok(None) };
+                        let (bytes, mime) = api::cover_file(&path)?;
+                        api::upload_cover(&uid, &kind, bytes, mime, &token).map(Some)
+                    }),
+                    move |result| Message::CoverUploaded(list.clone(), result),
+                );
+            }
+            Message::CoverUploaded(_, Ok(None)) => {}
+            Message::CoverUploaded(list, Ok(Some(uri))) => {
+                // Старая картинка забывается: карточки возьмут новую по свежему списку плейлистов.
+                let key = playlist_cover_key(&list);
+                self.covers.remove(&key);
+                self.requested.borrow_mut().remove(&key);
+                if let Some(open) = self.playlist.as_mut().filter(|open| open.kind == list.kind && open.owner == list.owner) {
+                    open.cover = uri;
+                }
+                self.playlists_loading = false;
+                return Task::batch([self.notify("Обложка обновлена".to_string()), self.playlists_load()]);
+            }
+            Message::CoverUploaded(_, Err(e)) => return self.fail(e),
             Message::DragStart(list, index) => {
                 self.drag = Some((list, index, None));
                 DRAGGING.store(true, Ordering::Release);
@@ -3577,6 +3611,7 @@ impl App {
             }
             Message::WindowSize(size) => *WINDOW.lock().unwrap() = (size.width, size.height),
             Message::WindowReady(hwnd) => {
+                self.hwnd = hwnd;
                 if let Some(hwnd) = hwnd {
                     black_caption(hwnd);
                 }
@@ -4883,7 +4918,8 @@ impl App {
                 let tool = |label, message| shine(button(text(label).color(ui::TEXT)).padding([6, 14]).style(ui::secondary).on_press(message), 24.0);
                 let mut tools = self.page_actions(Section::Playlists, format!("playlist:{}_{}", playlist.owner, playlist.kind), &playlist.title);
                 if self.is_own(playlist) && playlist.title != UPLOADS_TITLE {
-                    tools = tools.push(tool("Переименовать", Message::DialogOpen(Dialog::Rename(playlist.clone())))).push(tool("Описание", Message::DialogOpen(Dialog::Describe(playlist.clone()))));
+                    let cover = if playlist.cover.is_some() { "Изменить обложку" } else { "Добавить обложку" };
+                    tools = tools.push(tool("Переименовать", Message::DialogOpen(Dialog::Rename(playlist.clone())))).push(tool("Описание", Message::DialogOpen(Dialog::Describe(playlist.clone())))).push(tool(cover, Message::CoverPick(playlist.clone())));
                     if let Some(meta) = meta {
                         tools = tools.push(tool(if meta.2 == "private" { "Сделать публичным" } else { "Сделать приватным" }, Message::Visibility(playlist.clone())));
                     }
@@ -6094,6 +6130,28 @@ fn smoke_quality(query: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Обложка плейлиста: временный плейлист получает картинку 3000×3000 (уходит уменьшенной),
+/// потом удаляется.
+fn smoke_cover() -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let uid = api::profile(&token)?.uid;
+    let path = std::env::temp_dir().join("tune-native-cover-check.png");
+    let picture = ::image::RgbImage::from_fn(3000, 3000, |x, y| ::image::Rgb([(x / 12) as u8, (y / 12) as u8, 160]));
+    picture.save(&path).map_err(|e| e.to_string())?;
+    let (bytes, mime) = api::cover_file(&path)?;
+    let side = ::image::load_from_memory(&bytes).map_err(|e| e.to_string())?.width();
+    println!("К загрузке: {mime}, {} КБ, сторона {side}", bytes.len() / 1024);
+    let list = api::create_playlist(&uid, &format!("Проверка Tune {}", random_seed()), &token)?;
+    let result = api::upload_cover(&uid, &list.kind, bytes, mime, &token);
+    let shown = api::playlists(&uid, &token).ok().and_then(|lists| lists.into_iter().find(|p| p.kind == list.kind)).and_then(|p| p.cover);
+    api::delete_playlist(&uid, &list.kind, &token)?;
+    let _ = std::fs::remove_file(path);
+    println!("Яндекс вернул обложку: {:?}", result?);
+    println!("В списке плейлистов: {shown:?}");
+    println!("Временный плейлист удалён");
+    Ok(())
+}
+
 /// Перестановка трека в плейлисте: временный плейлист из трёх треков, первый уезжает в конец,
 /// потом плейлист удаляется.
 fn smoke_move(query: &str) -> Result<(), String> {
@@ -6251,7 +6309,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-crossfade" || flag == "--smoke-move" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -6262,6 +6320,7 @@ fn main() -> iced::Result {
                 "--smoke-home" => smoke_home(),
             "--smoke-crossfade" => smoke_crossfade(query),
             "--smoke-move" => smoke_move(query),
+            "--smoke-cover" => smoke_cover(),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
