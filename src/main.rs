@@ -429,7 +429,7 @@ struct App {
     history_tracks: Vec<Track>,
     history_loading: bool,
     /// Сведения о треке для окна: номер трека и строки. Пока идёт загрузка, строк нет.
-    track_info: Option<(String, Vec<(String, String)>)>,
+    track_info: Option<(String, api::TrackDetails)>,
     /// Поиск внутри открытого плейлиста или лайков.
     filter: String,
     filter_tracks: Vec<Track>,
@@ -590,7 +590,9 @@ enum Message {
     Found(u64, Result<Found, String>),
     SearchTyped(u64),
     MenuLyrics,
-    TrackInfoLoaded(String, Result<Vec<(String, String)>, String>),
+    TrackInfoLoaded(String, Result<api::TrackDetails, String>),
+    /// Включить похожий трек из окна сведений.
+    TrackInfoPlay(usize),
     Filter(String),
     FilterTyped(u64),
     FilterLoaded(u64, Result<Vec<Track>, String>),
@@ -2572,7 +2574,7 @@ impl App {
                     self.dialog = Some(dialog);
                     return Task::perform(background({
                         let id = id.clone();
-                        move || api::credits(&id, &token)
+                        move || api::track_details(&id, &token)
                     }), move |r| Message::TrackInfoLoaded(id.clone(), r));
                 }
                 let focus = !matches!(dialog, Dialog::Delete(_) | Dialog::WaveTune | Dialog::Logout | Dialog::Account);
@@ -2586,6 +2588,12 @@ impl App {
                 if matches!(&self.dialog, Some(Dialog::TrackInfo(track)) if track.id == id) {
                     self.track_info = Some((id, result.unwrap_or_default()));
                 }
+            }
+            Message::TrackInfoPlay(index) => {
+                let Some((_, details)) = &self.track_info else { return Task::none() };
+                let similar = details.similar.clone();
+                self.dialog = None;
+                return self.play_list(similar, "Похожие треки".to_string(), index);
             }
             Message::MenuLyrics => {
                 self.menu = None;
@@ -3287,13 +3295,31 @@ impl App {
         }
         let duration = clock(track.duration);
         rows.push(("Длительность", duration.as_str()));
-        let credits = self.track_info.as_ref().filter(|(id, _)| *id == track.id);
-        rows.extend(credits.into_iter().flat_map(|(_, list)| list.iter().map(|(title, value)| (title.as_str(), value.as_str()))));
+        let details = self.track_info.as_ref().filter(|(id, _)| *id == track.id).map(|(_, details)| details);
+        rows.extend(details.into_iter().flat_map(|details| details.facts.iter().map(|(title, value)| (title.as_str(), value.as_str()))));
         for (title, value) in rows {
             body = body.push(column![text(title.to_string()).size(13).color(ui::MUTED.scale_alpha(alpha)), text(value.to_string()).color(ui::TEXT.scale_alpha(alpha))].spacing(2));
         }
-        if credits.is_none() {
-            body = body.push(text("Загружаем сведения…").color(ui::MUTED.scale_alpha(alpha)));
+        match details {
+            None => body = body.push(text("Загружаем сведения…").color(ui::MUTED.scale_alpha(alpha))),
+            Some(details) if !details.similar.is_empty() => {
+                let similar = details.similar.iter().enumerate().fold(column![].spacing(2), |list, (index, similar)| {
+                    let line = row![
+                        ui::icon(ui::PLAY, 18.0, ui::MUTED.scale_alpha(alpha)),
+                        column![
+                            text(&similar.title).color(ui::TEXT.scale_alpha(alpha)).wrapping(Wrapping::None),
+                            text(&similar.artists).size(13).color(ui::MUTED.scale_alpha(alpha)).wrapping(Wrapping::None),
+                        ]
+                        .width(Length::Fill)
+                        .clip(true),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center);
+                    list.push(glow(button(line).width(Length::Fill).padding([6, 8]).style(ui::row).on_press(Message::TrackInfoPlay(index)), 8.0))
+                });
+                body = body.push(column![text("Похожие треки").size(16).font(ui::font_medium()).color(ui::TEXT.scale_alpha(alpha)), similar].spacing(6));
+            }
+            Some(_) => {}
         }
         // Голова стоит первой: прокрутка занимает остаток, сколько бы ни было авторов.
         let content = column![head, ui::scroll(body).width(Length::Fill).style(ui::scroll_still)].spacing(14);

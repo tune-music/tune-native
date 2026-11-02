@@ -474,8 +474,44 @@ fn parse_credits(v: &Value) -> Vec<(String, String)> {
 }
 
 /// Сведения о треке: исполнитель, авторы, лейбл.
-pub fn credits(id: &str, token: &str) -> Result<Vec<(String, String)>, String> {
-    Ok(parse_credits(&get(&format!("tracks/{id}/credits"), &[], token)?))
+/// Окно «Сведения о треке»: строки сведений и похожие треки.
+#[derive(Clone, Debug, Default)]
+pub struct TrackDetails {
+    pub facts: Vec<(String, String)>,
+    pub similar: Vec<Track>,
+}
+
+/// Русское название жанра по коду из ответа трека, например rock → «Рок».
+fn genre_title(genres: &Value, code: &str) -> Option<String> {
+    let list = genres.as_array()?;
+    list.iter().chain(list.iter().flat_map(|genre| genre["subGenres"].as_array().into_iter().flatten())).find(|genre| genre["id"].as_str() == Some(code)).and_then(|genre| {
+        genre["titles"]["ru"]["title"].as_str().or(genre["title"].as_str()).map(str::to_string)
+    })
+}
+
+fn parse_details(full: &Value, genres: &Value, credits: Vec<(String, String)>) -> TrackDetails {
+    let track = &full["track"];
+    let album = &track["albums"][0];
+    let mut facts = Vec::new();
+    if let Some(genre) = album["genre"].as_str().and_then(|code| genre_title(genres, code)) {
+        facts.push(("Жанр".to_string(), genre));
+    }
+    if let Some(year) = album["year"].as_u64() {
+        facts.push(("Год".to_string(), year.to_string()));
+    }
+    if let Some(version) = track["version"].as_str().map(str::trim).filter(|version| !version.is_empty()) {
+        facts.push(("Издание".to_string(), version.to_string()));
+    }
+    facts.extend(credits);
+    TrackDetails { facts, similar: full["similarTracks"].as_array().into_iter().flatten().filter_map(parse_track).collect() }
+}
+
+/// Авторы — главное в окне, остальное дополняет их и может не прийти.
+pub fn track_details(id: &str, token: &str) -> Result<TrackDetails, String> {
+    let credits = parse_credits(&get(&format!("tracks/{id}/credits"), &[], token)?);
+    let full = get(&format!("tracks/{id}/full-info"), &[], token).map(|v| result(&v).clone()).unwrap_or(Value::Null);
+    let genres = get("genres", &[], token).map(|v| result(&v).clone()).unwrap_or(Value::Null);
+    Ok(parse_details(&full, &genres, credits))
 }
 
 pub fn set_liked(uid: &str, track_id: &str, liked: bool, token: &str) -> Result<(), String> {
@@ -1428,6 +1464,18 @@ mod tests {
         assert_eq!(album.version, "Deluxe");
         assert_eq!(album.labels, vec!["Universal".to_string(), "EMI".to_string()]);
         assert_eq!(album.versions.iter().map(|c| c.subtitle.as_str()).collect::<Vec<_>>(), vec!["Remaster", "1980"]);
+    }
+
+    #[test]
+    fn reads_track_details() {
+        let genres = json!([{"id":"allrock","title":"Rock","titles":{"ru":{"title":"Рок"}},"subGenres":[{"id":"rock","title":"Рок-музыка"}]}]);
+        let full = json!({"track":{"version":"Remastered 2011","albums":[{"genre":"rock","year":1975}]},"similarTracks":[{"id":5,"title":"T"}]});
+        let details = parse_details(&full, &genres, vec![("Исполнитель".into(), "Queen".into())]);
+        let facts: Vec<(&str, &str)> = details.facts.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        assert_eq!(facts, vec![("Жанр", "Рок-музыка"), ("Год", "1975"), ("Издание", "Remastered 2011"), ("Исполнитель", "Queen")]);
+        assert_eq!(details.similar.len(), 1);
+        assert_eq!(genre_title(&genres, "allrock").as_deref(), Some("Рок"));
+        assert!(parse_details(&Value::Null, &Value::Null, Vec::new()).facts.is_empty());
     }
 
     #[test]
