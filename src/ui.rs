@@ -49,7 +49,7 @@ pub fn theme() -> Theme {
     Theme::custom("Tune", Palette { background: BLACK, text: TEXT, primary: ACCENT, success: ACCENT, warning: ACCENT, danger: DANGER })
 }
 
-pub const LYRICS: &str = "M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z";
+pub const LYRICS: &str = "M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-5 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z";
 pub const PLAY: &str = "M8 5v14l11-7z";
 pub const PAUSE: &str = "M6 19h4V5H6v14zm8-14v14h4V5h-4z";
 pub const NEXT: &str = "M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z";
@@ -248,6 +248,14 @@ pub fn link(_: &Theme, status: button::Status) -> button::Style {
 pub fn title_link(color: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, status| match status {
         button::Status::Hovered | button::Status::Pressed => flat(None, if color == ACCENT { WHITE } else { ACCENT }, 0.0),
+        button::Status::Active | button::Status::Disabled => flat(None, color, 0.0),
+    }
+}
+
+/// Строка текста песни: при наведении становится ярче.
+pub fn lyric_line(color: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| match status {
+        button::Status::Hovered | button::Status::Pressed => flat(None, Color { a: color.a.max(0.8), ..WHITE }, 0.0),
         button::Status::Active | button::Status::Disabled => flat(None, color, 0.0),
     }
 }

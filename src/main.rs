@@ -94,7 +94,12 @@ const LIST: &str = "list";
 const TUNE_WIDTH: f32 = 560.0;
 /// Страница текста: размер строк и как быстро она догоняет звучащую строку.
 const LYRICS_SIZE: f32 = 26.0;
-const LYRICS_SPEED: f32 = 7.0;
+const LYRICS_SPEED: f32 = 5.0;
+/// На сколько увеличена звучащая строка и как гаснут остальные с каждой строкой расстояния.
+const LYRICS_GROW: f32 = 0.08;
+const LYRICS_DIM_NEAR: f32 = 0.5;
+const LYRICS_DIM_STEP: f32 = 0.08;
+const LYRICS_DIM_FAR: f32 = 0.16;
 const LYRICS_CHROME: f32 = 300.0;
 /// Как часто запоминать место в треке.
 const SESSION_SAVE: Duration = Duration::from_secs(10);
@@ -428,6 +433,7 @@ struct App {
     lyrics: Option<(String, Option<api::Lyrics>)>,
     lyrics_loading: Option<String>,
     lyrics_line: Option<usize>,
+    /// Где фокус: номер строки, дробный посреди перехода. До первой строки это -1.
     lyrics_shown: f32,
     lyrics_target: f32,
     /// Место в треке после перезапуска: действует, пока трек не запустили.
@@ -658,8 +664,8 @@ impl App {
             lyrics: None,
             lyrics_loading: None,
             lyrics_line: None,
-            lyrics_shown: 0.0,
-            lyrics_target: 0.0,
+            lyrics_shown: -1.0,
+            lyrics_target: -1.0,
             resume: None,
             resume_seek: None,
             session_key: None,
@@ -1183,10 +1189,12 @@ impl App {
             self.notice_fade.step(elapsed);
             let lyrics = if self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target {
                 self.lyrics_shown += (self.lyrics_target - self.lyrics_shown) * (elapsed * LYRICS_SPEED).min(1.0);
-                if (self.lyrics_target - self.lyrics_shown).abs() < 0.0005 {
+                if (self.lyrics_target - self.lyrics_shown).abs() < 0.002 {
                     self.lyrics_shown = self.lyrics_target;
                 }
-                operation::snap_to(Id::new(LIST), scrollable::RelativeOffset { x: 0.0, y: self.lyrics_shown })
+                let count = self.lyrics.as_ref().and_then(|(_, lyrics)| lyrics.as_ref()).map_or(1, |lyrics| lyrics.lines.len().max(1));
+                let y = ((self.lyrics_shown + 0.5) / count as f32).clamp(0.0, 1.0);
+                operation::snap_to(Id::new(LIST), scrollable::RelativeOffset { x: 0.0, y })
             } else {
                 Task::none()
             };
@@ -1205,8 +1213,8 @@ impl App {
         } else {
             self.list_offset = 0.0;
             self.page_veil = 1.0;
-            self.lyrics_shown = 0.0;
-            self.lyrics_target = 0.0;
+            self.lyrics_shown = -1.0;
+            self.lyrics_target = -1.0;
             self.lyrics_line = None;
             let down = back || (self.section as u8) < rank;
             self.page_shift = (0.0, if down { -PAGE_SHIFT } else { PAGE_SHIFT });
@@ -1267,6 +1275,7 @@ impl App {
             Section::Home => !self.home.blocks.is_empty(),
             Section::Wave => self.current_track().is_some(),
             Section::Collection => true,
+            Section::Lyrics => self.lyrics.as_ref().is_some_and(|(id, _)| self.current_track().is_some_and(|track| track.id == *id)),
             Section::Albums => !self.liked_albums.is_empty(),
             Section::Artists => !self.liked_artists.is_empty(),
             Section::Artist => self.artist.is_some(),
@@ -1740,6 +1749,8 @@ impl App {
                     self.lyrics_loading = None;
                 }
                 self.lyrics_line = None;
+                self.lyrics_shown = -1.0;
+                self.lyrics_target = -1.0;
                 return match result {
                     Ok(found) => {
                         self.lyrics = Some((id, found));
@@ -1795,7 +1806,7 @@ impl App {
                         if matches!(self.preview, Some(Preview::Lyrics)) {
                             self.section = Section::Lyrics;
                             self.current = self.queue.iter().position(|track| track.lyrics).or(self.current);
-                            self.position = Duration::from_secs(40);
+                            self.position = Duration::from_secs(70);
                         }
                         if matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded | Preview::Lyrics)) {
                             self.preview = None;
@@ -2461,7 +2472,9 @@ impl App {
             return column![back, placeholder("Сейчас ничего не играет", None)].spacing(16).height(Length::Fill).into();
         };
         let about = column![text(&track.title).size(24).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None), text(&track.artists).color(ui::MUTED).wrapping(Wrapping::None)];
-        let header = row![back, container(about).width(Length::Fill).clip(true)].spacing(12).align_y(Alignment::Center);
+        let about = about.align_x(Alignment::Center);
+        // Пустое место справа равно кнопке слева, чтобы название стояло точно посередине.
+        let header = row![back, container(about).center_x(Length::Fill).clip(true), Space::new().width(36)].spacing(12).align_y(Alignment::Center);
         let found = self.lyrics.as_ref().filter(|(id, _)| *id == track.id);
         let Some(lyrics) = found.and_then(|(_, lyrics)| lyrics.as_ref()) else {
             let label = if found.is_some() { "У этого трека нет текста" } else { "Загружаем текст…" };
@@ -2469,23 +2482,29 @@ impl App {
         };
         // Запас сверху и снизу на половину страницы: первая и последняя строки тоже встают посередине.
         let room = ((WINDOW.lock().unwrap().1 - LYRICS_CHROME) / 2.0).max(0.0);
-        let mut lines = column![Space::new().height(if lyrics.synced() { room } else { 0.0 })].spacing(14).width(Length::Fill).padding(Padding::ZERO.right(SCROLLBAR));
+        let mut lines = column![Space::new().height(if lyrics.synced() { room } else { 0.0 })].spacing(14).width(Length::Fill).align_x(Alignment::Center);
         for (index, (time, words)) in lyrics.lines.iter().enumerate() {
-            let line = text(words).size(LYRICS_SIZE).font(ui::font_headline());
+            let line = text(words).size(LYRICS_SIZE).font(ui::font_headline()).width(Length::Fill).align_x(Alignment::Center);
             let line: Element<'_, Message> = match time {
                 Some(time) => {
-                    let color = if self.lyrics_line == Some(index) { ui::WHITE } else { ui::MUTED };
-                    button(line).padding(0).style(ui::title_link(color)).on_press(Message::LyricsSeek(*time)).into()
+                    // Всё считается от дробного положения фокуса, поэтому переход идёт сам.
+                    let distance = (index as f32 - self.lyrics_shown).abs();
+                    let focus = (1.0 - distance).clamp(0.0, 1.0);
+                    let dim = (LYRICS_DIM_NEAR - LYRICS_DIM_STEP * (distance - 1.0).max(0.0)).max(LYRICS_DIM_FAR);
+                    let color = ui::WHITE.scale_alpha(dim + (1.0 - dim) * focus);
+                    let line = button(line).width(Length::Fill).padding([2, 24]).style(ui::lyric_line(color)).on_press(Message::LyricsSeek(*time));
+                    reveal(line).scale(1.0 + LYRICS_GROW * focus, 0.5, 0.5).into()
                 }
-                None => line.color(ui::TEXT).into(),
+                None => container(line.color(ui::TEXT)).padding([0, 24]).into(),
             };
             lines = lines.push(line);
         }
         if !lyrics.authors.is_empty() {
-            lines = lines.push(text(format!("Авторы: {}", lyrics.authors.join(", "))).size(14).color(ui::MUTED));
+            lines = lines.push(container(text(format!("Авторы: {}", lyrics.authors.join(", "))).size(14).color(ui::MUTED).width(Length::Fill).align_x(Alignment::Center)).padding([0, 24]));
         }
         lines = lines.push(Space::new().height(if lyrics.synced() { room } else { 0.0 }));
-        column![header, scrollable(lines).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).height(Length::Fill)].spacing(16).height(Length::Fill).into()
+        let hidden = scrollable::Direction::Vertical(scrollable::Scrollbar::new().width(0).scroller_width(0));
+        column![header, scrollable(lines).id(LIST).direction(hidden).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).height(Length::Fill)].spacing(16).height(Length::Fill).into()
     }
 
     /// Запрашивает текст, когда открыта его страница и сменился трек.
@@ -2512,7 +2531,7 @@ impl App {
         let Some((_, Some(lyrics))) = self.lyrics.as_ref().filter(|(id, _)| self.current_track().is_some_and(|t| t.id == *id)) else { return };
         let line = lyrics.line_at(self.position.as_secs_f32());
         if line != self.lyrics_line {
-            self.lyrics_target = line.map_or(0.0, |index| (index as f32 + 0.5) / lyrics.lines.len().max(1) as f32);
+            self.lyrics_target = line.map_or(-1.0, |index| index as f32);
             self.lyrics_line = line;
         }
     }
