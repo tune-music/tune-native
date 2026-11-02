@@ -389,6 +389,8 @@ enum Preview {
     SearchFocus,
     /// Лайки прокручиваются, открывается главная и снова лайки: в stderr — где прокрутка.
     ScrollReturn,
+    /// В лайках набирается фильтр по буквам: в stderr — остался ли фокус.
+    FilterFocus,
     /// Все релизы исполнителя.
     Discography(String),
     /// Первый плейлист в очереди, открыта главная.
@@ -678,6 +680,7 @@ enum Message {
     PreviewSearchTab(usize),
     PreviewType(usize),
     PreviewScroll(usize),
+    PreviewFilter(usize),
     PreviewFocused(usize, bool),
     Frame(Instant),
     QueuePlay(usize),
@@ -1969,6 +1972,11 @@ impl App {
                         self.preview = None;
                         self.update(Message::Open(Section::Home))
                     }
+                    Some(Preview::FilterFocus) => {
+                        self.preview = None;
+                        let open = self.update(Message::Open(Section::Likes));
+                        Task::batch([open, Task::perform(background(|| std::thread::sleep(Duration::from_millis(2500))), |()| Message::PreviewFilter(0))])
+                    }
                     Some(Preview::ScrollReturn) => {
                         self.preview = None;
                         let open = self.update(Message::Open(Section::Likes));
@@ -3070,6 +3078,24 @@ impl App {
                     self.preloaded = None;
                     return self.play(index);
                 }
+            }
+            Message::PreviewFilter(step) => {
+                const WORD: &str = "Mary";
+                if step == 0 {
+                    let next = Task::perform(background(|| std::thread::sleep(Duration::from_millis(500))), |()| Message::PreviewFilter(1));
+                    return Task::batch([operation::focus(Id::new(FILTER_INPUT)), next]);
+                }
+                let filter = self.filter.clone();
+                let check = operation::is_focused(Id::new(FILTER_INPUT)).map(move |focused| {
+                    eprintln!("фильтр «{filter}», фокус {focused}");
+                    Message::Frame(Instant::now())
+                });
+                if step > WORD.len() + 2 {
+                    return check;
+                }
+                let typed = if step <= WORD.len() { self.update(Message::Filter(WORD[..step].to_string())) } else { Task::none() };
+                let next = Task::perform(background(|| std::thread::sleep(Duration::from_millis(700))), move |()| Message::PreviewFilter(step + 1));
+                return Task::batch([check, typed, next]);
             }
             Message::PreviewScroll(step) => {
                 eprintln!("шаг {step}: раздел {:?}, прокрутка {:.0}", self.section, self.list_offset);
@@ -4367,11 +4393,14 @@ impl App {
     fn view_filter<'a>(&self) -> Element<'a, Message> {
         let width = if self.main_width() < FILTER_WIDE { FILTER_WIDTH_SMALL } else { FILTER_WIDTH };
         let input = text_input("Поиск по трекам", &self.filter).id(FILTER_INPUT).on_input(Message::Filter).padding(Padding { top: 8.0, right: 34.0, bottom: 8.0, left: 16.0 }).size(14).width(width).style(ui::input);
-        if self.filter.is_empty() {
-            return input.into();
+        // Поле всегда внутри одной и той же стопки: если бы с первой буквой вокруг него
+        // появлялась обёртка, iced пересоздал бы поле и фокус пропал бы.
+        let mut field = stack![input].width(width);
+        if !self.filter.is_empty() {
+            let clear = glow(button(ui::icon(ui::CLOSE, 16.0, ui::MUTED)).padding(4).style(ui::ghost).on_press(Message::Filter(String::new())), 14.0);
+            field = field.push(container(clear).padding(Padding::ZERO.right(8)).align_right(width).height(Length::Fill).align_y(Alignment::Center));
         }
-        let clear = glow(button(ui::icon(ui::CLOSE, 16.0, ui::MUTED)).padding(4).style(ui::ghost).on_press(Message::Filter(String::new())), 14.0);
-        stack![input, container(clear).padding(Padding::ZERO.right(8)).align_right(width).height(Length::Fill).align_y(Alignment::Center)].width(width).into()
+        field.into()
     }
 
     fn view_filter_list<'a>(&'a self, section: Section) -> Element<'a, Message> {
@@ -5705,6 +5734,7 @@ fn main() -> iced::Result {
             "search-tabs" => Preview::SearchTabs(1),
             "search-focus" => Preview::SearchFocus,
             "scroll-return" => Preview::ScrollReturn,
+            "filter-focus" => Preview::FilterFocus,
             query => Preview::Search(query.to_string()),
         }),
         _ => None,
