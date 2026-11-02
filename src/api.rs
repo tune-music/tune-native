@@ -901,6 +901,9 @@ pub enum HomeItem {
     Playlist(Playlist),
     /// У волны прозрачная картинка: под неё кладётся цвет.
     Wave { title: String, seeds: Vec<String>, cover: Option<String>, color: Option<String> },
+    /// Карточки в начале главной: «Мне нравится» со счётчиком и «История» с последними треками.
+    Likes { count: u64, cover: Option<String> },
+    History { subtitle: String, cover: Option<String> },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -966,6 +969,13 @@ fn parse_home_item(v: &Value) -> Option<HomeItem> {
     let cover = data["compactImageUrl"].as_str().or(data["agent"]["cover"]["uri"].as_str()).or(data["imageUrl"].as_str()).or(data["backgroundImageUrl"].as_str()).map(str::to_string).or_else(|| cover_uri(data));
     let color = data["colors"]["average"].as_str().or(data["agent"]["cover"]["color"].as_str()).map(str::to_string);
     Some(HomeItem::Wave { title: data["title"].as_str().or(wave["name"].as_str())?.to_string(), seeds, cover, color })
+}
+
+impl HomeItem {
+    /// Карточка ведёт в раздел приложения, а не на страницу каталога.
+    pub fn is_shortcut(&self) -> bool {
+        matches!(self, HomeItem::Likes { .. } | HomeItem::History { .. })
+    }
 }
 
 /// Куда ведёт ссылка на Яндекс Музыку.
@@ -1050,7 +1060,22 @@ fn parse_home_block(title: &str, v: &Value) -> HomeBlock {
     if v["playlist"].is_object() {
         items.extend(parse_home_playlist(&v["playlist"]));
     }
-    let tracks = v["tracks"].as_array().into_iter().flatten().filter_map(|t| parse_track(if t["track"].is_object() { &t["track"] } else { t })).collect();
+    let favorites = &v["favorites"];
+    if favorites.is_object() {
+        items.push(HomeItem::Likes { count: favorites["count"].as_u64().unwrap_or(0), cover: cover_uri(favorites) });
+    }
+    let history = &v["history"];
+    if history.is_object() {
+        let subtitle = history["subtitleElements"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", ");
+        items.push(HomeItem::History { subtitle, cover: history["trackCovers"][0]["uri"].as_str().map(str::to_string) });
+    }
+    // Чарт лежит глубже: сам плейлист и его треки внутри chart.
+    let chart = &v["chart"];
+    if chart.is_object() {
+        items.extend(parse_home_playlist(chart));
+    }
+    let list = v["tracks"].as_array().or(chart["tracks"].as_array());
+    let tracks = list.into_iter().flatten().filter_map(|t| parse_track(if t["track"].is_object() { &t["track"] } else { t })).collect();
     HomeBlock { title: title.to_string(), items, tracks, tabs }
 }
 
@@ -1076,7 +1101,7 @@ pub fn home(tab: usize, token: &str) -> Result<Home, String> {
                 std::thread::spawn(move || get(&uri, &[], &token).ok().map(|v| parse_home_block(&title, result(&v))))
             })
             .collect();
-        blocks.extend(handles.into_iter().filter_map(|h| h.join().ok().flatten()).filter(|b| !b.title.is_empty() && (!b.items.is_empty() || !b.tracks.is_empty())));
+        blocks.extend(handles.into_iter().filter_map(|h| h.join().ok().flatten()).filter(|b| (!b.title.is_empty() || b.items.iter().all(HomeItem::is_shortcut)) && (!b.items.is_empty() || !b.tracks.is_empty())));
     }
     Ok(Home { tabs: names, blocks })
 }
@@ -1505,6 +1530,23 @@ mod tests {
         let block = parse_home_block("В стиле", &style);
         assert!(block.tabs.is_empty());
         assert!(matches!(&block.items[0], HomeItem::Album(card) if card.id == "7"));
+    }
+
+    #[test]
+    fn reads_chart_block() {
+        let v = json!({"title":"Чарт","chart":{"uid":414787002,"kind":1076,"title":"Чарт","tracks":[{"chartPosition":{"position":1},"track":{"id":"5","title":"Т","durationMs":1}}]}});
+        let block = parse_home_block("Чарт", &v);
+        assert_eq!(block.tracks.len(), 1);
+        assert!(matches!(&block.items[0], HomeItem::Playlist(list) if list.kind == "1076"));
+    }
+
+    #[test]
+    fn reads_likes_and_history_block() {
+        let v = json!({"favorites":{"count":214,"cover":{"uri":"likes/%%"}},"history":{"subtitleElements":["A","B"],"trackCovers":[{"uri":"h/%%"}]}});
+        let block = parse_home_block("", &v);
+        assert!(matches!(&block.items[0], HomeItem::Likes { count: 214, cover } if cover.as_deref() == Some("likes/%%")));
+        assert!(matches!(&block.items[1], HomeItem::History { subtitle, cover } if subtitle == "A, B" && cover.as_deref() == Some("h/%%")));
+        assert!(block.items.iter().all(HomeItem::is_shortcut));
     }
 
     #[test]

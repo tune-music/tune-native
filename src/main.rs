@@ -348,6 +348,8 @@ enum Preview {
     History,
     Dialog,
     Home,
+    /// Вторая вкладка главной.
+    HomeTrends,
     Wave,
     /// Главная с перемоткой в самом начале трека.
     WaveSeek,
@@ -1749,6 +1751,11 @@ impl App {
                         self.preview = None;
                         self.update(Message::Open(Section::Home))
                     }
+                    Some(Preview::HomeTrends) => {
+                        self.preview = None;
+                        self.section = Section::Home;
+                        self.update(Message::HomeTab(1))
+                    }
                     Some(Preview::SimilarOf(list)) => {
                         self.preview = None;
                         self.preview_end = true;
@@ -2106,6 +2113,8 @@ impl App {
                 HomeItem::Artist(card) => return self.update(open_artist(&card)),
                 HomeItem::Playlist(list) => return self.open_list(list),
                 HomeItem::Wave { seeds, title, .. } => return self.update(Message::WaveStartSeeds(seeds, Some(title))),
+                HomeItem::Likes { .. } => return self.update(Message::Open(Section::Likes)),
+                HomeItem::History { .. } => return self.update(Message::Open(Section::History)),
             },
             Message::LikedPages(Ok((albums, artists))) => {
                 self.liked_albums = albums;
@@ -4165,7 +4174,7 @@ impl App {
                 let arrow = |icon, active: bool, forward| glow(button(ui::icon(icon, 22.0, if active { ui::TEXT } else { ui::CONTROL_HOVER })).padding(5).style(ui::ghost).on_press_maybe(active.then_some(Message::HomePage(index, forward))), 20.0);
                 head = head.push(arrow(ui::LEFT, shown.start > 0, false)).push(arrow(ui::RIGHT, shown.end < block.items.len(), true));
             }
-            let mut body = column![head].spacing(8);
+            let mut body = if block.title.is_empty() { column![] } else { column![head] }.spacing(8);
             if !block.tabs.is_empty() {
                 let chosen = self.home_block_tabs.get(&index).copied().unwrap_or(0);
                 let chips = block.tabs.iter().enumerate().fold(row![].spacing(8), |chips, (at, (title, _))| {
@@ -4191,6 +4200,8 @@ impl App {
             HomeItem::Artist(card) => (&card.title, card.subtitle.clone(), true),
             HomeItem::Playlist(list) => (&list.title, if list.count > 0 { format!("{} {}", list.count, tracks_word(list.count as usize)) } else { "Плейлист".to_string() }, false),
             HomeItem::Wave { title, .. } => (title, "Волна".to_string(), true),
+            HomeItem::Likes { count, .. } => ("Мне нравится", format!("{count} {}", tracks_word(*count as usize)), false),
+            HomeItem::History { subtitle, .. } => ("История", if subtitle.is_empty() { "Недавно прослушанное".to_string() } else { subtitle.clone() }, false),
         };
         let radius = if round { CARD / 2.0 } else { 8.0 };
         let color = match item {
@@ -4670,6 +4681,8 @@ fn home_item_key(item: &HomeItem) -> String {
         HomeItem::Artist(card) => format!("{ARTIST_COVER}{}", card.id),
         HomeItem::Playlist(list) => playlist_cover_key(list),
         HomeItem::Wave { title, .. } => format!("{WAVE_CARD}{title}"),
+        HomeItem::Likes { .. } => format!("{WAVE_CARD}:likes"),
+        HomeItem::History { .. } => format!("{WAVE_CARD}:history"),
     }
 }
 
@@ -4677,7 +4690,7 @@ fn home_item_cover(item: &HomeItem) -> Option<String> {
     match item {
         HomeItem::Album(card) | HomeItem::Artist(card) => card.cover.clone(),
         HomeItem::Playlist(list) => list.cover.clone(),
-        HomeItem::Wave { cover, .. } => cover.clone(),
+        HomeItem::Wave { cover, .. } | HomeItem::Likes { cover, .. } | HomeItem::History { cover, .. } => cover.clone(),
     }
 }
 
@@ -5228,6 +5241,7 @@ fn main() -> iced::Result {
         [_, flag, what] if flag == "--preview" => Some(match what.as_str() {
             "wave" => Preview::Wave,
             "home" => Preview::Home,
+            "home-trends" => Preview::HomeTrends,
             "history" => Preview::History,
             "dislikes" => Preview::Dislikes,
             "dialog" => Preview::Dialog,
