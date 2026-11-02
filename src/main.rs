@@ -24,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use iced::futures::channel::{mpsc, oneshot};
 use iced::widget::text::Wrapping;
 use iced::keyboard;
-use iced::widget::{button, canvas, column, container, image, mouse_area, operation, row, scrollable, stack, text, text_input, vertical_slider, Id, Space};
+use iced::widget::{button, canvas, column, container, image, mouse_area, operation, pick_list, row, scrollable, stack, text, text_input, vertical_slider, Id, Space};
 use anim::{hover_line, reveal, smooth, Fade};
 use glow::{glow, shine};
 use iced::{event, mouse, time, window, Alignment, Event, Element, Length, Padding, Size, Subscription, Task};
@@ -159,6 +159,12 @@ const DIALOG_OPEN: f32 = 0.2;
 const FULL_CHROME: f32 = 330.0;
 /// Высота ползунков эквалайзера.
 const EQ_HEIGHT: f32 = 150.0;
+/// Эквалайзер из трекбара: ширина и высота окна, высота ползунков в нём.
+const EQ_POPUP_WIDTH: f32 = 520.0;
+const EQ_POPUP_HEIGHT: f32 = 336.0;
+/// Насколько выше точки клика по кнопке кончается окно эквалайзера, чтобы не закрывать трекбар.
+const EQ_POPUP_LIFT: f32 = 76.0;
+const EQ_POPUP_SLIDER: f32 = 120.0;
 const FULL_COVER_MAX: f32 = 560.0;
 const FULL_TINT: f32 = 0.55;
 /// Как быстро фон перетекает в цвет обложки нового трека: чем больше, тем короче переход.
@@ -401,6 +407,7 @@ enum Preview {
     ScrollReturn,
     /// Восстановленная очередь и плеер на всё окно.
     Full,
+    EqBar,
     /// Восстановленная очередь на странице волны, без звука.
     WaveRestored,
     /// В лайках набирается фильтр по буквам: в stderr — остался ли фокус.
@@ -563,6 +570,8 @@ struct App {
     forward: Vec<Place>,
     /// Выбор качества открыт в этой точке.
     quality_menu: Option<(f32, f32)>,
+    /// Эквалайзер из трекбара открыт в этой точке.
+    eq_menu: Option<(f32, f32)>,
     /// Что ещё закрывает новую страницу, от 1 до 0.
     page_veil: f32,
     /// Текущее прослушивание для отчётов `plays`.
@@ -587,6 +596,7 @@ struct App {
     shown_track: Option<String>,
     menu_fade: Fade<(Track, f32, f32, bool, bool)>,
     quality_fade: Fade<(f32, f32)>,
+    eq_fade: Fade<(f32, f32)>,
     dialog_fade: Fade<Dialog>,
     /// Плеер на всё окно: открыт ли и как далеко выехал.
     player_full: bool,
@@ -775,7 +785,8 @@ enum Message {
     TrackRemoved(Result<(), String>),
     /// Нажали на недоступный трек.
     Unavailable,
-    /// Эквалайзер: включить, выбрать пресет, сдвинуть полосу или предусиление, отпустить ползунок.
+    /// Эквалайзер: открыть из трекбара, включить, выбрать пресет, сдвинуть полосу или предусиление, отпустить ползунок.
+    EqOpen,
     EqToggle,
     EqPreset(usize),
     EqBand(usize, f32),
@@ -930,6 +941,7 @@ impl App {
             unhold: false,
             forward: Vec::new(),
             quality_menu: None,
+            eq_menu: None,
             page_veil: 0.0,
             listen: None,
             scroll_places: HashMap::new(),
@@ -944,6 +956,7 @@ impl App {
             shown_track: None,
             menu_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
             quality_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
+            eq_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
             dialog_fade: Fade::new(DIALOG_OPEN, DIALOG_CLOSE),
             player_full: false,
             full_fade: Fade::new(FULL_OPEN, FULL_CLOSE),
@@ -990,7 +1003,7 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        self.pin_fade.busy() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy()
+        self.pin_fade.busy() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.eq_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy()
     }
 
     /// Сколько места занимает основная часть окна.
@@ -1225,6 +1238,7 @@ impl App {
         self.retry = None;
         self.unshuffled = None;
         self.quality_menu = None;
+        self.eq_menu = None;
         self.sound = None;
         self.uid = None;
         self.wave = None;
@@ -1806,6 +1820,7 @@ impl App {
             self.menu_fade.step(elapsed);
             self.pin_fade.step(elapsed);
             self.quality_fade.step(elapsed);
+            self.eq_fade.step(elapsed);
             self.dialog_fade.step(elapsed);
             self.full_fade.step(elapsed);
             if self.full_fade.item.is_some() {
@@ -1919,6 +1934,7 @@ impl App {
     fn sync_overlays(&mut self) {
         self.menu_fade.sync(self.menu.as_ref().map(|(track, x, y)| (track.clone(), *x, *y, self.menu_artists, self.menu_lists)));
         self.quality_fade.sync(self.quality_menu);
+        self.eq_fade.sync(self.eq_menu);
         self.pin_fade.sync(self.pin_menu);
         self.dialog_fade.sync(self.dialog.clone());
         self.full_fade.sync(self.player_full.then_some(()));
@@ -2101,6 +2117,12 @@ impl App {
                     Some(Preview::WaveRestored) => {
                         self.preview = None;
                         self.section = Section::Wave;
+                        session::load().map_or(Task::none(), |saved| self.restore(saved))
+                    }
+                    Some(Preview::EqBar) => {
+                        self.preview = None;
+                        let (width, height) = *WINDOW.lock().unwrap();
+                        self.eq_menu = Some(eq_place((width - 200.0, height - 60.0)));
                         session::load().map_or(Task::none(), |saved| self.restore(saved))
                     }
                     Some(Preview::Full) => {
@@ -2942,12 +2964,13 @@ impl App {
             }
             Message::MenuClose => {
                 // Esc сначала закрывает меню и окна, потом плеер на всё окно.
-                if self.menu.is_none() && self.pin_menu.is_none() && self.quality_menu.is_none() && self.dialog.is_none() {
+                if self.menu.is_none() && self.pin_menu.is_none() && self.quality_menu.is_none() && self.eq_menu.is_none() && self.dialog.is_none() {
                     self.player_full = false;
                 }
                 self.menu = None;
                 self.pin_menu = None;
                 self.quality_menu = None;
+                self.eq_menu = None;
                 self.dialog = None;
             }
             Message::MenuArtists => self.menu_artists = true,
@@ -3326,6 +3349,7 @@ impl App {
                 return Task::batch([iced::clipboard::write(track.share_link()), notice]);
             }
             Message::Unavailable => return self.notify(UNAVAILABLE.to_string()),
+            Message::EqOpen => self.eq_menu = Some(eq_place(*CURSOR.lock().unwrap())),
             Message::EqToggle => {
                 self.eq.enabled = !self.eq.enabled;
                 self.eq_apply(true);
@@ -3681,7 +3705,7 @@ impl App {
         if let Some(full) = self.view_full() {
             layers = layers.push(full);
         }
-        if self.menu.is_some() || self.quality_menu.is_some() || self.pin_menu.is_some() {
+        if self.menu.is_some() || self.quality_menu.is_some() || self.eq_menu.is_some() || self.pin_menu.is_some() {
             layers = layers.push(mouse_area(container(Space::new()).width(Length::Fill).height(Length::Fill)).on_press(Message::MenuClose).on_right_press(Message::MenuClose));
         }
         if let Some((track, x, y, artists, lists)) = &self.menu_fade.item {
@@ -3692,6 +3716,9 @@ impl App {
         }
         if let Some((x, y)) = self.quality_fade.item {
             layers = layers.push(self.view_quality(x, y));
+        }
+        if let Some((x, y)) = self.eq_fade.item {
+            layers = layers.push(self.view_eq_popup(x, y));
         }
         if let Some(dialog) = &self.dialog_fade.item {
             layers = layers.push(self.view_dialog(dialog));
@@ -4143,11 +4170,45 @@ impl App {
         mouse_area(glow(button(line).width(Length::Fill).height(ROW).padding([8, 8]).style(ui::row).on_press(press), 8.0)).on_right_press(Message::MenuOpen(track.clone())).into()
     }
 
+    /// Эквалайзер, открытый из трекбара: тот же, что в настройках, пресеты списком.
+    fn view_eq_popup(&self, x: f32, y: f32) -> Element<'_, Message> {
+        let (alpha, live) = (self.eq_fade.shown(), self.eq_fade.live);
+        let eq = self.eq;
+        let head = row![text("Эквалайзер").size(16).font(ui::font_medium()).color(ui::TEXT.scale_alpha(alpha)).width(Length::Fill), view_switch(Some(eq.enabled))].align_y(Alignment::Center);
+        let head = glow(button(head).width(Length::Fill).padding([6, 8]).style(ui::button_faded(ui::row, alpha)).on_press(Message::EqToggle), 8.0);
+        let presets: Vec<Preset> = (0..equalizer::PRESETS.len()).map(Preset).collect();
+        let select = pick_list(presets, Some(Preset(eq.preset)), |preset: Preset| Message::EqPreset(preset.0))
+            .width(Length::Fill)
+            .padding([7, 12])
+            .text_size(14)
+            .style(ui::select_faded(alpha))
+            .menu_style(ui::select_menu);
+        let body = column![head, container(select).padding([0, 8]), self.eq_bands(EQ_POPUP_SLIDER, alpha)].spacing(12);
+        popup(body.into(), x, y, EQ_POPUP_WIDTH, EQ_POPUP_HEIGHT, alpha, live)
+    }
+
+    /// Ползунки эквалайзера: уровень и десять полос с подписями.
+    fn eq_bands(&self, height: f32, alpha: f32) -> Element<'static, Message> {
+        let eq = self.eq;
+        let tint = if eq.enabled { ui::TEXT } else { ui::MUTED }.scale_alpha(alpha);
+        let value_tint = ui::MUTED.scale_alpha(alpha);
+        let column_of = |value: String, slider: Element<'static, Message>, label: String| column![text(value).size(12).color(value_tint), slider, text(label).size(12).color(tint)].spacing(6).align_x(Alignment::Center).width(Length::Fill);
+        let preamp = vertical_slider(equalizer::PREAMP_MIN..=equalizer::PREAMP_MAX, eq.preamp, Message::EqPreamp).step(0.05).height(height).on_release(Message::EqSave).style(ui::eq_slider(eq.enabled, alpha));
+        let mut bands = row![column_of(format!("{:.2}", eq.preamp), preamp.into(), "уровень".to_string())].spacing(4);
+        for (band, frequency) in equalizer::BANDS.iter().enumerate() {
+            let slider = vertical_slider(-equalizer::GAIN_LIMIT..=equalizer::GAIN_LIMIT, eq.gains[band], move |gain| Message::EqBand(band, gain)).step(0.5).height(height).on_release(Message::EqSave).style(ui::eq_slider(eq.enabled, alpha));
+            let label = if *frequency < 1000.0 { format!("{frequency}") } else { format!("{}K", frequency / 1000.0) };
+            bands = bands.push(column_of(format!("{:+}", eq.gains[band]), slider.into(), label));
+        }
+        container(bands).padding([0, 8]).into()
+    }
+
     /// Качество и очередь: кнопки рядом с громкостью.
     fn view_tools<'a>(&self, size: f32, quality: bool) -> Element<'a, Message> {
         let tool = |icon, on: bool, message| glow(button(ui::icon(icon, size, if on { ui::ACCENT } else { ui::MUTED })).padding(4).style(ui::ghost).on_press(message), 20.0);
         let mut tools = row![].spacing(6).align_y(Alignment::Center);
         if quality {
+            tools = tools.push(tool(ui::EQUALIZER, self.eq.enabled, Message::EqOpen));
             tools = tools.push(tool(ui::TUNE, self.quality == Quality::Lossless, Message::QualityOpen));
         }
         if self.current_track().is_some_and(|track| track.lyrics) {
@@ -4443,19 +4504,10 @@ impl App {
         .spacing(16)
         .align_y(Alignment::Center);
         let head = glow(button(head).width(Length::Fill).padding(8).style(ui::row).on_press(Message::EqToggle), 8.0);
-        let tint = if eq.enabled { ui::TEXT } else { ui::MUTED };
-        let column_of = |value: String, slider: Element<'static, Message>, label: String| column![text(value).size(12).color(ui::MUTED), slider, text(label).size(12).color(tint)].spacing(6).align_x(Alignment::Center).width(Length::Fill);
-        let preamp = vertical_slider(equalizer::PREAMP_MIN..=equalizer::PREAMP_MAX, eq.preamp, Message::EqPreamp).step(0.05).height(EQ_HEIGHT).on_release(Message::EqSave).style(ui::eq_slider(eq.enabled));
-        let mut bands = row![column_of(format!("{:.2}", eq.preamp), preamp.into(), "уровень".to_string())].spacing(4);
-        for (band, frequency) in equalizer::BANDS.iter().enumerate() {
-            let slider = vertical_slider(-equalizer::GAIN_LIMIT..=equalizer::GAIN_LIMIT, eq.gains[band], move |gain| Message::EqBand(band, gain)).step(0.5).height(EQ_HEIGHT).on_release(Message::EqSave).style(ui::eq_slider(eq.enabled));
-            let label = if *frequency < 1000.0 { format!("{frequency}") } else { format!("{}K", frequency / 1000.0) };
-            bands = bands.push(column_of(format!("{:+}", eq.gains[band]), slider.into(), label));
-        }
         let presets = equalizer::PRESETS.iter().enumerate().fold(row![].spacing(8), |line, (index, (name, _))| {
             line.push(shine(button(text(*name).size(14)).padding([6, 14]).style(ui::chip(eq.enabled && index == eq.preset)).on_press(Message::EqPreset(index)), 16.0))
         });
-        column![head, container(bands).padding([0, 8]), presets.wrap().vertical_spacing(8)].spacing(16).into()
+        column![head, self.eq_bands(EQ_HEIGHT, 1.0), presets.wrap().vertical_spacing(8)].spacing(16).into()
     }
 
     fn view_collection(&self) -> Element<'_, Message> {
@@ -5167,7 +5219,7 @@ impl App {
         }
 
         let lyrics = if track.lyrics { BAR_TOOL + 6.0 } else { 0.0 };
-        let tools = lyrics + 2.0 * BAR_TOOL + 6.0;
+        let tools = lyrics + 3.0 * BAR_TOOL + 12.0;
         let slider_room = (zone - tools - BAR_VOLUME_ICON - 14.0).clamp(BAR_SLIDER_MIN, BAR_SLIDER_MAX);
         let right = row![self.view_tools(22.0, true), self.view_volume(24.0, Some(slider_room))].spacing(8).align_y(Alignment::Center);
 
@@ -5210,7 +5262,7 @@ fn popup<'a>(content: Element<'a, Message>, x: f32, y: f32, width: f32, height: 
     let origin_x = if placed_x < x { 1.0 } else { 0.0 };
     let origin_y = if placed_y < y { 1.0 } else { 0.0 };
     let body = container(content).width(width).padding(8).style(ui::popover_faded(alpha));
-    container(reveal(body).scale(0.92 + 0.08 * alpha, origin_x, origin_y).inert(!live))
+    container(reveal(anim::block(body)).scale(0.92 + 0.08 * alpha, origin_x, origin_y).inert(!live))
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(Padding::new(0.0).left(placed_x).top(placed_y))
@@ -5587,6 +5639,21 @@ fn view_hotkeys<'a>() -> Element<'a, Message> {
 }
 
 /// Переключатель. Пока значение неизвестно, он блёклый и стоит в положении «выключено».
+/// Эквалайзер встаёт над трекбаром: низ окна над кнопкой, а не поверх неё.
+fn eq_place((x, y): (f32, f32)) -> (f32, f32) {
+    (x, (y - EQ_POPUP_LIFT - EQ_POPUP_HEIGHT).max(8.0))
+}
+
+/// Пресет эквалайзера в выпадающем списке.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Preset(usize);
+
+impl std::fmt::Display for Preset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(equalizer::PRESETS[self.0].0)
+    }
+}
+
 fn view_switch<'a>(state: Option<bool>) -> Element<'a, Message> {
     let on = state == Some(true);
     let (back, front) = if on { (ui::ACCENT, ui::ON_ACCENT) } else { (ui::CONTROL, ui::MUTED) };
@@ -5935,6 +6002,7 @@ fn main() -> iced::Result {
             "search-focus" => Preview::SearchFocus,
             "scroll-return" => Preview::ScrollReturn,
             "full" => Preview::Full,
+            "eq-bar" => Preview::EqBar,
             "wave-restored" => Preview::WaveRestored,
             "filter-focus" => Preview::FilterFocus,
             query => Preview::Search(query.to_string()),

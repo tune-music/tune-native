@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use iced::widget::{button, container, scrollable, slider, svg, text_input, Scrollable};
+use iced::overlay::menu;
+use iced::widget::{button, container, pick_list, scrollable, slider, svg, text_input, Scrollable};
 use iced::{color, Background, Color, Element, Font, Length, Shadow, Theme};
 
 pub const BLACK: Color = color!(0x000000);
@@ -74,6 +75,7 @@ pub const REPEAT: &str = "M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12
 pub const REPEAT_ONE: &str = "M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4zm-4-2V9h-1l-2 1v1h1.5v4H13z";
 pub const SHUFFLE: &str = "M10.59 9.17 5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z";
 pub const VOLUME_OFF: &str = "M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3 3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4 9.91 6.09 12 8.18V4z";
+pub const EQUALIZER: &str = "M10 20h4V4h-4v16zm-6 0h4v-8H4v8zM16 9v11h4V9h-4z";
 pub const QUEUE: &str = "M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18c-.31-.11-.65-.18-1-.18-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V8h3V6h-5z";
 pub const TUNE: &str = "M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z";
 pub const INFO: &str = "M11 7h2v2h-2zm0 4h2v6h-2zm1-9a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 18a8 8 0 1 1 0-16 8 8 0 0 1 0 16z";
@@ -273,8 +275,44 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
 }
 
 /// Ползунок эквалайзера: тонкая дорожка, жёлтая часть от низа до значения. Выключенный — серый.
-pub fn eq_slider(enabled: bool) -> impl Fn(&Theme, slider::Status) -> slider::Style {
-    move |_, status| eq_slider_style(enabled, status)
+pub fn eq_slider(enabled: bool, alpha: f32) -> impl Fn(&Theme, slider::Status) -> slider::Style {
+    move |_, status| {
+        let style = eq_slider_style(enabled, status);
+        let fade = |back: Background| match back {
+            Background::Color(color) => Background::Color(color.scale_alpha(alpha)),
+            other => other,
+        };
+        slider::Style {
+            rail: slider::Rail { backgrounds: (fade(style.rail.backgrounds.0), fade(style.rail.backgrounds.1)), ..style.rail },
+            handle: slider::Handle { background: fade(style.handle.background), ..style.handle },
+        }
+    }
+}
+
+/// Выпадающий список во всплывающем окне посреди появления.
+pub fn select_faded(alpha: f32) -> impl Fn(&Theme, pick_list::Status) -> pick_list::Style {
+    move |_, status| {
+        let back = if matches!(status, pick_list::Status::Active) { CONTROL } else { CONTROL_HOVER };
+        pick_list::Style {
+            text_color: TEXT.scale_alpha(alpha),
+            placeholder_color: MUTED.scale_alpha(alpha),
+            handle_color: MUTED.scale_alpha(alpha),
+            background: Background::Color(back.scale_alpha(alpha)),
+            border: border::rounded(8),
+        }
+    }
+}
+
+/// Раскрытый выпадающий список.
+pub fn select_menu(_: &Theme) -> menu::Style {
+    menu::Style {
+        background: Background::Color(color!(0x1f1f1f)),
+        border: Border { color: CONTROL, width: 1.0, radius: 8.0.into() },
+        text_color: TEXT,
+        selected_text_color: TEXT,
+        selected_background: Background::Color(CONTROL_HOVER),
+        shadow: Shadow::default(),
+    }
 }
 
 fn eq_slider_style(enabled: bool, status: slider::Status) -> slider::Style {
