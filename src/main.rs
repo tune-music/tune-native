@@ -156,7 +156,14 @@ const TRACK_FADE: f32 = 0.3;
 const POPUP_OPEN: f32 = 0.16;
 const POPUP_CLOSE: f32 = 0.1;
 const DIALOG_OPEN: f32 = 0.2;
+/// Плеер на всё окно: место под шапку, название, перемотку и кнопки; предел обложки; насколько темнеет цвет фона.
+const FULL_CHROME: f32 = 330.0;
+const FULL_COVER_MAX: f32 = 560.0;
+const FULL_TINT: f32 = 0.55;
 const DIALOG_CLOSE: f32 = 0.13;
+/// За сколько секунд плеер на всё окно выезжает и уезжает.
+const FULL_OPEN: f32 = 0.32;
+const FULL_CLOSE: f32 = 0.24;
 const NOTICE_OPEN: f32 = 0.22;
 const NOTICE_CLOSE: f32 = 0.18;
 /// Сколько времени самое большее учитывает один кадр: первый кадр страницы бывает долгим.
@@ -389,6 +396,8 @@ enum Preview {
     SearchFocus,
     /// Лайки прокручиваются, открывается главная и снова лайки: в stderr — где прокрутка.
     ScrollReturn,
+    /// Восстановленная очередь и плеер на всё окно.
+    Full,
     /// В лайках набирается фильтр по буквам: в stderr — остался ли фокус.
     FilterFocus,
     /// Все релизы исполнителя.
@@ -572,6 +581,11 @@ struct App {
     menu_fade: Fade<(Track, f32, f32, bool, bool)>,
     quality_fade: Fade<(f32, f32)>,
     dialog_fade: Fade<Dialog>,
+    /// Плеер на всё окно: открыт ли и как далеко выехал.
+    player_full: bool,
+    full_fade: Fade<()>,
+    /// Средний цвет крупной обложки трека: им окрашен фон плеера на всё окно.
+    cover_tints: HashMap<String, iced::Color>,
     notice_fade: Fade<String>,
     /// От чего запущена волна; пусто у обычной Моей волны.
     wave_title: Option<String>,
@@ -752,6 +766,10 @@ enum Message {
     TrackRemoved(Result<(), String>),
     /// Нажали на недоступный трек.
     Unavailable,
+    /// Плеер на всё окно: открыть или закрыть.
+    FullToggle,
+    /// Нажатие мимо кнопок плеера на всё окно не должно доходить до страницы под ним.
+    Swallow,
     /// Ответ, какие треки очереди сейчас можно слушать.
     Availability(Result<Vec<(String, bool)>, String>),
     HistoryLoaded(Result<Vec<Track>, String>),
@@ -912,6 +930,9 @@ impl App {
             menu_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
             quality_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
             dialog_fade: Fade::new(DIALOG_OPEN, DIALOG_CLOSE),
+            player_full: false,
+            full_fade: Fade::new(FULL_OPEN, FULL_CLOSE),
+            cover_tints: HashMap::new(),
             notice_fade: Fade::new(NOTICE_OPEN, NOTICE_CLOSE),
             wave_title: None,
             wave_tuning: saved.wave,
@@ -950,7 +971,7 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        self.pin_fade.busy() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.dialog_fade.busy() || self.notice_fade.busy()
+        self.pin_fade.busy() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.notice_fade.busy()
     }
 
     /// Сколько места занимает основная часть окна.
@@ -1097,7 +1118,7 @@ impl App {
         let list = self.fetch_cover_jobs(jobs, "100x100");
         let similar = if self.section == Section::Playlists { self.similar.iter().filter_map(|item| Some((home_item_key(item), home_item_cover(item)?))).collect() } else { Vec::new() };
         let similar = self.fetch_cover_jobs(similar, "200x200");
-        let big = self.current_track().filter(|_| self.section == Section::Wave).and_then(|t| Some((format!("{WAVE_BIG}{}", t.id), t.cover.clone()?)));
+        let big = self.current_track().filter(|_| self.section == Section::Wave || self.player_full).and_then(|t| Some((format!("{WAVE_BIG}{}", t.id), t.cover.clone()?)));
         let big = self.fetch_cover_jobs(big.into_iter().collect(), "600x600");
         // Играющий трек показан и в плеере, и крупно на главной.
         let current = self.current_track().and_then(|t| Some((t.id.clone(), t.cover.clone()?))).into_iter().collect();
@@ -1751,6 +1772,7 @@ impl App {
             self.pin_fade.step(elapsed);
             self.quality_fade.step(elapsed);
             self.dialog_fade.step(elapsed);
+            self.full_fade.step(elapsed);
             self.notice_fade.step(elapsed);
             let lyrics = if self.section == Section::Lyrics && (self.lyrics_shown != self.lyrics_target || self.lyrics_back < 1.0 || self.page_veil > 0.0) {
                 self.lyrics_shown += (self.lyrics_target - self.lyrics_shown) * (elapsed * LYRICS_SPEED).min(1.0);
@@ -1856,10 +1878,11 @@ impl App {
         self.quality_fade.sync(self.quality_menu);
         self.pin_fade.sync(self.pin_menu);
         self.dialog_fade.sync(self.dialog.clone());
+        self.full_fade.sync(self.player_full.then_some(()));
         self.notice_fade.sync(self.notice.as_ref().map(|(_, text)| text.clone()));
         let track = self.current_track().map(|track| track.id.clone());
         if track != self.shown_track {
-            if self.section == Section::Wave && self.shown_track.is_some() {
+            if (self.section == Section::Wave || self.player_full) && self.shown_track.is_some() {
                 self.track_veil = 1.0;
             }
             self.shown_track = track;
@@ -2031,6 +2054,11 @@ impl App {
                     Some(Preview::Settings) => {
                         self.preview = None;
                         self.update(Message::Open(Section::Settings))
+                    }
+                    Some(Preview::Full) => {
+                        self.preview = None;
+                        self.player_full = true;
+                        session::load().map_or(Task::none(), |saved| self.restore(saved))
                     }
                     Some(Preview::Restored) => {
                         self.preview = None;
@@ -2259,6 +2287,7 @@ impl App {
                 }
             }
             Message::Open(section) => {
+                self.player_full = false;
                 if self.section != section {
                     self.remember();
                 }
@@ -2864,6 +2893,10 @@ impl App {
                 self.menu_lists = false;
             }
             Message::MenuClose => {
+                // Esc сначала закрывает меню и окна, потом плеер на всё окно.
+                if self.menu.is_none() && self.pin_menu.is_none() && self.quality_menu.is_none() && self.dialog.is_none() {
+                    self.player_full = false;
+                }
                 self.menu = None;
                 self.pin_menu = None;
                 self.quality_menu = None;
@@ -3245,6 +3278,8 @@ impl App {
                 return Task::batch([iced::clipboard::write(track.share_link()), notice]);
             }
             Message::Unavailable => return self.notify(UNAVAILABLE.to_string()),
+            Message::FullToggle => self.player_full = !self.player_full && self.current_track().is_some(),
+            Message::Swallow => {}
             Message::Availability(Ok(found)) => {
                 let found: HashMap<String, bool> = found.into_iter().collect();
                 for track in &mut self.queue {
@@ -3284,7 +3319,11 @@ impl App {
             }
             Message::Cover(id, handle) => {
                 // Крупная обложка заменяет уже видную мелкую, ей проявляться не нужно.
-                if !id.starts_with(WAVE_BIG) {
+                if let Some(track) = id.strip_prefix(WAVE_BIG) {
+                    if let Some(tint) = average_color(&handle) {
+                        self.cover_tints.insert(track.to_string(), tint);
+                    }
+                } else {
                     self.cover_fades.insert(handle.id(), 0.0);
                 }
                 self.covers.insert(id, handle);
@@ -3564,6 +3603,9 @@ impl App {
         let columns = row![self.view_sidebar(), main];
         let base = container(columns).width(Length::Fill).height(Length::Fill).style(ui::root);
         let mut layers = stack![base];
+        if let Some(full) = self.view_full() {
+            layers = layers.push(full);
+        }
         if self.menu.is_some() || self.quality_menu.is_some() || self.pin_menu.is_some() {
             layers = layers.push(mouse_area(container(Space::new()).width(Length::Fill).height(Length::Fill)).on_press(Message::MenuClose).on_right_press(Message::MenuClose));
         }
@@ -4155,19 +4197,10 @@ impl App {
             .center(Length::Fill)
             .into();
         };
-        let side = |icon, message| glow(button(ui::icon(icon, 32.0, ui::TEXT)).padding(8).style(ui::ghost).on_press(message), 20.0);
         let space = self.main_width() - 24.0;
         let height = WINDOW.lock().unwrap().1;
         let art = (height - WAVE_CHROME).min(space).clamp(WAVE_COVER_MIN, WAVE_COVER_MAX);
         let line = space.min(WAVE_COLUMN);
-        let name_size = (line / (track.title.chars().count().max(1) as f32 * 0.62)).clamp(20.0, 34.0);
-        let names: Element<'_, Message> = if track.artist_list.is_empty() {
-            text(&track.artists).size(18).color(ui::MUTED).wrapping(Wrapping::None).into()
-        } else {
-            artist_links(&track.artist_list, 18.0, ui::font(), ui::MUTED).into()
-        };
-        let about = column![track_title(track, name_size, ui::font_headline(), ui::WHITE), names].spacing(4).align_x(Alignment::Center);
-        let info = row![self.like_button(track, 24.0), container(about).center_x(Length::Fill).clip(true), self.more_button(track, 22.0)].spacing(12).align_y(Alignment::Center).width(line);
 
         let tuned = settings::wave_names(self.wave_tuning).join(", ");
         let source = if self.wave_queue {
@@ -4190,6 +4223,36 @@ impl App {
             None => text("Моя волна").size(18).font(ui::font_headline()).color(ui::ACCENT).wrapping(Wrapping::None).into(),
         };
 
+        let body = self.player_body(track, art, line, ui::BLACK);
+        let tune: Element<'_, Message> = if self.wave_queue {
+            let tint = if tuned.is_empty() { ui::TEXT } else { ui::ACCENT };
+            shine(button(row![ui::icon(ui::WAVE, 20.0, tint), text("Настроить").color(tint)].spacing(8).align_y(Alignment::Center)).padding([8, 16]).style(ui::secondary).on_press(Message::DialogOpen(Dialog::WaveTune)), 24.0)
+        } else {
+            Space::new().into()
+        };
+        let pin: Element<'_, Message> = if self.wave_queue && self.wave_base != [api::MY_WAVE] {
+            let target = PinRef::Wave(self.wave_base.clone());
+            let pinned = self.pins.iter().any(|pin| target.matches(pin));
+            shine(button(container(ui::icon(ui::PIN, 20.0, if pinned { ui::ACCENT } else { ui::TEXT })).center(20)).padding(9).style(ui::secondary).on_press(Message::Pin(target)), 20.0).into()
+        } else {
+            Space::new().into()
+        };
+        let tools = row![tune, pin, Space::new().width(Length::Fill), self.view_tools(22.0, true), self.view_volume(22.0, Some((space - 130.0).clamp(50.0, 130.0)))].spacing(10).align_y(Alignment::Center);
+        column![container(top).center_x(Length::Fill).padding(Padding::ZERO.top(8)), container(body).center(Length::Fill), tools].height(Length::Fill).into()
+    }
+
+    /// Большой плеер: обложка, название, перемотка и кнопки. Общий у волны и плеера на всё окно.
+    /// `back` — цвет фона, которым на миг закрывается смена трека.
+    fn player_body<'a>(&'a self, track: &'a Track, art: f32, line: f32, back: iced::Color) -> Element<'a, Message> {
+        let side = |icon, message| glow(button(ui::icon(icon, 32.0, ui::TEXT)).padding(8).style(ui::ghost).on_press(message), 20.0);
+        let name_size = (line / (track.title.chars().count().max(1) as f32 * 0.62)).clamp(20.0, 34.0);
+        let names: Element<'_, Message> = if track.artist_list.is_empty() {
+            text(&track.artists).size(18).color(ui::MUTED).wrapping(Wrapping::None).into()
+        } else {
+            artist_links(&track.artist_list, 18.0, ui::font(), ui::MUTED).into()
+        };
+        let about = column![track_title(track, name_size, ui::font_headline(), ui::WHITE), names].spacing(4).align_x(Alignment::Center);
+        let info = row![self.like_button(track, 24.0), container(about).center_x(Length::Fill).clip(true), self.more_button(track, 22.0)].spacing(12).align_y(Alignment::Center).width(line);
         let mode = |icon, on: bool, message| glow(button(ui::icon(icon, 24.0, if on { ui::ACCENT } else { ui::MUTED })).padding(8).style(ui::ghost).on_press(message), 20.0);
         let mut transport = row![].spacing(20).align_y(Alignment::Center);
         if !self.wave_queue {
@@ -4206,8 +4269,8 @@ impl App {
 
         let rest = 1.0 - anim::ease_out(1.0 - self.track_veil);
         let shift = 10.0 * rest;
-        let veil = ui::BLACK.scale_alpha(rest);
-        let body = column![
+        let veil = back.scale_alpha(rest);
+        column![
             reveal(self.wave_cover(track, art)).shift(0.0, shift).veil(veil),
             Space::new().height(20),
             reveal(info).shift(0.0, shift).veil(veil),
@@ -4216,22 +4279,33 @@ impl App {
             Space::new().height(8),
             transport,
         ]
-        .align_x(Alignment::Center);
-        let tune: Element<'_, Message> = if self.wave_queue {
-            let tint = if tuned.is_empty() { ui::TEXT } else { ui::ACCENT };
-            shine(button(row![ui::icon(ui::WAVE, 20.0, tint), text("Настроить").color(tint)].spacing(8).align_y(Alignment::Center)).padding([8, 16]).style(ui::secondary).on_press(Message::DialogOpen(Dialog::WaveTune)), 24.0)
-        } else {
-            Space::new().into()
+        .align_x(Alignment::Center)
+        .into()
+    }
+
+    /// Плеер на всё окно поверх приложения: выезжает снизу, фон в цвет обложки.
+    fn view_full(&self) -> Option<Element<'_, Message>> {
+        self.full_fade.item?;
+        let track = self.current_track()?;
+        let (width, height) = *WINDOW.lock().unwrap();
+        let art = (height - FULL_CHROME).min(width - 48.0).clamp(WAVE_COVER_MIN, FULL_COVER_MAX);
+        let line = (width - 48.0).min(WAVE_COLUMN);
+        let tint = self.cover_tints.get(&track.id).copied().unwrap_or(ui::TILE);
+        // Цвет обложки приглушён, чтобы белый текст читался на любой картинке.
+        let top = iced::Color::from_rgb(tint.r * FULL_TINT, tint.g * FULL_TINT, tint.b * FULL_TINT);
+        let source = if self.wave_queue { self.wave_title.clone().unwrap_or_else(|| "Моя волна".to_string()) } else { self.queue_title.clone().unwrap_or_default() };
+        let collapse = glow(button(ui::icon(ui::COLLAPSE, 32.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::FullToggle), 20.0);
+        let label = text(clipped(&source, WAVE_LABEL)).size(16).font(ui::font_medium()).color(ui::MUTED).wrapping(Wrapping::None);
+        let head = row![collapse, container(label).center_x(Length::Fill), Space::new().width(44)].align_y(Alignment::Center);
+        let tools = row![Space::new().width(Length::Fill), self.view_tools(22.0, true), self.view_volume(22.0, Some(120.0))].spacing(10).align_y(Alignment::Center);
+        let page = column![head, container(self.player_body(track, art, line, top)).center(Length::Fill), tools].padding(24).width(Length::Fill).height(Length::Fill);
+        let back = move |_: &iced::Theme| container::Style {
+            background: Some(iced::Background::Gradient(iced::Gradient::Linear(iced::gradient::Linear::new(iced::Radians(std::f32::consts::PI)).add_stop(0.0, top).add_stop(1.0, ui::BLACK)))),
+            ..container::Style::default()
         };
-        let pin: Element<'_, Message> = if self.wave_queue && self.wave_base != [api::MY_WAVE] {
-            let target = PinRef::Wave(self.wave_base.clone());
-            let pinned = self.pins.iter().any(|pin| target.matches(pin));
-            shine(button(container(ui::icon(ui::PIN, 20.0, if pinned { ui::ACCENT } else { ui::TEXT })).center(20)).padding(9).style(ui::secondary).on_press(Message::Pin(target)), 20.0).into()
-        } else {
-            Space::new().into()
-        };
-        let tools = row![tune, pin, Space::new().width(Length::Fill), self.view_tools(22.0, true), self.view_volume(22.0, Some((space - 130.0).clamp(50.0, 130.0)))].spacing(10).align_y(Alignment::Center);
-        column![container(top).center_x(Length::Fill).padding(Padding::ZERO.top(8)), container(body).center(Length::Fill), tools].height(Length::Fill).into()
+        let shown = self.full_fade.shown();
+        let sheet = mouse_area(container(page).width(Length::Fill).height(Length::Fill).style(back)).on_press(Message::Swallow);
+        Some(reveal(sheet).shift(0.0, height * (1.0 - shown)).inert(!self.player_full).into())
     }
 
     fn view_volume<'a>(&self, icon: f32, width: Option<f32>) -> Element<'a, Message> {
@@ -4986,7 +5060,8 @@ impl App {
                 artist_links(&track.artist_list, size, ui::font(), ui::MUTED.scale_alpha(alpha)).into()
             }
         };
-        let mut about = row![self.cover(track, BAR_COVER)].spacing(12).align_y(Alignment::Center);
+        let cover = button(self.cover(track, BAR_COVER)).padding(0).style(ui::ghost).on_press(Message::FullToggle);
+        let mut about = row![cover].spacing(12).align_y(Alignment::Center);
         if !stacked {
             about = about.push(column![track_title(track, 16.0, ui::font_medium(), ui::WHITE), names(16.0, 1.0)].width(Length::Fill).clip(true));
         }
@@ -5315,6 +5390,20 @@ impl PipeMedia for Subscription<Message> {
 
 /// Готовые пиксели обложки. Сжатую картинку iced распаковал бы прямо во время кадра,
 /// и при смене страницы с десятком новых обложек анимация спотыкалась бы.
+/// Средний цвет картинки по каждой десятой точке: для фона хватает.
+fn average_color(handle: &image::Handle) -> Option<iced::Color> {
+    let image::Handle::Rgba { pixels, .. } = handle else { return None };
+    let (mut sum, mut count) = ([0u64; 3], 0u64);
+    for pixel in pixels.chunks_exact(4).step_by(10) {
+        for (total, value) in sum.iter_mut().zip(pixel) {
+            *total += *value as u64;
+        }
+        count += 1;
+    }
+    let part = |total: u64| (total / count.max(1)) as f32 / 255.0;
+    (count > 0).then(|| iced::Color::from_rgb(part(sum[0]), part(sum[1]), part(sum[2])))
+}
+
 fn decoded(bytes: &[u8]) -> Option<image::Handle> {
     let picture = ::image::load_from_memory(bytes).ok()?.into_rgba8();
     let (width, height) = picture.dimensions();
@@ -5351,6 +5440,7 @@ fn hotkey(key: &keyboard::Key, physical: keyboard::key::Physical, modifiers: key
         Code::KeyD => Message::DislikeCurrent,
         Code::KeyR => Message::RepeatNext,
         Code::KeyS => Message::ShuffleToggle,
+        Code::KeyW => Message::FullToggle,
         _ => return None,
     })
 }
@@ -5517,6 +5607,20 @@ fn smoke_settings() -> Result<(), String> {
     Ok(())
 }
 
+/// Печатает блоки обеих вкладок главной: что из ответа Яндекса дошло до экрана.
+fn smoke_home() -> Result<(), String> {
+    let token = api::load_token().ok_or("нет токена")?;
+    for tab in 0..2 {
+        let home = api::home(tab, &token)?;
+        println!("=== {}", home.tabs.get(tab).cloned().unwrap_or_default());
+        for block in &home.blocks {
+            let kinds: Vec<String> = block.items.iter().take(4).map(|item| format!("{item:?}").split(['{', '(', ' ']).next().unwrap_or_default().to_string()).collect();
+            println!("{} | карточек {} | треков {} | вкладок {} | {}", block.title, block.items.len(), block.tracks.len(), block.tabs.len(), kinds.join(","));
+        }
+    }
+    Ok(())
+}
+
 /// Шлёт стартовый отчёт о прослушивании для трека, на котором остановилась прошлая очередь.
 fn smoke_plays() -> Result<(), String> {
     let token = api::load_token().ok_or("нет токена")?;
@@ -5672,7 +5776,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -5680,6 +5784,7 @@ fn main() -> iced::Result {
                 "--smoke-lyrics" => smoke_lyrics(query),
                 "--smoke-settings" => smoke_settings(),
                 "--smoke-plays" => smoke_plays(),
+                "--smoke-home" => smoke_home(),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
@@ -5734,6 +5839,7 @@ fn main() -> iced::Result {
             "search-tabs" => Preview::SearchTabs(1),
             "search-focus" => Preview::SearchFocus,
             "scroll-return" => Preview::ScrollReturn,
+            "full" => Preview::Full,
             "filter-focus" => Preview::FilterFocus,
             query => Preview::Search(query.to_string()),
         }),
