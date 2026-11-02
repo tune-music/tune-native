@@ -1299,6 +1299,12 @@ mod tests {
     }
 
     #[test]
+    fn pin_key_of_my_wave_is_its_seed() {
+        let pin = Pin { target: PinTarget::Wave(vec![MY_WAVE.to_string()]), title: String::new(), subtitle: String::new(), cover: None, round: true };
+        assert_eq!(pin.key(), MY_WAVE);
+    }
+
+    #[test]
     fn pinned_wave_round_trip() {
         let v: Value = serde_json::from_str(r#"{"type":"wave_item","data":{"agent":{"cover":{"uri":""}},"backgroundImageUrl":"","header":"Моя волна по альбому","seeds":["album:7"],"title":"Альбом"}}"#).unwrap();
         let pin = parse_pin(&v).unwrap();

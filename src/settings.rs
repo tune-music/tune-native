@@ -79,6 +79,8 @@ pub struct Settings {
     pub shuffle: bool,
     pub quality: Quality,
     pub wave: [usize; 4],
+    /// Моя волна откреплена. На сервере она остаётся всегда, поэтому это хранится здесь.
+    pub my_wave_hidden: bool,
 }
 
 fn parse(v: &Value) -> Settings {
@@ -91,6 +93,7 @@ fn parse(v: &Value) -> Settings {
             _ => Repeat::Off,
         },
         shuffle: v["shuffle"].as_bool().unwrap_or(false),
+        my_wave_hidden: v["my_wave_hidden"].as_bool().unwrap_or(false),
         wave: std::array::from_fn(|group| v["wave"][group].as_u64().map_or(0, |choice| choice as usize).min(WAVE_GROUPS[group].1.len() - 1)),
         quality: Quality::ALL.into_iter().find(|q| v["quality"].as_str() == Some(q.code())).unwrap_or(Quality::Normal),
     }
@@ -108,7 +111,7 @@ pub fn save(settings: Settings) {
         Repeat::All => "all",
         Repeat::One => "one",
     };
-    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave });
+    let value = json!({ "my_wave_hidden": settings.my_wave_hidden, "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave });
     let dir = api::data_dir();
     if fs::create_dir_all(&dir).is_ok() {
         let _ = fs::write(dir.join("settings.json"), value.to_string());
@@ -122,9 +125,9 @@ mod tests {
     #[test]
     fn reads_saved_and_broken_values() {
         let saved = parse(&json!({ "volume": 0.25, "muted": true, "repeat": "one", "shuffle": true, "quality": "lossless" }));
-        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless });
+        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], my_wave_hidden: false, quality: Quality::Lossless });
         let empty = parse(&Value::Null);
-        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal });
+        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], my_wave_hidden: false, quality: Quality::Normal });
         assert_eq!(parse(&json!({ "volume": 7 })).volume, 1.0);
     }
 }

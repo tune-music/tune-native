@@ -370,6 +370,8 @@ enum Preview {
     Account,
     LogoutAsk,
     PinMenu,
+    /// Открепление Моей волны.
+    PinHideMyWave,
     /// Нажатие на закреп под этим номером, без звука.
     PinPlay(usize),
     /// Плейлист по владельцу и номеру или альбом, прокрученные до «Похожего».
@@ -432,6 +434,9 @@ struct App {
     pin_fade: Fade<(usize, f32, f32)>,
     /// Последний нажатый закреп: ответ на прошлое нажатие уже не нужен.
     pin_wanted: u64,
+    /// Сколько запросов на закрепление ещё идёт: пока они идут, старому списку верить нельзя.
+    pin_saving: u32,
+    my_wave_hidden: bool,
     playlists: Vec<Playlist>,
     playlists_loading: bool,
     /// Открытый плейлист и его треки; показывается только начало списка.
@@ -728,6 +733,8 @@ impl App {
             pin_menu: None,
             pin_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
             pin_wanted: 0,
+            pin_saving: 0,
+            my_wave_hidden: saved.my_wave_hidden,
             playlists: Vec::new(),
             playlists_loading: false,
             playlist: None,
@@ -829,6 +836,35 @@ impl App {
         }
     }
 
+    /// Что показать из ответа сервера: без повторов и без откреплённой Моей волны.
+    fn pins_shown(&self, pins: Vec<Pin>) -> Vec<Pin> {
+        let mut seen = HashSet::new();
+        pins.into_iter().filter(|pin| seen.insert(pin.key()) && !(self.my_wave_hidden && pin.key() == api::MY_WAVE)).collect()
+    }
+
+    /// Сразу показывает новый закреп по тому, что уже известно о странице.
+    fn pin_show(&mut self, target: &PinRef) -> Task<Message> {
+        let pin = match target {
+            PinRef::Wave(seeds) => {
+                let title = if seeds == &[api::MY_WAVE] { "Моя волна".to_string() } else { self.wave_title.clone().unwrap_or_else(|| "Волна".to_string()) };
+                Some(Pin { target: PinTarget::Wave(seeds.clone()), title, subtitle: "Волна".to_string(), cover: None, round: true })
+            }
+            PinRef::Album(id) => self.album.as_ref().filter(|album| album.id == *id).map(|album| {
+                let list = Playlist { cover: album.cover.clone(), ..Playlist::album(id, &album.title) };
+                Pin { target: PinTarget::List(list), title: album.title.clone(), subtitle: "Альбом".to_string(), cover: album.cover.clone(), round: false }
+            }),
+            PinRef::Artist(id) => self.artist.as_ref().filter(|artist| artist.id == *id).map(|artist| {
+                let list = Playlist { cover: artist.cover.clone(), ..Playlist::artist(id, &artist.name) };
+                Pin { target: PinTarget::List(list), title: artist.name.clone(), subtitle: "Исполнитель".to_string(), cover: artist.cover.clone(), round: true }
+            }),
+            PinRef::Playlist(..) => self.playlist.clone().map(|list| Pin { title: list.title.clone(), subtitle: "Плейлист".to_string(), cover: list.cover.clone(), target: PinTarget::List(list), round: false }),
+        };
+        let Some(pin) = pin else { return Task::none() };
+        let job = pin.cover.clone().map(|cover| (format!("{PIN_COVER_PREFIX}{}", pin.key()), cover));
+        self.pins.insert(0, pin);
+        self.fetch_cover_jobs(job.into_iter().collect(), "100x100")
+    }
+
     /// Сейчас играет то, что на этом закрепе.
     fn pin_active(&self, pin: &Pin) -> bool {
         match &pin.target {
@@ -854,7 +890,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, my_wave_hidden: self.my_wave_hidden, wave: self.wave_tuning });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -1599,7 +1635,7 @@ impl App {
                         self.preview = None;
                         self.update(Message::DialogOpen(Dialog::Logout))
                     }
-                    Some(Preview::PinMenu | Preview::PinPlay(_)) => Task::none(),
+                    Some(Preview::PinMenu | Preview::PinHideMyWave | Preview::PinPlay(_)) => Task::none(),
                     Some(Preview::Search(query)) => {
                         self.preview = None;
                         self.section = Section::Search;
@@ -1620,9 +1656,17 @@ impl App {
                 return Task::batch([pins, page]);
             }
             Message::PinsLoaded(Ok(pins)) => {
-                self.pins = pins;
+                let preview_hide = matches!(self.preview, Some(Preview::PinHideMyWave));
+                if self.pin_saving > 0 {
+                    return Task::none();
+                }
+                self.pins = self.pins_shown(pins);
                 let jobs = self.pins.iter().filter_map(|p| Some((format!("{PIN_COVER_PREFIX}{}", p.key()), p.cover.clone()?))).collect();
                 let covers = self.fetch_cover_jobs(jobs, "100x100");
+                if preview_hide {
+                    self.preview = None;
+                    return Task::batch([covers, self.handle(Message::Pin(PinRef::Wave(vec![api::MY_WAVE.to_string()])))]);
+                }
                 match self.preview.clone() {
                     Some(Preview::PinMenu) => {
                         self.preview = None;
@@ -2423,14 +2467,34 @@ impl App {
                 meta.2 = value.to_string();
                 return Task::perform(background(move || api::set_visibility(&uid, &list.kind, value, &token)), Message::SimpleSaved);
             }
+            // Панель меняется сразу, а сервер догоняет: ответ идёт больше секунды.
             Message::Pin(target) => {
                 self.pin_menu = None;
                 let Some(token) = self.token() else { return Task::none() };
                 let pinned = !self.pins.iter().any(|pin| target.matches(pin));
-                return Task::perform(background(move || api::set_pinned(&target, pinned, &token)), Message::PinSaved);
+                let my_wave = matches!(&target, PinRef::Wave(seeds) if seeds == &[api::MY_WAVE]);
+                if pinned {
+                    let covers = self.pin_show(&target);
+                    if my_wave {
+                        // Основная Моя волна и так есть на сервере: повторный запрос добавил бы вторую.
+                        self.my_wave_hidden = false;
+                        self.save_settings();
+                        return covers;
+                    }
+                    self.pin_saving += 1;
+                    return Task::batch([covers, Task::perform(background(move || api::set_pinned(&target, true, &token)), Message::PinSaved)]);
+                }
+                self.pins.retain(|pin| !target.matches(pin));
+                if my_wave {
+                    self.my_wave_hidden = true;
+                    self.save_settings();
+                }
+                self.pin_saving += 1;
+                return Task::perform(background(move || api::set_pinned(&target, false, &token)), Message::PinSaved);
             }
             Message::PinSaved(result) => {
-                let reload = self.token().map_or(Task::none(), |token| Task::perform(background(move || api::pins(&token)), Message::PinsLoaded));
+                self.pin_saving = self.pin_saving.saturating_sub(1);
+                let reload = if self.pin_saving > 0 { Task::none() } else { self.token().map_or(Task::none(), |token| Task::perform(background(move || api::pins(&token)), Message::PinsLoaded)) };
                 return match result {
                     Ok(()) => reload,
                     Err(e) => Task::batch([reload, self.fail(e)]),
@@ -4577,6 +4641,7 @@ fn main() -> iced::Result {
             "account" => Preview::Account,
             "logout-ask" => Preview::LogoutAsk,
             "pin-menu" => Preview::PinMenu,
+            "pin-hide-my-wave" => Preview::PinHideMyWave,
             "pin-play-0" => Preview::PinPlay(0),
             "pin-play-1" => Preview::PinPlay(1),
             "pin-play-2" => Preview::PinPlay(2),
