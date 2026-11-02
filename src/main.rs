@@ -121,6 +121,8 @@ const LYRICS_CHROME: f32 = 300.0;
 const SESSION_SAVE: Duration = Duration::from_secs(10);
 /// Шаг перемотки и громкости с клавиатуры.
 const SEEK_STEP: f32 = 5.0;
+/// Сколько других альбомов исполнителя показать под альбомом.
+const ALBUM_OTHERS: usize = 8;
 const VOLUME_STEP: f32 = 0.05;
 const DIALOG_INPUT: &str = "dialog";
 const DIALOG_WIDTH: f32 = 400.0;
@@ -560,6 +562,8 @@ struct App {
     /// «Меньше ИИ»; пока не знаем ответа сервера, переключатель не работает.
     ai_less: Option<bool>,
     discography: Vec<Card>,
+    /// Другие альбомы исполнителя открытого альбома.
+    album_others: Vec<Card>,
     discography_total: u64,
     discography_also: bool,
     discography_by_year: bool,
@@ -660,6 +664,8 @@ enum Message {
     DiscographySort(bool),
     DiscographyMore,
     DiscographyLoaded(String, Result<api::Releases, String>),
+    /// Другие альбомы исполнителя для страницы альбома.
+    AlbumOthers(String, Result<api::Releases, String>),
     /// Окно закрывают: сначала надо запомнить, что играло.
     Quit,
     /// Новая сессия для волны, восстановленной после запуска.
@@ -854,6 +860,7 @@ impl App {
             session_at: None,
             ai_less: None,
             discography: Vec::new(),
+            album_others: Vec::new(),
             discography_total: 0,
             discography_also: false,
             discography_by_year: false,
@@ -1196,6 +1203,8 @@ impl App {
         cards.extend(self.liked_artists.iter().chain(&self.found.artists).chain(page.into_iter().flat_map(|a| &a.similar)).map(|c| format!("{ARTIST_COVER}{}", c.id)));
         cards.extend(self.home.blocks.iter().enumerate().flat_map(|(index, block)| block.items[self.home_shown(index, block)].iter()).map(home_item_key));
         cards.extend(self.album.iter().map(|a| format!("{ALBUM_COVER}{}", a.id)));
+        let album_cards = self.album.iter().flat_map(|a| &a.versions).chain(&self.album_others).chain(&self.discography);
+        cards.extend(album_cards.map(|c| format!("{ALBUM_COVER}{}", c.id)));
         cards.extend(self.similar.iter().map(home_item_key));
         cards.extend(self.current_track().map(|t| format!("{WAVE_BIG}{}", t.id)));
         cards.extend(page.iter().map(|a| format!("{ARTIST_COVER}{}", a.id)));
@@ -1427,6 +1436,7 @@ impl App {
         self.playlist = Some(playlist.clone());
         self.playlist_tracks.clear();
         self.album = None;
+        self.album_others.clear();
         self.similar.clear();
         let similar = self.similar_load(&playlist);
         let kind = playlist.kind.clone();
@@ -1909,6 +1919,14 @@ impl App {
                     return self.discography_load(self.discography.len() as u64 / api::RELEASES_PAGE);
                 }
             }
+            Message::AlbumOthers(id, result) => {
+                let Some(album) = self.album.as_ref().filter(|album| album.id == id) else { return Task::none() };
+                let skip: HashSet<&str> = album.versions.iter().map(|c| c.id.as_str()).chain([album.id.as_str()]).collect();
+                let others: Vec<Card> = result.map(|releases| releases.albums).unwrap_or_default().into_iter().filter(|c| !skip.contains(c.id.as_str())).take(ALBUM_OTHERS).collect();
+                let jobs = others.iter().filter_map(|c| Some((format!("{ALBUM_COVER}{}", c.id), c.cover.clone()?))).collect();
+                self.album_others = others;
+                return self.fetch_cover_jobs(jobs, "300x300");
+            }
             Message::DiscographyLoaded(key, result) => {
                 if self.discography_key.as_ref() != Some(&key) {
                     return Task::none();
@@ -2152,10 +2170,20 @@ impl App {
                     if let Some(playlist) = &mut self.playlist {
                         playlist.title = album.title.clone();
                     }
-                    let cover = album.cover.clone().map(|uri| (format!("{ALBUM_COVER}{}", album.id), uri)).into_iter().collect();
+                    let main = album.cover.clone().map(|uri| (format!("{ALBUM_COVER}{}", album.id), uri));
+                    let versions = album.versions.iter().filter_map(|c| Some((format!("{ALBUM_COVER}{}", c.id), c.cover.clone()?)));
+                    let cover = main.into_iter().chain(versions).collect();
+                    // Другие альбомы — дополнение: страница не ждёт их и не ругается без них.
+                    let others = match (album.artists.first().map(|(_, id)| id.clone()).filter(|id| !id.is_empty()), self.token()) {
+                        (Some(artist), Some(token)) => {
+                            let id = album.id.clone();
+                            Task::perform(background(move || api::releases(&artist, false, false, 0, &token)), move |result| Message::AlbumOthers(id.clone(), result))
+                        }
+                        _ => Task::none(),
+                    };
                     self.album = Some(album);
                     let cover = self.fetch_cover_jobs(cover, "300x300");
-                    return Task::batch([cover, self.handle(Message::PlaylistLoaded(kind, Ok(tracks)))]);
+                    return Task::batch([cover, others, self.handle(Message::PlaylistLoaded(kind, Ok(tracks)))]);
                 }
                 Err(e) => return self.handle(Message::PlaylistLoaded(kind, Err(e))),
             },
@@ -4184,6 +4212,12 @@ impl App {
         let count = self.playlist_tracks.len();
         let mut about: Vec<String> = album.year.map(|year| year.to_string()).into_iter().collect();
         about.push(format!("{count} {}", tracks_word(count)));
+        if album.volumes.len() > 1 {
+            about.push(format!("{} {}", album.volumes.len(), disks_word(album.volumes.len())));
+        }
+        if !album.version.is_empty() {
+            about.push(album.version.clone());
+        }
         let actions = self.page_actions(Section::Playlists, format!("album:{}", album.id), &album.title);
         let liked = self.liked_albums.iter().any(|c| c.id == album.id);
         let actions = actions.push(self.page_like(liked, Message::AlbumLike)).push(self.page_tools(PinRef::Album(album.id.clone()), format!("https://music.yandex.ru/album/{}", album.id)));
@@ -4279,14 +4313,40 @@ impl App {
         if let Some(header) = header {
             list = list.push(header);
         }
-        list = list.push(Space::new().height(range.start as f32 * ROW));
-        for index in range.clone() {
-            list = list.push(match tracks.get(index) {
-                Some(track) => self.view_track(section, index, track),
-                None => skeleton_row(),
-            });
+        let disks = self.album.as_ref().map_or(0, |album| album.volumes.len());
+        if disks > 1 && self.album_place(section, 0).is_some() && tracks.len() == total {
+            // Альбом с дисками короткий: строки идут целиком, с заголовком перед каждым диском.
+            for (index, track) in tracks.iter().enumerate() {
+                if let Some((disk, 1)) = self.album_place(section, index) {
+                    list = list.push(container(text(format!("Диск {disk}")).size(18).font(ui::font_medium()).color(ui::TEXT)).padding(Padding::new(8.0).top(if disk > 1 { 20.0 } else { 8.0 })));
+                }
+                list = list.push(self.view_track(section, index, track));
+            }
+        } else {
+            list = list.push(Space::new().height(range.start as f32 * ROW));
+            for index in range.clone() {
+                list = list.push(match tracks.get(index) {
+                    Some(track) => self.view_track(section, index, track),
+                    None => skeleton_row(),
+                });
+            }
+            list = list.push(Space::new().height((total - range.end) as f32 * ROW));
         }
-        list = list.push(Space::new().height((total - range.end) as f32 * ROW));
+        if let Some(album) = self.album.as_ref().filter(|_| section == Section::Playlists && !self.filtering()) {
+            let mut facts = column![].spacing(2);
+            if let Some(released) = &album.released {
+                facts = facts.push(text(format!("Дата выхода: {released}")).size(13).color(ui::MUTED));
+            }
+            if !album.labels.is_empty() {
+                facts = facts.push(text(format!("Лейбл: {}", album.labels.join(", "))).size(13).color(ui::MUTED));
+            }
+            list = list.push(container(facts).padding(Padding::new(8.0).top(16)));
+            for (title, cards) in [("Другие версии", &album.versions), ("Другие альбомы исполнителя", &self.album_others)] {
+                if !cards.is_empty() {
+                    list = list.push(Space::new().height(24)).push(text(title).size(24).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None)).push(Space::new().height(8)).push(self.view_cards(cards, ALBUM_COVER, false, open_album));
+                }
+            }
+        }
         if section == Section::Playlists && !self.filtering() && !self.similar.is_empty() {
             let cards = self.similar.iter().fold(row![].spacing(4), |cards, item| cards.push(self.view_home_item(item)));
             list = list.push(Space::new().height(24)).push(text("Похожее").size(24).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None)).push(Space::new().height(8)).push(cards.wrap()).push(Space::new().height(16));
@@ -4295,12 +4355,37 @@ impl App {
     }
 
     fn view_track<'a>(&'a self, section: Section, index: usize, track: &'a Track) -> Element<'a, Message> {
-        self.view_track_row(Message::Play(section, index), track)
+        self.view_numbered_row(Message::Play(section, index), track, self.album_place(section, index).map(|(_, number)| number))
     }
 
     fn view_track_row<'a>(&'a self, play: Message, track: &'a Track) -> Element<'a, Message> {
+        self.view_numbered_row(play, track, None)
+    }
+
+    /// Открыт альбом без поиска внутри: у трека есть диск и номер на диске, с единицы.
+    fn album_place(&self, section: Section, index: usize) -> Option<(usize, usize)> {
+        let album = self.album.as_ref().filter(|_| section == Section::Playlists && !self.filtering())?;
+        let mut left = index;
+        for (disk, &size) in album.volumes.iter().enumerate() {
+            if left < size {
+                return Some((disk + 1, left + 1));
+            }
+            left -= size;
+        }
+        None
+    }
+
+    /// Строка трека. В альбоме вместо одинаковых обложек стоят номера, как в оригинале.
+    fn view_numbered_row<'a>(&'a self, play: Message, track: &'a Track, number: Option<usize>) -> Element<'a, Message> {
         let current = self.current_track().is_some_and(|t| t.id == track.id);
-        let cover: Element<'_, Message> = if current {
+        let cover: Element<'_, Message> = if let Some(number) = number {
+            let mark: Element<'_, Message> = if current {
+                ui::icon(if self.is_playing() { ui::PAUSE } else { ui::PLAY }, 22.0, ui::ACCENT)
+            } else {
+                text(number.to_string()).color(ui::MUTED).into()
+            };
+            container(mark).center(COVER).into()
+        } else if current {
             let icon = if self.is_playing() { ui::PAUSE } else { ui::PLAY };
             stack![self.cover(track, COVER), container(ui::icon(icon, 22.0, ui::WHITE)).center(COVER).style(ui::overlay)].into()
         } else {
@@ -4548,6 +4633,14 @@ fn more_title<'a>(title: &'a str, press: Message) -> Element<'a, Message> {
         .style(ui::ghost)
         .on_press(press), 20.0)
         .into()
+}
+
+fn disks_word(n: usize) -> &'static str {
+    match (n % 10, n % 100) {
+        (1, rest) if rest != 11 => "диск",
+        (2..=4, rest) if !(12..=14).contains(&rest) => "диска",
+        _ => "дисков",
+    }
 }
 
 fn open_artist(card: &Card) -> Message {
@@ -5132,6 +5225,15 @@ fn main() -> iced::Result {
 #[cfg(test)]
 mod lyrics_tests {
     use super::*;
+
+    #[test]
+    fn counts_disks() {
+        assert_eq!(disks_word(1), "диск");
+        assert_eq!(disks_word(3), "диска");
+        assert_eq!(disks_word(5), "дисков");
+        assert_eq!(disks_word(11), "дисков");
+        assert_eq!(disks_word(22), "диска");
+    }
 
     #[test]
     fn return_starts_and_ends_softly() {

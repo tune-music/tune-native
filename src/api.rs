@@ -624,6 +624,15 @@ pub struct Album {
     pub year: Option<u64>,
     pub artists: Vec<(String, String)>,
     pub cover: Option<String>,
+    /// Сколько треков на каждом диске; у обычного альбома один диск.
+    pub volumes: Vec<usize>,
+    /// Пометка издания, например «Deluxe Edition».
+    pub version: String,
+    pub labels: Vec<String>,
+    /// Дата выхода словами: «1 января 2011».
+    pub released: Option<String>,
+    /// Другие издания того же альбома.
+    pub versions: Vec<Card>,
 }
 
 /// Альбом или исполнитель в сетке обложек.
@@ -677,7 +686,29 @@ fn parse_album(v: &Value) -> Option<Album> {
         year: v["year"].as_u64(),
         artists: parse_artist_list(&v["artists"]),
         cover: cover_uri(v),
+        volumes: Vec::new(),
+        version: v["version"].as_str().unwrap_or_default().trim().to_string(),
+        labels: v["labels"].as_array().into_iter().flatten().filter_map(|label| label["name"].as_str().or(label.as_str()).map(str::to_string)).collect(),
+        released: v["releaseDate"].as_str().and_then(release_date),
+        versions: parse_cards(&v["duplicates"], version_card),
     })
+}
+
+/// «2011-01-01T00:00:00+03:00» → «1 января 2011».
+fn release_date(iso: &str) -> Option<String> {
+    const MONTHS: [&str; 12] = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
+    let mut parts = iso.get(..10)?.split('-');
+    let (year, month, day) = (parts.next()?, parts.next()?.parse::<usize>().ok()?, parts.next()?.parse::<u32>().ok()?);
+    Some(format!("{day} {} {year}", MONTHS.get(month.checked_sub(1)?)?))
+}
+
+/// Издание альбома: подпись — его пометка, а если её нет, то год.
+fn version_card(v: &Value) -> Option<Card> {
+    let mut card = album_card(v)?;
+    if let Some(version) = v["version"].as_str().map(str::trim).filter(|version| !version.is_empty()) {
+        card.subtitle = version.to_string();
+    }
+    Some(card)
 }
 
 fn parse_cards(v: &Value, card: impl Fn(&Value) -> Option<Card>) -> Vec<Card> {
@@ -754,8 +785,10 @@ pub fn releases(id: &str, also: bool, by_year: bool, page: u64, token: &str) -> 
 pub fn album(id: &str, token: &str) -> Result<(Album, Vec<Track>), String> {
     let v = get(&format!("albums/{id}/with-tracks"), &[], token)?;
     let v = result(&v);
-    let tracks = v["volumes"].as_array().into_iter().flatten().flat_map(|disk| disk.as_array().into_iter().flatten()).filter_map(parse_track).collect();
-    Ok((parse_album(v).ok_or("Яндекс не прислал альбом")?, tracks))
+    let disks: Vec<Vec<Track>> = v["volumes"].as_array().into_iter().flatten().map(|disk| disk.as_array().into_iter().flatten().filter_map(parse_track).collect()).collect();
+    let mut album = parse_album(v).ok_or("Яндекс не прислал альбом")?;
+    album.volumes = disks.iter().map(Vec::len).filter(|&size| size > 0).collect();
+    Ok((album, disks.into_iter().flatten().collect()))
 }
 
 pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
@@ -1382,6 +1415,19 @@ mod tests {
         assert_eq!(album_subtitle(&json!({"year":2020,"type":"single"})), "2020 · Сингл");
         assert_eq!(album_subtitle(&json!({"year":1975})), "1975");
         assert_eq!(album_subtitle(&json!({})), "Альбом");
+    }
+
+    #[test]
+    fn reads_album_details() {
+        assert_eq!(release_date("2011-01-01T00:00:00+03:00").as_deref(), Some("1 января 2011"));
+        assert_eq!(release_date("1977-10-28").as_deref(), Some("28 октября 1977"));
+        assert_eq!(release_date("2011-13-01"), None);
+        assert_eq!(release_date("2011"), None);
+        let v = json!({"id":1,"title":"A","version":" Deluxe ","labels":[{"id":1,"name":"Universal"},"EMI"],"duplicates":[{"id":2,"title":"A","year":1977,"version":"Remaster"},{"id":3,"title":"A","year":1980}]});
+        let album = parse_album(&v).unwrap();
+        assert_eq!(album.version, "Deluxe");
+        assert_eq!(album.labels, vec!["Universal".to_string(), "EMI".to_string()]);
+        assert_eq!(album.versions.iter().map(|c| c.subtitle.as_str()).collect::<Vec<_>>(), vec!["Remaster", "1980"]);
     }
 
     #[test]
