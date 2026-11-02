@@ -5,6 +5,7 @@ use std::fs;
 use serde_json::{json, Value};
 
 use crate::api;
+use crate::equalizer::{self, EqSettings};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Repeat {
@@ -79,6 +80,7 @@ pub struct Settings {
     pub shuffle: bool,
     pub quality: Quality,
     pub wave: [usize; 4],
+    pub eq: EqSettings,
 }
 
 fn parse(v: &Value) -> Settings {
@@ -93,6 +95,18 @@ fn parse(v: &Value) -> Settings {
         shuffle: v["shuffle"].as_bool().unwrap_or(false),
         wave: std::array::from_fn(|group| v["wave"][group].as_u64().map_or(0, |choice| choice as usize).min(WAVE_GROUPS[group].1.len() - 1)),
         quality: Quality::ALL.into_iter().find(|q| v["quality"].as_str() == Some(q.code())).unwrap_or(Quality::Normal),
+        eq: parse_eq(&v["equalizer"]),
+    }
+}
+
+fn parse_eq(v: &Value) -> EqSettings {
+    let base = EqSettings::default();
+    let limit = equalizer::GAIN_LIMIT as f64;
+    EqSettings {
+        enabled: v["enabled"].as_bool().unwrap_or(base.enabled),
+        preset: v["preset"].as_u64().map_or(base.preset, |preset| (preset as usize).min(equalizer::PRESETS.len() - 1)),
+        preamp: v["preamp"].as_f64().map_or(base.preamp, |x| x.clamp(equalizer::PREAMP_MIN as f64, equalizer::PREAMP_MAX as f64) as f32),
+        gains: std::array::from_fn(|band| v["gains"][band].as_f64().map_or(0.0, |x| x.clamp(-limit, limit) as f32)),
     }
 }
 
@@ -108,7 +122,9 @@ pub fn save(settings: Settings) {
         Repeat::All => "all",
         Repeat::One => "one",
     };
-    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave });
+    let eq = settings.eq;
+    let equalizer = json!({ "enabled": eq.enabled, "preset": eq.preset, "preamp": eq.preamp, "gains": eq.gains });
+    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer });
     let dir = api::data_dir();
     if fs::create_dir_all(&dir).is_ok() {
         let _ = fs::write(dir.join("settings.json"), value.to_string());
@@ -122,9 +138,11 @@ mod tests {
     #[test]
     fn reads_saved_and_broken_values() {
         let saved = parse(&json!({ "volume": 0.25, "muted": true, "repeat": "one", "shuffle": true, "quality": "lossless" }));
-        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless });
+        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default() });
         let empty = parse(&Value::Null);
-        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal });
+        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default() });
+        let eq = parse(&json!({ "equalizer": { "enabled": true, "preset": 14, "preamp": 9, "gains": [40, -3.5] } })).eq;
+        assert_eq!((eq.enabled, eq.preset, eq.preamp, eq.gains[0], eq.gains[1], eq.gains[2]), (true, 14, 1.5, 12.0, -3.5, 0.0));
         assert_eq!(parse(&json!({ "volume": 7 })).volume, 1.0);
     }
 }

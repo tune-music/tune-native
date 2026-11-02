@@ -12,6 +12,7 @@ use aes::cipher::{KeyIvInit, StreamCipher};
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink};
 
 use crate::api::FileInfo;
+use crate::equalizer::{EqSettings, Equalized, Shared};
 
 type Ctr128 = ctr::Ctr128BE<aes::Aes128>;
 type Ctr256 = ctr::Ctr128BE<aes::Aes256>;
@@ -169,6 +170,8 @@ pub struct Player {
     generation: Arc<AtomicU64>,
     /// Следующий трек откроется на паузе: его ещё надо перемотать или он и был на паузе.
     hold: Arc<AtomicBool>,
+    /// Эквалайзер, через который идёт каждый трек.
+    eq: Shared,
     _device: Arc<SendDevice>,
 }
 
@@ -189,6 +192,7 @@ impl Player {
             prepared: Arc::default(),
             generation: Arc::default(),
             hold: Arc::default(),
+            eq: Shared::default(),
             _device: Arc::new(SendDevice(device)),
         })
     }
@@ -259,7 +263,7 @@ impl Player {
         if self.generation.load(Ordering::Acquire) != generation {
             return Ok(());
         }
-        self.output.append(decoder);
+        self.output.append(Equalized::new(decoder, self.eq.clone()));
         if self.hold.swap(false, Ordering::AcqRel) {
             self.output.pause();
         } else {
@@ -290,6 +294,11 @@ impl Player {
 
     pub fn position(&self) -> Duration {
         self.output.get_pos()
+    }
+
+    /// Новые настройки эквалайзера слышны сразу, в том числе в играющем треке.
+    pub fn set_eq(&self, settings: EqSettings) {
+        self.eq.set(settings);
     }
 
     pub fn set_volume(&self, volume: f32) {

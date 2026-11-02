@@ -9,6 +9,7 @@ mod media;
 mod player;
 mod seek;
 mod session;
+mod equalizer;
 mod settings;
 mod ui;
 
@@ -23,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use iced::futures::channel::{mpsc, oneshot};
 use iced::widget::text::Wrapping;
 use iced::keyboard;
-use iced::widget::{button, canvas, column, container, image, mouse_area, operation, row, scrollable, stack, text, text_input, Id, Space};
+use iced::widget::{button, canvas, column, container, image, mouse_area, operation, row, scrollable, stack, text, text_input, vertical_slider, Id, Space};
 use anim::{hover_line, reveal, smooth, Fade};
 use glow::{glow, shine};
 use iced::{event, mouse, time, window, Alignment, Event, Element, Length, Padding, Size, Subscription, Task};
@@ -156,6 +157,8 @@ const POPUP_CLOSE: f32 = 0.1;
 const DIALOG_OPEN: f32 = 0.2;
 /// Плеер на всё окно: место под шапку, название, перемотку и кнопки; предел обложки; насколько темнеет цвет фона.
 const FULL_CHROME: f32 = 330.0;
+/// Высота ползунков эквалайзера.
+const EQ_HEIGHT: f32 = 150.0;
 const FULL_COVER_MAX: f32 = 560.0;
 const FULL_TINT: f32 = 0.55;
 /// Как быстро фон перетекает в цвет обложки нового трека: чем больше, тем короче переход.
@@ -513,6 +516,8 @@ struct App {
     media: Option<Media>,
     failures: u32,
     player: Option<Player>,
+    /// Эквалайзер: включён ли, пресет, предусиление и полосы.
+    eq: equalizer::EqSettings,
     /// Что играет: смена раздела и новый поиск не прерывают музыку.
     queue: Vec<Track>,
     /// Сессия волны, если очередь — это волна.
@@ -770,6 +775,12 @@ enum Message {
     TrackRemoved(Result<(), String>),
     /// Нажали на недоступный трек.
     Unavailable,
+    /// Эквалайзер: включить, выбрать пресет, сдвинуть полосу или предусиление, отпустить ползунок.
+    EqToggle,
+    EqPreset(usize),
+    EqBand(usize, f32),
+    EqPreamp(f32),
+    EqSave,
     /// Плеер на всё окно: открыть или закрыть.
     FullToggle,
 
@@ -913,6 +924,7 @@ impl App {
             shuffle: saved.shuffle,
             unshuffled: None,
             quality: saved.quality,
+            eq: saved.eq,
             sound: None,
             restart: None,
             unhold: false,
@@ -971,6 +983,9 @@ impl App {
             preview,
         };
         app.apply_volume();
+        if let Some(player) = &app.player {
+            player.set_eq(app.eq);
+        }
         (app, Task::batch([task, window_handle(), window::latest().then(|id| id.map_or(Task::none(), window::size)).map(Message::WindowSize)]))
     }
 
@@ -1051,6 +1066,16 @@ impl App {
         list.source == Source::Playlist && list.kind != FAVORITES_KIND && self.uid.as_deref() == Some(list.owner.as_str())
     }
 
+    /// Передаёт эквалайзер плееру. Во время перетаскивания ползунка файл не пишется на каждый шаг.
+    fn eq_apply(&self, save: bool) {
+        if let Some(player) = &self.player {
+            player.set_eq(self.eq);
+        }
+        if save {
+            self.save_settings();
+        }
+    }
+
     fn apply_volume(&self) {
         if let Some(p) = &self.player {
             p.set_volume(if self.muted { 0.0 } else { self.volume });
@@ -1058,7 +1083,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -3301,6 +3326,33 @@ impl App {
                 return Task::batch([iced::clipboard::write(track.share_link()), notice]);
             }
             Message::Unavailable => return self.notify(UNAVAILABLE.to_string()),
+            Message::EqToggle => {
+                self.eq.enabled = !self.eq.enabled;
+                self.eq_apply(true);
+            }
+            Message::EqPreset(preset) => {
+                // Своя настройка хранит то, что выставлено руками, остальные берут числа пресета.
+                if preset != equalizer::CUSTOM {
+                    self.eq.gains = equalizer::PRESETS[preset].1;
+                    self.eq.preamp = 1.0;
+                }
+                self.eq.preset = preset;
+                self.eq.enabled = true;
+                self.eq_apply(true);
+            }
+            Message::EqBand(band, gain) => {
+                self.eq.gains[band] = (gain * 2.0).round() / 2.0;
+                self.eq.preset = equalizer::CUSTOM;
+                self.eq.enabled = true;
+                self.eq_apply(false);
+            }
+            Message::EqPreamp(preamp) => {
+                self.eq.preamp = (preamp * 20.0).round() / 20.0;
+                self.eq.preset = equalizer::CUSTOM;
+                self.eq.enabled = true;
+                self.eq_apply(false);
+            }
+            Message::EqSave => self.save_settings(),
             Message::FullToggle => {
                 self.player_full = !self.player_full && self.current_track().is_some();
                 // Плеер выезжает уже в цвете обложки, без перехода от серого.
@@ -4364,6 +4416,7 @@ impl App {
         let page = column![
             text("Настройки").size(36).font(ui::font_headline()).color(ui::TEXT),
             sound,
+            self.view_equalizer(),
             column![title("Рекомендации"), ai].spacing(8),
             view_hotkeys(),
             column![title("Аккаунт"), row![link("Управление аккаунтом", Message::DialogOpen(Dialog::Account)), link("Выйти", Message::DialogOpen(Dialog::Logout))].spacing(8)].spacing(12),
@@ -4378,6 +4431,31 @@ impl App {
         .max_width(700)
         .padding(Padding::ZERO.right(20));
         ui::scroll(page).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
+    }
+
+    /// Эквалайзер как в оригинале: уровень слева, десять полос, пресеты под ними.
+    fn view_equalizer(&self) -> Element<'_, Message> {
+        let eq = self.eq;
+        let head = row![
+            column![text("Эквалайзер").size(20).font(ui::font_medium()).color(ui::TEXT), text(equalizer::PRESETS[eq.preset].0).size(13).color(ui::MUTED)].spacing(2).width(Length::Fill),
+            view_switch(Some(eq.enabled)),
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center);
+        let head = glow(button(head).width(Length::Fill).padding(8).style(ui::row).on_press(Message::EqToggle), 8.0);
+        let tint = if eq.enabled { ui::TEXT } else { ui::MUTED };
+        let column_of = |value: String, slider: Element<'static, Message>, label: String| column![text(value).size(12).color(ui::MUTED), slider, text(label).size(12).color(tint)].spacing(6).align_x(Alignment::Center).width(Length::Fill);
+        let preamp = vertical_slider(equalizer::PREAMP_MIN..=equalizer::PREAMP_MAX, eq.preamp, Message::EqPreamp).step(0.05).height(EQ_HEIGHT).on_release(Message::EqSave).style(ui::eq_slider(eq.enabled));
+        let mut bands = row![column_of(format!("{:.2}", eq.preamp), preamp.into(), "уровень".to_string())].spacing(4);
+        for (band, frequency) in equalizer::BANDS.iter().enumerate() {
+            let slider = vertical_slider(-equalizer::GAIN_LIMIT..=equalizer::GAIN_LIMIT, eq.gains[band], move |gain| Message::EqBand(band, gain)).step(0.5).height(EQ_HEIGHT).on_release(Message::EqSave).style(ui::eq_slider(eq.enabled));
+            let label = if *frequency < 1000.0 { format!("{frequency}") } else { format!("{}K", frequency / 1000.0) };
+            bands = bands.push(column_of(format!("{:+}", eq.gains[band]), slider.into(), label));
+        }
+        let presets = equalizer::PRESETS.iter().enumerate().fold(row![].spacing(8), |line, (index, (name, _))| {
+            line.push(shine(button(text(*name).size(14)).padding([6, 14]).style(ui::chip(eq.enabled && index == eq.preset)).on_press(Message::EqPreset(index)), 16.0))
+        });
+        column![head, container(bands).padding([0, 8]), presets.wrap().vertical_spacing(8)].spacing(16).into()
     }
 
     fn view_collection(&self) -> Element<'_, Message> {

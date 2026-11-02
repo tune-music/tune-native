@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use iced::widget::{button, container, scrollable, svg, text_input, Scrollable};
+use iced::widget::{button, container, scrollable, slider, svg, text_input, Scrollable};
 use iced::{color, Background, Color, Element, Font, Length, Shadow, Theme};
 
 pub const BLACK: Color = color!(0x000000);
@@ -269,6 +269,20 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
         placeholder: MUTED,
         value: TEXT,
         selection: Color { a: 0.35, ..ACCENT },
+    }
+}
+
+/// Ползунок эквалайзера: тонкая дорожка, жёлтая часть от низа до значения. Выключенный — серый.
+pub fn eq_slider(enabled: bool) -> impl Fn(&Theme, slider::Status) -> slider::Style {
+    move |_, status| eq_slider_style(enabled, status)
+}
+
+fn eq_slider_style(enabled: bool, status: slider::Status) -> slider::Style {
+    let fill = if enabled { ACCENT } else { MUTED };
+    let handle = if matches!(status, slider::Status::Dragged) && enabled { ACCENT_HOVER } else { fill };
+    slider::Style {
+        rail: slider::Rail { backgrounds: (Background::Color(fill), Background::Color(CONTROL_PRESSED)), width: 4.0, border: Border { radius: 2.0.into(), ..Border::default() } },
+        handle: slider::Handle { shape: slider::HandleShape::Circle { radius: 7.0 }, background: Background::Color(handle), border_width: 0.0, border_color: Color::TRANSPARENT },
     }
 }
 
