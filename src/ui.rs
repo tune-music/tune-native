@@ -272,11 +272,6 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
     }
 }
 
-/// Источник музыки над треком на главной.
-pub fn source_button(_: &Theme, _: button::Status) -> button::Style {
-    flat(None, ACCENT, 20.0)
-}
-
 /// Цвет из ответа Яндекса, вида #2AA75B.
 pub fn hex_color(hex: &str) -> Option<Color> {
     let digits = hex.strip_prefix('#').filter(|digits| digits.len() == 6)?;

@@ -58,9 +58,7 @@ const BAR_SLIDER_MIN: f32 = 30.0;
 const BAR_SLIDER_MAX: f32 = 110.0;
 const CARD: f32 = 190.0;
 /// Волна: что занято по высоте кроме обложки, пределы обложки и ширина подписей под ней.
-const WAVE_CHROME: f32 = 400.0;
 const WAVE_COVER_MIN: f32 = 140.0;
-const WAVE_COVER_MAX: f32 = 420.0;
 const WAVE_COLUMN: f32 = 560.0;
 /// Обложка играющего трека в волне крупнее, чем в списках.
 const WAVE_BIG: &str = "wave-big:";
@@ -1119,7 +1117,7 @@ impl App {
         let list = self.fetch_cover_jobs(jobs, "100x100");
         let similar = if self.section == Section::Playlists { self.similar.iter().filter_map(|item| Some((home_item_key(item), home_item_cover(item)?))).collect() } else { Vec::new() };
         let similar = self.fetch_cover_jobs(similar, "200x200");
-        let big = self.current_track().filter(|_| self.section == Section::Wave || self.player_full).and_then(|t| Some((format!("{WAVE_BIG}{}", t.id), t.cover.clone()?)));
+        let big = self.current_track().filter(|_| self.player_full).and_then(|t| Some((format!("{WAVE_BIG}{}", t.id), t.cover.clone()?)));
         let big = self.fetch_cover_jobs(big.into_iter().collect(), "600x600");
         // Играющий трек показан и в плеере, и крупно на главной.
         let current = self.current_track().and_then(|t| Some((t.id.clone(), t.cover.clone()?))).into_iter().collect();
@@ -1883,7 +1881,7 @@ impl App {
         self.notice_fade.sync(self.notice.as_ref().map(|(_, text)| text.clone()));
         let track = self.current_track().map(|track| track.id.clone());
         if track != self.shown_track {
-            if (self.section == Section::Wave || self.player_full) && self.shown_track.is_some() {
+            if self.player_full && self.shown_track.is_some() {
                 self.track_veil = 1.0;
             }
             self.shown_track = track;
@@ -4181,69 +4179,52 @@ impl App {
     }
 
     /// Главная: играющий трек с управлением, откуда бы он ни играл.
+    /// Страница волны: только управление волной. Трек и его кнопки — в нижнем плеере,
+    /// середина свободна под будущую анимацию.
     fn view_wave(&self) -> Element<'_, Message> {
-        let Some(track) = self.current_track() else {
-            if self.wave_loading || self.uid.is_none() {
-                return placeholder("Настраиваем волну…", None);
-            }
-            return container(
-                column![
-                    text("Моя волна").size(56).font(ui::font_headline()).color(ui::WHITE),
-                    Space::new().height(16),
-                    shine(button(container(ui::icon(ui::PLAY, 36.0, ui::ON_ACCENT)).center(64)).padding(8).style(ui::round).on_press(Message::WaveStart), 40.0),
-                ]
-                .align_x(Alignment::Center),
-            )
-            .center(Length::Fill)
-            .into();
-        };
-        // Волна стоит в панели над нижним плеером: место под обложку меньше окна.
-        let space = self.main_width() - 48.0;
-        let height = WINDOW.lock().unwrap().1;
-        let art = (height - WAVE_CHROME - BAR_HEIGHT).min(space).clamp(WAVE_COVER_MIN, WAVE_COVER_MAX);
-        let line = space.min(WAVE_COLUMN);
-
+        if self.uid.is_none() {
+            return placeholder("Настраиваем волну…", None);
+        }
         let tuned = settings::wave_names(self.wave_tuning).join(", ");
-        let source = if self.wave_queue {
-            match (&self.wave_title, tuned.is_empty()) {
-                (Some(title), _) => Some(title.clone()),
-                (None, false) => Some(format!("Моя волна · {tuned}")),
-                (None, true) => None,
-            }
+        let title = match &self.wave_title {
+            Some(title) if self.wave_queue => clipped(title, WAVE_LABEL),
+            _ => "Моя волна".to_string(),
+        };
+        let playing = self.wave_queue && self.is_playing();
+        // Играет волна — кнопка ставит её на паузу; играет что-то другое — включает волну.
+        let press = if self.wave_queue { Message::Toggle } else { Message::WaveStart };
+        // 64 + 2 × 8 = 80: при радиусе 40 у стиля кнопка ровно круглая.
+        let play = shine(button(container(ui::icon(if playing { ui::PAUSE } else { ui::PLAY }, 36.0, ui::ON_ACCENT)).center(64)).padding(8).style(ui::round).on_press(press), 40.0);
+        let note = if self.wave_loading {
+            "Настраиваем волну…".to_string()
+        } else if !tuned.is_empty() {
+            tuned.clone()
         } else {
-            self.queue_title.clone()
+            "Музыка под ваш вкус без конца".to_string()
         };
-        let close = if self.wave_queue { Message::WaveReset } else { Message::WaveStart };
-        let top: Element<'_, Message> = match source {
-            _ if self.wave_loading => text("Настраиваем волну…").size(18).font(ui::font_headline()).color(ui::MUTED).wrapping(Wrapping::None).into(),
-            // Крестик возвращает к обычной Моей волне.
-            Some(source) => {
-                let back = row![text(clipped(&source, WAVE_LABEL)).size(18).font(ui::font_headline()).color(ui::ACCENT).wrapping(Wrapping::None), ui::icon(ui::CLOSE, 20.0, ui::ACCENT)].spacing(8).align_y(Alignment::Center);
-                glow(button(back).padding([6, 14]).style(ui::source_button).on_press(close), 20.0)
-            }
-            None => text("Моя волна").size(18).font(ui::font_headline()).color(ui::ACCENT).wrapping(Wrapping::None).into(),
-        };
-
-        let body = self.player_body(track, art, line, ui::CONTENT);
-        let tune: Element<'_, Message> = if self.wave_queue {
-            let tint = if tuned.is_empty() { ui::TEXT } else { ui::ACCENT };
-            shine(button(row![ui::icon(ui::WAVE, 20.0, tint), text("Настроить").color(tint)].spacing(8).align_y(Alignment::Center)).padding([8, 16]).style(ui::secondary).on_press(Message::DialogOpen(Dialog::WaveTune)), 24.0)
-        } else {
-            Space::new().into()
-        };
-        let pin: Element<'_, Message> = if self.wave_queue && self.wave_base != [api::MY_WAVE] {
+        let tint = if tuned.is_empty() { ui::TEXT } else { ui::ACCENT };
+        let mut tools = row![shine(button(row![ui::icon(ui::WAVE, 20.0, tint), text("Настроить").color(tint)].spacing(8).align_y(Alignment::Center)).padding([8, 16]).style(ui::secondary).on_press(Message::DialogOpen(Dialog::WaveTune)), 24.0)].spacing(10).align_y(Alignment::Center);
+        if self.wave_queue && self.wave_base != [api::MY_WAVE] {
             let target = PinRef::Wave(self.wave_base.clone());
             let pinned = self.pins.iter().any(|pin| target.matches(pin));
-            shine(button(container(ui::icon(ui::PIN, 20.0, if pinned { ui::ACCENT } else { ui::TEXT })).center(20)).padding(9).style(ui::secondary).on_press(Message::Pin(target)), 20.0).into()
-        } else {
-            Space::new().into()
-        };
-        // Качество, текст, очередь и громкость есть в нижнем плеере, здесь только своё для волны.
-        let tools = row![tune, pin].spacing(10).align_y(Alignment::Center);
-        column![container(top).center_x(Length::Fill).padding(Padding::ZERO.top(8)), container(body).center(Length::Fill), tools].height(Length::Fill).into()
+            tools = tools.push(shine(button(container(ui::icon(ui::PIN, 20.0, if pinned { ui::ACCENT } else { ui::TEXT })).center(20)).padding(9).style(ui::secondary).on_press(Message::Pin(target)), 20.0));
+            // Волна от исполнителя, альбома или настроения: можно вернуться к обычной.
+            tools = tools.push(shine(button(text("К Моей волне").color(ui::TEXT)).padding([8, 16]).style(ui::secondary).on_press(Message::WaveReset), 24.0));
+        }
+        let body = column![
+            text(title).size(56).font(ui::font_headline()).color(ui::WHITE).wrapping(Wrapping::None),
+            text(note).size(16).color(if tuned.is_empty() { ui::MUTED } else { ui::ACCENT }).wrapping(Wrapping::None),
+            Space::new().height(28),
+            play,
+            Space::new().height(28),
+            tools,
+        ]
+        .spacing(8)
+        .align_x(Alignment::Center);
+        container(body).center(Length::Fill).into()
     }
 
-    /// Большой плеер: обложка, название, перемотка и кнопки. Общий у волны и плеера на всё окно.
+    /// Большой плеер на всё окно: обложка, название, перемотка и кнопки.
     /// `back` — цвет фона, которым на миг закрывается смена трека.
     fn player_body<'a>(&'a self, track: &'a Track, art: f32, line: f32, back: iced::Color) -> Element<'a, Message> {
         let side = |icon, message| glow(button(ui::icon(icon, 32.0, ui::TEXT)).padding(8).style(ui::ghost).on_press(message), 20.0);
@@ -4273,7 +4254,7 @@ impl App {
         let shift = 10.0 * rest;
         let veil = back.scale_alpha(rest);
         column![
-            reveal(button(self.wave_cover(track, art)).padding(0).style(ui::ghost).on_press_maybe((!self.player_full).then_some(Message::FullToggle))).shift(0.0, shift).veil(veil),
+            reveal(self.wave_cover(track, art)).shift(0.0, shift).veil(veil),
             Space::new().height(20),
             reveal(info).shift(0.0, shift).veil(veil),
             Space::new().height(12),
