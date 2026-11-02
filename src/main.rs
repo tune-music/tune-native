@@ -174,6 +174,8 @@ const ARTIST_COVER: &str = "artist:";
 /// За сколько до конца трека начать качать следующий.
 const PRELOAD_BEFORE: Duration = Duration::from_secs(30);
 /// Высота шапки страницы очереди: заголовок, играющий трек и «Далее в очереди».
+/// Сколько карточек показываем в «Похожем».
+const SIMILAR_LIMIT: usize = 12;
 const QUEUE_HEADER: f32 = 200.0;
 /// За сколько секунд очередь доезжает до начала, когда включили трек ниже.
 const QUEUE_SCROLL: f32 = 0.45;
@@ -358,6 +360,8 @@ enum Preview {
     Filter(String),
     /// Сведения о первом треке лайков.
     TrackInfo,
+    /// Плейлист по владельцу и номеру или альбом, прокрученные до «Похожего».
+    SimilarOf(Playlist),
     /// Очередь, прокрученная вниз, в которой включается трек ниже.
     QueueJump,
 }
@@ -445,6 +449,10 @@ struct App {
     /// Откуда играет очередь, если это не волна.
     queue_title: Option<String>,
     queue_from: QueueFrom,
+    /// Похожее на открытый альбом или плейлист.
+    similar: Vec<HomeItem>,
+    /// Превью: после загрузки похожего перейти в конец страницы.
+    preview_end: bool,
     /// Плавный подъём очереди: откуда едем и как далеко прошли, от 0 до 1.
     queue_scroll: Option<(f32, f32)>,
     /// В очереди треки волны. В режиме просмотра они есть и без сессии.
@@ -593,6 +601,7 @@ enum Message {
     PinOpen(usize),
     PinsLoaded(Result<Vec<Pin>, String>),
     PlaylistLoaded(String, Result<Vec<Track>, String>),
+    SimilarLoaded(String, Result<Vec<HomeItem>, String>),
     MenuOpen(Track),
     MenuClose,
     MenuArtists,
@@ -715,6 +724,8 @@ impl App {
             wave_pending: None,
             queue_title: None,
             queue_from: QueueFrom::Unknown,
+            similar: Vec::new(),
+            preview_end: false,
             queue_scroll: None,
             wave_queue: false,
             wave_loading: false,
@@ -850,11 +861,13 @@ impl App {
         let range = self.visible();
         let jobs = self.list(self.section).iter().skip(range.start).take(range.len()).filter_map(|t| Some((t.id.clone(), t.cover.clone()?))).collect();
         let list = self.fetch_cover_jobs(jobs, "100x100");
+        let similar = if self.section == Section::Playlists { self.similar.iter().filter_map(|item| Some((home_item_key(item), home_item_cover(item)?))).collect() } else { Vec::new() };
+        let similar = self.fetch_cover_jobs(similar, "200x200");
         let big = self.current_track().filter(|_| self.section == Section::Wave).and_then(|t| Some((format!("{WAVE_BIG}{}", t.id), t.cover.clone()?)));
         let big = self.fetch_cover_jobs(big.into_iter().collect(), "600x600");
         // Играющий трек показан и в плеере, и крупно на главной.
         let current = self.current_track().and_then(|t| Some((t.id.clone(), t.cover.clone()?))).into_iter().collect();
-        Task::batch([list, self.home_covers(), self.fetch_cover_jobs(current, "300x300"), big])
+        Task::batch([list, similar, self.home_covers(), self.fetch_cover_jobs(current, "300x300"), big])
     }
 
     fn token(&self) -> Option<String> {
@@ -1013,6 +1026,7 @@ impl App {
         cards.extend(self.liked_artists.iter().chain(&self.found.artists).chain(page.into_iter().flat_map(|a| &a.similar)).map(|c| format!("{ARTIST_COVER}{}", c.id)));
         cards.extend(self.home.blocks.iter().enumerate().flat_map(|(index, block)| block.items[self.home_shown(index, block)].iter()).map(home_item_key));
         cards.extend(self.album.iter().map(|a| format!("{ALBUM_COVER}{}", a.id)));
+        cards.extend(self.similar.iter().map(home_item_key));
         cards.extend(self.current_track().map(|t| format!("{WAVE_BIG}{}", t.id)));
         cards.extend(page.iter().map(|a| format!("{ARTIST_COVER}{}", a.id)));
         self.covers.retain(|id, _| id.starts_with(PLAYLIST_COVER) || id.starts_with(PIN_COVER_PREFIX) || cards.contains(id) || keep.contains(id));
@@ -1175,6 +1189,13 @@ impl App {
         self.load_list(playlist)
     }
 
+    fn similar_load(&self, list: &Playlist) -> Task<Message> {
+        // У своих плейлистов похожего не бывает.
+        let (Some(token), false) = (self.token(), self.is_own(list) || list.kind == FAVORITES_KIND) else { return Task::none() };
+        let (list, kind) = (list.clone(), list.kind.clone());
+        Task::perform(background(move || api::similar(&list, &token)), move |r| Message::SimilarLoaded(kind.clone(), r))
+    }
+
     fn load_list(&mut self, playlist: Playlist) -> Task<Message> {
         let Some(token) = self.token() else { return Task::none() };
         self.section = Section::Playlists;
@@ -1182,9 +1203,11 @@ impl App {
         self.playlist = Some(playlist.clone());
         self.playlist_tracks.clear();
         self.album = None;
+        self.similar.clear();
+        let similar = self.similar_load(&playlist);
         let kind = playlist.kind.clone();
         if playlist.source == Source::Album {
-            return Task::perform(background(move || api::album(&playlist.kind, &token)), move |r| Message::AlbumLoaded(kind.clone(), r));
+            return Task::batch([similar, Task::perform(background(move || api::album(&playlist.kind, &token)), move |r| Message::AlbumLoaded(kind.clone(), r))]);
         }
         self.list_meta = None;
         let meta = if playlist.source == Source::Playlist {
@@ -1194,7 +1217,7 @@ impl App {
         } else {
             Task::none()
         };
-        Task::batch([meta, Task::perform(background(move || api::playlist_tracks(&playlist, &token)), move |r| Message::PlaylistLoaded(kind.clone(), r))])
+        Task::batch([similar, meta, Task::perform(background(move || api::playlist_tracks(&playlist, &token)), move |r| Message::PlaylistLoaded(kind.clone(), r))])
     }
 
     fn wave_load(&mut self, seeds: Vec<String>, title: Option<String>, autoplay: bool) -> Task<Message> {
@@ -1474,6 +1497,11 @@ impl App {
                     Some(Preview::Home) => {
                         self.preview = None;
                         self.update(Message::Open(Section::Home))
+                    }
+                    Some(Preview::SimilarOf(list)) => {
+                        self.preview = None;
+                        self.preview_end = true;
+                        self.open_list(list)
                     }
                     Some(Preview::Album(id)) => {
                         self.preview = None;
@@ -2049,6 +2077,16 @@ impl App {
             Message::PlaylistOpen(index) => {
                 if let Some(playlist) = self.playlists.get(index).cloned() {
                     return self.open_list(playlist);
+                }
+            }
+            Message::SimilarLoaded(kind, result) => {
+                if self.playlist.as_ref().is_some_and(|list| list.kind == kind) {
+                    // Похожее не главное на странице: если не пришло, просто его не показываем.
+                    self.similar = result.unwrap_or_default();
+                    self.similar.truncate(SIMILAR_LIMIT);
+                    if std::mem::take(&mut self.preview_end) {
+                        return operation::snap_to(Id::new(LIST), scrollable::RelativeOffset { x: 0.0, y: 1.0 });
+                    }
                 }
             }
             Message::PlaylistLoaded(kind, result) => {
@@ -3633,6 +3671,10 @@ impl App {
             });
         }
         list = list.push(Space::new().height((total - range.end) as f32 * ROW));
+        if section == Section::Playlists && !self.filtering() && !self.similar.is_empty() {
+            let cards = self.similar.iter().fold(row![].spacing(4), |cards, item| cards.push(self.view_home_item(item)));
+            list = list.push(Space::new().height(24)).push(text("Похожее").size(24).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None)).push(Space::new().height(8)).push(cards.wrap()).push(Space::new().height(16));
+        }
         ui::scroll(list).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).height(Length::Fill).into()
     }
 
@@ -4314,6 +4356,11 @@ fn main() -> iced::Result {
             "playlist" => Preview::Playlist,
             "playlist-home" => Preview::PlaylistHome,
             what if what.starts_with("filter:") => Preview::Filter(what[7..].to_string()),
+            what if what.starts_with("similar-album:") => Preview::SimilarOf(Playlist::album(&what[14..], "")),
+            what if what.starts_with("similar-list:") => {
+                let (owner, kind) = what[13..].split_once('_').unwrap_or_default();
+                Preview::SimilarOf(Playlist { source: Source::Playlist, owner: owner.to_string(), kind: kind.to_string(), title: "Плейлист".to_string(), count: 1, cover: None })
+            }
             what if what.starts_with("album:") => Preview::Album(what[6..].to_string()),
             what if what.starts_with("artist:") => Preview::Artist(what[7..].to_string()),
             query => Preview::Search(query.to_string()),

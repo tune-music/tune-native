@@ -731,12 +731,32 @@ fn parse_home_item(v: &Value) -> Option<HomeItem> {
     if data["album"].is_object() {
         return album_card(&data["album"]).map(HomeItem::Album);
     }
-    let seeds: Vec<String> = data["seeds"].as_array()?.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+    // В похожем волна лежит глубже: название и зёрна в wave, обложка в agent.
+    let wave = &data["wave"];
+    let seeds: Vec<String> = data["seeds"].as_array().or(wave["seeds"].as_array())?.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
     if seeds.is_empty() {
         return None;
     }
-    let cover = data["backgroundImageUrl"].as_str().or(data["imageUrl"].as_str()).map(str::to_string).or_else(|| cover_uri(data));
-    Some(HomeItem::Wave { title: data["title"].as_str()?.to_string(), seeds, cover })
+    let cover = data["backgroundImageUrl"].as_str().or(data["imageUrl"].as_str()).or(data["agent"]["cover"]["uri"].as_str()).map(str::to_string).or_else(|| cover_uri(data));
+    Some(HomeItem::Wave { title: data["title"].as_str().or(wave["name"].as_str())?.to_string(), seeds, cover })
+}
+
+fn parse_similar(v: &Value) -> Vec<HomeItem> {
+    result(v)["items"].as_array().into_iter().flatten().filter_map(parse_home_item).collect()
+}
+
+/// Похожее на альбом или плейлист: альбомы, плейлисты, исполнители и волны.
+pub fn similar(list: &Playlist, token: &str) -> Result<Vec<HomeItem>, String> {
+    let path = match list.source {
+        Source::Album => format!("albums/{}/similar-entities", list.kind),
+        Source::Artist => return Ok(Vec::new()),
+        Source::Playlist => {
+            let v = get(&format!("users/{}/playlists/{}", list.owner, list.kind), &[("rich-tracks", "true")], token)?;
+            let Some(uuid) = result(&v)["playlistUuid"].as_str() else { return Ok(Vec::new()) };
+            format!("playlist/{uuid}/similar-entities")
+        }
+    };
+    Ok(parse_similar(&get(&path, &[], token)?))
 }
 
 /// У блоков главной разные ответы, но элементы в них одни и те же.
@@ -1171,6 +1191,19 @@ mod tests {
         assert!(cache.entries.len() <= CACHE_SIZE);
         assert_eq!(cache.get("k0", now + CACHE_TIME / 2), None);
         assert!(!cacheable("music-history") && !cacheable("get-file-info") && cacheable("albums/1/with-tracks"));
+    }
+
+    #[test]
+    fn parses_similar() {
+        let json = r#"{"result":{"items":[
+            {"type":"wave_agent_item","data":{"agent":{"cover":{"uri":"a/%%"}},"wave":{"name":"Рок","seeds":["playlist:x_1"]}}},
+            {"type":"playlist_item","data":{"playlist":{"kind":2311,"title":"Метал","uid":103372440}}},
+            {"type":"unknown","data":{}}
+        ]}}"#;
+        let items = parse_similar(&serde_json::from_str(json).unwrap());
+        assert_eq!(items.len(), 2);
+        assert!(matches!(&items[0], HomeItem::Wave { title, seeds, cover } if title == "Рок" && seeds == &["playlist:x_1"] && cover.as_deref() == Some("a/%%")));
+        assert!(matches!(&items[1], HomeItem::Playlist(list) if list.owner == "103372440" && list.kind == "2311"));
     }
 
     #[test]
