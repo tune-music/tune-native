@@ -370,8 +370,6 @@ enum Preview {
     Account,
     LogoutAsk,
     PinMenu,
-    /// Открепление Моей волны.
-    PinHideMyWave,
     /// Нажатие на закреп под этим номером, без звука.
     PinPlay(usize),
     /// Плейлист по владельцу и номеру или альбом, прокрученные до «Похожего».
@@ -436,7 +434,6 @@ struct App {
     pin_wanted: u64,
     /// Сколько запросов на закрепление ещё идёт: пока они идут, старому списку верить нельзя.
     pin_saving: u32,
-    my_wave_hidden: bool,
     playlists: Vec<Playlist>,
     playlists_loading: bool,
     /// Открытый плейлист и его треки; показывается только начало списка.
@@ -734,7 +731,6 @@ impl App {
             pin_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
             pin_wanted: 0,
             pin_saving: 0,
-            my_wave_hidden: saved.my_wave_hidden,
             playlists: Vec::new(),
             playlists_loading: false,
             playlist: None,
@@ -836,28 +832,33 @@ impl App {
         }
     }
 
-    /// Что показать из ответа сервера: без повторов и без откреплённой Моей волны.
+    /// Что показать из ответа сервера: без повторов.
     fn pins_shown(&self, pins: Vec<Pin>) -> Vec<Pin> {
         let mut seen = HashSet::new();
-        pins.into_iter().filter(|pin| seen.insert(pin.key()) && !(self.my_wave_hidden && pin.key() == api::MY_WAVE)).collect()
+        pins.into_iter().filter(|pin| seen.insert(pin.key())).collect()
     }
 
     /// Сразу показывает новый закреп по тому, что уже известно о странице.
     fn pin_show(&mut self, target: &PinRef) -> Task<Message> {
         let pin = match target {
             PinRef::Wave(seeds) => {
-                let title = if seeds == &[api::MY_WAVE] { "Моя волна".to_string() } else { self.wave_title.clone().unwrap_or_else(|| "Волна".to_string()) };
-                Some(Pin { target: PinTarget::Wave(seeds.clone()), title, subtitle: "Волна".to_string(), cover: None, round: true })
+                let title = self.wave_title.clone().unwrap_or_else(|| "Волна".to_string());
+                Some(Pin { target: PinTarget::Wave(seeds.clone()), title, subtitle: "Волна".to_string(), cover: None, round: true, color: None })
             }
             PinRef::Album(id) => self.album.as_ref().filter(|album| album.id == *id).map(|album| {
                 let list = Playlist { cover: album.cover.clone(), ..Playlist::album(id, &album.title) };
-                Pin { target: PinTarget::List(list), title: album.title.clone(), subtitle: "Альбом".to_string(), cover: album.cover.clone(), round: false }
+                Pin { target: PinTarget::List(list), title: album.title.clone(), subtitle: "Альбом".to_string(), cover: album.cover.clone(), round: false, color: None }
             }),
             PinRef::Artist(id) => self.artist.as_ref().filter(|artist| artist.id == *id).map(|artist| {
                 let list = Playlist { cover: artist.cover.clone(), ..Playlist::artist(id, &artist.name) };
-                Pin { target: PinTarget::List(list), title: artist.name.clone(), subtitle: "Исполнитель".to_string(), cover: artist.cover.clone(), round: true }
+                Pin { target: PinTarget::List(list), title: artist.name.clone(), subtitle: "Исполнитель".to_string(), cover: artist.cover.clone(), round: true, color: None }
             }),
-            PinRef::Playlist(..) => self.playlist.clone().map(|list| Pin { title: list.title.clone(), subtitle: "Плейлист".to_string(), cover: list.cover.clone(), target: PinTarget::List(list), round: false }),
+            // «Мне нравится» открыто отдельной страницей, а не как плейлист.
+            PinRef::Playlist(owner, kind) if kind == FAVORITES_KIND => {
+                let list = Playlist { source: Source::Playlist, owner: owner.clone(), kind: kind.clone(), title: "Мне нравится".to_string(), count: 0, cover: None };
+                Some(Pin { title: list.title.clone(), subtitle: "Плейлист".to_string(), cover: None, target: PinTarget::List(list), round: false, color: None })
+            }
+            PinRef::Playlist(..) => self.playlist.clone().map(|list| Pin { title: list.title.clone(), subtitle: "Плейлист".to_string(), cover: list.cover.clone(), target: PinTarget::List(list), round: false, color: None }),
         };
         let Some(pin) = pin else { return Task::none() };
         let job = pin.cover.clone().map(|cover| (format!("{PIN_COVER_PREFIX}{}", pin.key()), cover));
@@ -890,7 +891,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, my_wave_hidden: self.my_wave_hidden, wave: self.wave_tuning });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -1635,7 +1636,7 @@ impl App {
                         self.preview = None;
                         self.update(Message::DialogOpen(Dialog::Logout))
                     }
-                    Some(Preview::PinMenu | Preview::PinHideMyWave | Preview::PinPlay(_)) => Task::none(),
+                    Some(Preview::PinMenu | Preview::PinPlay(_)) => Task::none(),
                     Some(Preview::Search(query)) => {
                         self.preview = None;
                         self.section = Section::Search;
@@ -1656,17 +1657,12 @@ impl App {
                 return Task::batch([pins, page]);
             }
             Message::PinsLoaded(Ok(pins)) => {
-                let preview_hide = matches!(self.preview, Some(Preview::PinHideMyWave));
                 if self.pin_saving > 0 {
                     return Task::none();
                 }
                 self.pins = self.pins_shown(pins);
                 let jobs = self.pins.iter().filter_map(|p| Some((format!("{PIN_COVER_PREFIX}{}", p.key()), p.cover.clone()?))).collect();
                 let covers = self.fetch_cover_jobs(jobs, "100x100");
-                if preview_hide {
-                    self.preview = None;
-                    return Task::batch([covers, self.handle(Message::Pin(PinRef::Wave(vec![api::MY_WAVE.to_string()])))]);
-                }
                 match self.preview.clone() {
                     Some(Preview::PinMenu) => {
                         self.preview = None;
@@ -2472,23 +2468,12 @@ impl App {
                 self.pin_menu = None;
                 let Some(token) = self.token() else { return Task::none() };
                 let pinned = !self.pins.iter().any(|pin| target.matches(pin));
-                let my_wave = matches!(&target, PinRef::Wave(seeds) if seeds == &[api::MY_WAVE]);
                 if pinned {
                     let covers = self.pin_show(&target);
-                    if my_wave {
-                        // Основная Моя волна и так есть на сервере: повторный запрос добавил бы вторую.
-                        self.my_wave_hidden = false;
-                        self.save_settings();
-                        return covers;
-                    }
                     self.pin_saving += 1;
                     return Task::batch([covers, Task::perform(background(move || api::set_pinned(&target, true, &token)), Message::PinSaved)]);
                 }
                 self.pins.retain(|pin| !target.matches(pin));
-                if my_wave {
-                    self.my_wave_hidden = true;
-                    self.save_settings();
-                }
                 self.pin_saving += 1;
                 return Task::perform(background(move || api::set_pinned(&target, false, &token)), Message::PinSaved);
             }
@@ -3395,10 +3380,16 @@ impl App {
             .fold(column![].spacing(4), |list, (index, pin)| {
                 let radius = if pin.round { 20.0 } else { 6.0 };
                 let cover: Element<'_, Message> = match self.covers.get(&format!("{PIN_COVER_PREFIX}{}", pin.key())) {
-                    Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle)).width(40).height(40).border_radius(radius).into(),
+                    Some(handle) => {
+                        let picture = image(handle.clone()).opacity(self.cover_alpha(handle)).width(40).height(40).border_radius(radius);
+                        match pin.color.as_deref().and_then(ui::hex_color) {
+                            Some(color) => container(picture).style(move |_| container::Style::default().background(color).border(iced::border::rounded(radius))).into(),
+                            None => picture.into(),
+                        }
+                    }
                     None => container(Space::new()).width(40).height(40).style(if pin.round { ui::avatar } else { ui::tile }).into(),
                 };
-                let line = row![
+                let mut line = row![
                     cover,
                     column![
                         text(&pin.title).size(13).font(ui::font_medium()).color(if self.pin_active(pin) { ui::ACCENT } else { ui::TEXT }).wrapping(Wrapping::None),
@@ -3406,11 +3397,16 @@ impl App {
                     ]
                     .width(Length::Fill)
                     .clip(true),
-                    glow(button(ui::icon(ui::MORE, 16.0, ui::MUTED)).padding(4).style(ui::ghost).on_press(Message::PinMenu(index)), 14.0),
                 ]
                 .spacing(10)
                 .align_y(Alignment::Center);
-                list.push(mouse_area(glow(button(line).width(Length::Fill).padding(6).style(ui::row).on_press(Message::PinOpen(index)), 8.0)).on_right_press(Message::PinMenu(index)))
+                // У Моей волны нет ни страницы, ни открепления, так что и меню не нужно.
+                let menu = pin.removable();
+                if menu {
+                    line = line.push(glow(button(ui::icon(ui::MORE, 16.0, ui::MUTED)).padding(4).style(ui::ghost).on_press(Message::PinMenu(index)), 14.0));
+                }
+                let row = glow(button(line).width(Length::Fill).padding(6).style(ui::row).on_press(Message::PinOpen(index)), 8.0);
+                list.push(if menu { Element::from(mouse_area(row).on_right_press(Message::PinMenu(index))) } else { row.into() })
             })
             .into()
     }
@@ -3509,7 +3505,7 @@ impl App {
         } else {
             Space::new().into()
         };
-        let pin: Element<'_, Message> = if self.wave_queue {
+        let pin: Element<'_, Message> = if self.wave_queue && self.wave_base != [api::MY_WAVE] {
             let target = PinRef::Wave(self.wave_base.clone());
             let pinned = self.pins.iter().any(|pin| target.matches(pin));
             shine(button(container(ui::icon(ui::PIN, 20.0, if pinned { ui::ACCENT } else { ui::TEXT })).center(20)).padding(9).style(ui::secondary).on_press(Message::Pin(target)), 20.0).into()
@@ -3628,6 +3624,13 @@ impl App {
     }
 
     /// Крестик лежит внутри поля, чтобы при вводе оно не сдвигалось.
+    fn view_likes_pin<'a>(&self) -> Element<'a, Message> {
+        let Some(uid) = self.uid.clone() else { return Space::new().into() };
+        let target = PinRef::Playlist(uid, FAVORITES_KIND.to_string());
+        let pinned = self.pins.iter().any(|pin| target.matches(pin));
+        shine(button(container(ui::icon(ui::PIN, 20.0, if pinned { ui::ACCENT } else { ui::TEXT })).center(20)).padding(7).style(ui::secondary).on_press(Message::Pin(target)), 20.0).into()
+    }
+
     fn view_filter<'a>(&self) -> Element<'a, Message> {
         let width = if self.main_width() < FILTER_WIDE { FILTER_WIDTH_SMALL } else { FILTER_WIDTH };
         let input = text_input("Поиск по трекам", &self.filter).id(FILTER_INPUT).on_input(Message::Filter).padding(Padding { top: 8.0, right: 34.0, bottom: 8.0, left: 16.0 }).size(14).width(width).style(ui::input);
@@ -3657,6 +3660,7 @@ impl App {
         let title = row![
             glow(button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0),
             container(name).width(Length::Fill).clip(true),
+            self.view_likes_pin(),
             self.view_filter(),
         ]
         .spacing(12)
@@ -4641,7 +4645,6 @@ fn main() -> iced::Result {
             "account" => Preview::Account,
             "logout-ask" => Preview::LogoutAsk,
             "pin-menu" => Preview::PinMenu,
-            "pin-hide-my-wave" => Preview::PinHideMyWave,
             "pin-play-0" => Preview::PinPlay(0),
             "pin-play-1" => Preview::PinPlay(1),
             "pin-play-2" => Preview::PinPlay(2),

@@ -275,6 +275,13 @@ pub fn source_button(_: &Theme, _: button::Status) -> button::Style {
     flat(None, ACCENT, 20.0)
 }
 
+/// Цвет из ответа Яндекса, вида #2AA75B.
+pub fn hex_color(hex: &str) -> Option<Color> {
+    let digits = hex.strip_prefix('#').filter(|digits| digits.len() == 6)?;
+    let part = |at: usize| u8::from_str_radix(digits.get(at..at + 2)?, 16).ok();
+    Some(Color::from_rgb8(part(0)?, part(2)?, part(4)?))
+}
+
 /// Полоса прокрутки: тонкий скруглённый бегунок без дорожки.
 const SCROLL_WIDTH: f32 = 6.0;
 const SCROLL_MARGIN: f32 = 4.0;
@@ -356,6 +363,15 @@ pub fn scroll<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Scrollable<'a, M
 #[cfg(test)]
 mod scroll_tests {
     use super::*;
+
+    #[test]
+    fn reads_hex_colors() {
+        assert_eq!(hex_color("#000000"), Some(Color::BLACK));
+        assert_eq!(hex_color("#FFFFFF"), Some(Color::WHITE));
+        assert_eq!(hex_color("2AA75B"), None);
+        assert_eq!(hex_color("#12"), None);
+        assert_eq!(hex_color("#GGGGGG"), None);
+    }
 
     #[test]
     fn glow_reaches_target_and_stops() {

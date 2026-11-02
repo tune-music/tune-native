@@ -118,6 +118,8 @@ pub struct Pin {
     pub subtitle: String,
     pub cover: Option<String>,
     pub round: bool,
+    /// Цвет под картинкой волны: сама картинка прозрачная.
+    pub color: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -505,7 +507,7 @@ fn parse_pin(item: &Value) -> Option<Pin> {
             let owner = id_text(&data["uid"])?;
             let title = data["title"].as_str()?.to_string();
             let target = Playlist { source: Source::Playlist, owner, kind: id_text(&data["kind"])?, title: title.clone(), count: 0, cover: cover.clone() };
-            Some(Pin { target: PinTarget::List(target), title, subtitle: "Плейлист".to_string(), cover, round: false })
+            Some(Pin { target: PinTarget::List(target), title, subtitle: "Плейлист".to_string(), cover, round: false, color: None })
         }
         "wave_item" => {
             let seeds = data["seeds"].as_array()?.iter().filter_map(|s| s.as_str().map(str::to_string)).collect();
@@ -513,17 +515,17 @@ fn parse_pin(item: &Value) -> Option<Pin> {
             let title = data["title"].as_str()?.to_string();
             // Подпись говорит, по чему волна: «Моя волна по альбому» и так далее.
             let subtitle = data["header"].as_str().filter(|header| *header != title).unwrap_or("Волна").to_string();
-            Some(Pin { target: PinTarget::Wave(seeds), title, subtitle, cover, round: true })
+            Some(Pin { target: PinTarget::Wave(seeds), title, subtitle, cover, round: true, color: data["colors"]["average"].as_str().map(str::to_string) })
         }
         "album_item" => {
             let title = data["title"].as_str()?;
             let cover = data["coverUri"].as_str();
-            Some(Pin { target: PinTarget::List(list(Source::Album, title, cover)), title: title.to_string(), subtitle: "Альбом".to_string(), cover: cover.map(str::to_string), round: false })
+            Some(Pin { target: PinTarget::List(list(Source::Album, title, cover)), title: title.to_string(), subtitle: "Альбом".to_string(), cover: cover.map(str::to_string), round: false, color: None })
         }
         "artist_item" => {
             let title = data["name"].as_str()?;
             let cover = data["cover"]["uri"].as_str().or(data["coverUri"].as_str());
-            Some(Pin { target: PinTarget::List(list(Source::Artist, title, cover)), title: title.to_string(), subtitle: "Исполнитель".to_string(), cover: cover.map(str::to_string), round: true })
+            Some(Pin { target: PinTarget::List(list(Source::Artist, title, cover)), title: title.to_string(), subtitle: "Исполнитель".to_string(), cover: cover.map(str::to_string), round: true, color: None })
         }
         _ => None,
     }
@@ -958,6 +960,11 @@ pub enum PinRef {
 }
 
 impl Pin {
+    /// Мою волну Яндекс возвращает всегда, поэтому открепить её нельзя.
+    pub fn removable(&self) -> bool {
+        self.key() != MY_WAVE
+    }
+
     /// Ссылка на этот закреп для запроса на открепление.
     pub fn reference(&self) -> PinRef {
         match &self.target {
@@ -1249,7 +1256,7 @@ mod tests {
 
     #[test]
     fn pin_reference_matches_its_target() {
-        let list = |source, owner: &str, kind: &str| Pin { target: PinTarget::List(Playlist { source, owner: owner.to_string(), kind: kind.to_string(), title: String::new(), count: 0, cover: None }), title: String::new(), subtitle: String::new(), cover: None, round: false };
+        let list = |source, owner: &str, kind: &str| Pin { target: PinTarget::List(Playlist { source, owner: owner.to_string(), kind: kind.to_string(), title: String::new(), count: 0, cover: None }), title: String::new(), subtitle: String::new(), cover: None, round: false, color: None };
         assert!(PinRef::Album("1".into()).matches(&list(Source::Album, "", "1")));
         assert!(!PinRef::Album("1".into()).matches(&list(Source::Artist, "", "1")));
         assert!(PinRef::Playlist("5".into(), "7".into()).matches(&list(Source::Playlist, "5", "7")));
@@ -1300,8 +1307,15 @@ mod tests {
 
     #[test]
     fn pin_key_of_my_wave_is_its_seed() {
-        let pin = Pin { target: PinTarget::Wave(vec![MY_WAVE.to_string()]), title: String::new(), subtitle: String::new(), cover: None, round: true };
+        let pin = Pin { target: PinTarget::Wave(vec![MY_WAVE.to_string()]), title: String::new(), subtitle: String::new(), cover: None, round: true, color: None };
         assert_eq!(pin.key(), MY_WAVE);
+        assert!(!pin.removable());
+    }
+
+    #[test]
+    fn pinned_wave_keeps_its_color() {
+        let v: Value = serde_json::from_str(r##"{"type":"wave_item","data":{"colors":{"average":"#2AA75B"},"seeds":["user:onyourwave"],"title":"Моя волна"}}"##).unwrap();
+        assert_eq!(parse_pin(&v).unwrap().color.as_deref(), Some("#2AA75B"));
     }
 
     #[test]
@@ -1309,6 +1323,8 @@ mod tests {
         let v: Value = serde_json::from_str(r#"{"type":"wave_item","data":{"agent":{"cover":{"uri":""}},"backgroundImageUrl":"","header":"Моя волна по альбому","seeds":["album:7"],"title":"Альбом"}}"#).unwrap();
         let pin = parse_pin(&v).unwrap();
         assert_eq!(pin.subtitle, "Моя волна по альбому");
+        assert!(pin.removable());
+        assert_eq!(pin.color, None);
         assert_eq!(pin.cover, None);
         assert!(pin.reference().matches(&pin));
         assert_eq!(pin.reference().body(), json!({"seeds":["album:7"]}));
