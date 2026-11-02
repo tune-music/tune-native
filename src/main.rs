@@ -142,7 +142,8 @@ const ARTIST_SEARCH: u32 = 5;
 const PAGE_FADE: f32 = 0.26;
 /// На сколько точек новая страница сдвинута в начале появления.
 const PAGE_SHIFT: f32 = 22.0;
-const TAB_SHIFT: f32 = 36.0;
+/// За сколько секунд проявляется содержимое другой вкладки.
+const AREA_FADE: f32 = 0.2;
 /// Смена трека в Моей волне.
 const TRACK_FADE: f32 = 0.3;
 /// Появление и исчезновение меню, окон и уведомлений, в секундах.
@@ -425,8 +426,6 @@ struct App {
     searched: bool,
     /// Уже полученные вкладки текущего запроса: возврат на них не ждёт сети.
     search_cache: HashMap<(String, SearchTab), Found>,
-    /// Вкладка сменилась, а её результаты ещё в пути: въезжать она будет, когда они придут.
-    search_slide: Option<f32>,
     liked_albums: Vec<Card>,
     liked_artists: Vec<Card>,
     searching: bool,
@@ -538,6 +537,8 @@ struct App {
     quality_menu: Option<(f32, f32)>,
     /// Что ещё закрывает новую страницу, от 1 до 0.
     page_veil: f32,
+    /// То же для области под вкладками поиска и главной.
+    area_veil: f32,
     /// Откуда въезжает страница.
     page_shift: (f32, f32),
     /// Насколько выехала верхняя строка трекбара, от 0 до 1.
@@ -789,7 +790,6 @@ impl App {
             search_tab: SearchTab::All,
             searched: false,
             search_cache: HashMap::new(),
-            search_slide: None,
             liked_albums: Vec::new(),
             liked_artists: Vec::new(),
             searching: false,
@@ -867,6 +867,7 @@ impl App {
             forward: Vec::new(),
             quality_menu: None,
             page_veil: 0.0,
+            area_veil: 0.0,
             page_shift: (0.0, 0.0),
             bar_top: 0.0,
             track_veil: 0.0,
@@ -912,7 +913,7 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        self.pin_fade.busy() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.dialog_fade.busy() || self.notice_fade.busy()
+        self.pin_fade.busy() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.dialog_fade.busy() || self.notice_fade.busy()
     }
 
     /// Сколько места занимает основная часть окна.
@@ -1195,7 +1196,6 @@ impl App {
         }
         if let Some(found) = self.search_cache.get(&(text.clone(), self.search_tab)).cloned() {
             self.searching = false;
-            self.search_slide = None;
             return self.search_show(found);
         }
         self.searching = true;
@@ -1618,11 +1618,12 @@ impl App {
             return iced::exit();
         }
         if let Message::Frame(now) = message {
-            if self.page_veil > 0.0 && std::env::var_os("TUNE_FRAMES").is_some() {
-                eprintln!("кадр {:.1} мс, переход {:.2}", self.last_frame.map_or(0.0, |last| now.duration_since(last).as_secs_f32() * 1000.0), self.page_veil);
+            if self.page_veil.max(self.area_veil) > 0.0 && std::env::var_os("TUNE_FRAMES").is_some() {
+                eprintln!("кадр {:.1} мс, переход {:.2}, вкладка {:.2}", self.last_frame.map_or(0.0, |last| now.duration_since(last).as_secs_f32() * 1000.0), self.page_veil, self.area_veil);
             }
             let elapsed = self.last_frame.map_or(0.0, |last| now.duration_since(last).as_secs_f32()).min(FRAME_LIMIT);
             self.page_veil = (self.page_veil - elapsed / PAGE_FADE).max(0.0);
+            self.area_veil = (self.area_veil - elapsed / AREA_FADE).max(0.0);
             self.track_veil = (self.track_veil - elapsed / TRACK_FADE).max(0.0);
             let bar_top = self.bar_top_target();
             self.bar_top = if bar_top > self.bar_top { (self.bar_top + elapsed / BAR_TOP_FADE).min(bar_top) } else { (self.bar_top - elapsed / BAR_TOP_FADE).max(bar_top) };
@@ -1653,8 +1654,9 @@ impl App {
         let place = self.list_place();
         let back = matches!(message, Message::Back);
         let rank = self.section as u8;
-        let tab = self.search_tab as u8;
+        let tab = (self.search_tab, self.home_tab);
         let ready = self.page_ready();
+        let loading = self.area_loading();
         let task = self.handle(message);
         // Другой список открывается с начала.
         let snap = if place == self.list_place() {
@@ -1674,16 +1676,14 @@ impl App {
             operation::snap_to(Id::new(LIST), scrollable::RelativeOffset::START)
         };
         if place == self.list_place() {
-            let now = self.search_tab as u8;
-            if self.section == Section::Search && now != tab {
-                // Вкладка въезжает с той стороны, где стоит, и сразу готовой:
-                // пока результаты в пути, на месте остаются прежние.
-                let shift = if now > tab { TAB_SHIFT } else { -TAB_SHIFT };
-                if self.searching {
-                    self.search_slide = Some(shift);
-                } else {
-                    self.page_veil = 1.0;
-                    self.page_shift = (shift, 0.0);
+            let tabbed = matches!(self.section, Section::Search | Section::Home);
+            if tabbed && (self.search_tab, self.home_tab) != tab {
+                // Другая вкладка проявляется на месте, без сдвига: шапка и кнопки не трогаются.
+                self.area_veil = 1.0;
+            } else if tabbed {
+                // Результаты пришли: они проявляются, если переход вкладки уже закончился.
+                if loading && !self.area_loading() && self.area_veil == 0.0 {
+                    self.area_veil = 0.85;
                 }
             } else if !ready && self.page_ready() && self.page_veil == 0.0 {
                 // Страница дождалась данных: они проявляются, а не выскакивают. Если переход
@@ -1731,6 +1731,21 @@ impl App {
     }
 
     /// Есть ли что показать на странице, или она ещё ждёт данных.
+    /// Грузится содержимое под вкладками поиска или главной.
+    fn area_loading(&self) -> bool {
+        match self.section {
+            Section::Search => self.searching,
+            Section::Home => self.home_loading,
+            _ => false,
+        }
+    }
+
+    /// Пелена над областью под вкладками.
+    fn area<'a>(&self, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+        let rest = 1.0 - anim::ease_out(1.0 - self.area_veil);
+        reveal(content).veil(ui::CONTENT.scale_alpha(rest)).into()
+    }
+
     fn page_ready(&self) -> bool {
         match self.section {
             Section::Likes | Section::Playlists if self.filtering() => true,
@@ -2279,10 +2294,6 @@ impl App {
                     return Task::none();
                 }
                 self.searching = false;
-                if let Some(shift) = self.search_slide.take() {
-                    self.page_veil = 1.0;
-                    self.page_shift = (shift, 0.0);
-                }
                 match result {
                     Ok(found) => {
                         self.search_cache.insert((text, tab), found.clone());
@@ -4275,7 +4286,7 @@ impl App {
         }
         let found = &self.found;
         let nothing = found.tracks.is_empty() && found.albums.is_empty() && found.artists.is_empty() && found.playlists.is_empty();
-        let center: Element<'_, Message> = if self.searching && self.search_slide.is_none() {
+        let center: Element<'_, Message> = if self.searching {
             skeleton_list()
         } else if nothing {
             placeholder("Ничего не нашлось", Some("Попробуйте написать иначе"))
@@ -4299,7 +4310,7 @@ impl App {
             }
             ui::scroll(blocks).id(LIST).width(Length::Fill).height(Length::Fill).into()
         };
-        page.push(center).into()
+        page.push(self.area(center)).into()
     }
 
     fn view_home(&self) -> Element<'_, Message> {
@@ -4311,7 +4322,7 @@ impl App {
         }
         let page = column![text("Главная").size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None), tabs].spacing(16).height(Length::Fill);
         if self.home_loading || self.home.blocks.is_empty() {
-            return page.push(if self.home_loading { skeleton_home(self.cards_in_row()) } else { placeholder("Пока здесь пусто", None) }).into();
+            return page.push(self.area(if self.home_loading { skeleton_home(self.cards_in_row()) } else { placeholder("Пока здесь пусто", None) })).into();
         }
         let in_row = self.cards_in_row();
         let blocks = self.home.blocks.iter().enumerate().fold(column![].spacing(12).padding(Padding::ZERO.right(SCROLLBAR)), |blocks, (index, block)| {
@@ -4338,7 +4349,7 @@ impl App {
             }
             blocks.push(body).push(Space::new().height(8))
         });
-        page.push(ui::scroll(blocks).id(LIST).width(Length::Fill).height(Length::Fill)).into()
+        page.push(self.area(ui::scroll(blocks).id(LIST).width(Length::Fill).height(Length::Fill))).into()
     }
 
     fn view_home_item<'a>(&self, item: &'a HomeItem) -> Element<'a, Message> {
