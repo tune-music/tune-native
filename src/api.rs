@@ -382,6 +382,16 @@ pub fn search_playlist(uid: &str, kind: &str, part: &str, token: &str) -> Result
     Ok(tracks)
 }
 
+fn parse_credits(v: &Value) -> Vec<(String, String)> {
+    let items = result(v)["credits"].as_array().into_iter().flatten();
+    items.filter_map(|item| Some((item["title"].as_str()?.to_string(), item["value"].as_str().filter(|value| !value.is_empty())?.to_string()))).collect()
+}
+
+/// Сведения о треке: исполнитель, авторы, лейбл.
+pub fn credits(id: &str, token: &str) -> Result<Vec<(String, String)>, String> {
+    Ok(parse_credits(&get(&format!("tracks/{id}/credits"), &[], token)?))
+}
+
 pub fn set_liked(uid: &str, track_id: &str, liked: bool, token: &str) -> Result<(), String> {
     let path = if liked {
         format!("users/{uid}/likes/tracks/add?track-id={track_id}")
@@ -1161,6 +1171,13 @@ mod tests {
         assert!(cache.entries.len() <= CACHE_SIZE);
         assert_eq!(cache.get("k0", now + CACHE_TIME / 2), None);
         assert!(!cacheable("music-history") && !cacheable("get-file-info") && cacheable("albums/1/with-tracks"));
+    }
+
+    #[test]
+    fn parses_credits() {
+        let credits = |json: &str| parse_credits(&serde_json::from_str(json).unwrap());
+        assert_eq!(credits(r#"{"result":{"credits":[{"title":"Лейбл","value":"А"},{"title":"Пусто","value":""}]}}"#), [("Лейбл".to_string(), "А".to_string())]);
+        assert!(credits(r#"{"result":{}}"#).is_empty());
     }
 
     #[test]

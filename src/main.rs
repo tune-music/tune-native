@@ -114,6 +114,8 @@ const LYRICS_CHROME: f32 = 300.0;
 const SESSION_SAVE: Duration = Duration::from_secs(10);
 const DIALOG_INPUT: &str = "dialog";
 const DIALOG_WIDTH: f32 = 400.0;
+/// Сколько окна остаётся вокруг сведений о треке.
+const INFO_MARGIN: f32 = 80.0;
 /// Сколько последних треков показать в истории.
 const HISTORY_LIMIT: usize = 200;
 /// Сколько плейлистов видно в меню трека без прокрутки.
@@ -255,6 +257,7 @@ enum Dialog {
     Describe(Playlist),
     Delete(Playlist),
     WaveTune,
+    TrackInfo(Track),
 }
 
 /// Вкладка поиска.
@@ -331,6 +334,8 @@ enum Preview {
     Search(String),
     /// Поиск внутри лайков.
     Filter(String),
+    /// Сведения о первом треке лайков.
+    TrackInfo,
 }
 
 struct App {
@@ -367,6 +372,8 @@ struct App {
     dialog_text: String,
     history_tracks: Vec<Track>,
     history_loading: bool,
+    /// Сведения о треке для окна: номер трека и строки. Пока идёт загрузка, строк нет.
+    track_info: Option<(String, Vec<(String, String)>)>,
     /// Поиск внутри открытого плейлиста или лайков.
     filter: String,
     filter_tracks: Vec<Track>,
@@ -490,6 +497,8 @@ enum Message {
     Search,
     Found(u64, Result<Found, String>),
     SearchTyped(u64),
+    MenuLyrics,
+    TrackInfoLoaded(String, Result<Vec<(String, String)>, String>),
     Filter(String),
     FilterTyped(u64),
     FilterLoaded(u64, Result<Vec<Track>, String>),
@@ -637,6 +646,7 @@ impl App {
             dialog_text: String::new(),
             history_tracks: Vec::new(),
             history_loading: false,
+            track_info: None,
             filter: String::new(),
             filter_tracks: Vec::new(),
             filter_loading: false,
@@ -1400,7 +1410,7 @@ impl App {
                         Task::batch([wave, self.update(Message::DialogOpen(Dialog::WaveTune))])
                     }
                     Some(Preview::WaveSeeded) => self.wave_load(vec!["artist:3121".to_string()], Some(wave_label("artist:3121", "Metallica")), false),
-                    Some(Preview::Likes | Preview::LikesEnd | Preview::Menu | Preview::Panels) => self.update(Message::Open(Section::Likes)),
+                    Some(Preview::Likes | Preview::LikesEnd | Preview::Menu | Preview::Panels | Preview::TrackInfo) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
                     Some(Preview::Playlists | Preview::Playlist | Preview::PlaylistHome) => self.update(Message::Open(Section::Playlists)),
                     Some(Preview::Dislikes) => {
@@ -1791,6 +1801,12 @@ impl App {
                             self.queue = self.liked.clone();
                             self.current = Some(0).filter(|_| !self.queue.is_empty());
                         }
+                        if matches!(self.preview, Some(Preview::TrackInfo)) {
+                            self.preview = None;
+                            if let Some(track) = self.liked.first().cloned() {
+                                return self.handle(Message::DialogOpen(Dialog::TrackInfo(track)));
+                            }
+                        }
                         if matches!(self.preview, Some(Preview::Panels)) {
                             self.preview = None;
                             self.queue = self.liked.clone();
@@ -2022,6 +2038,16 @@ impl App {
                     Dialog::Describe(_) => self.list_meta.as_ref().map_or_else(String::new, |meta| meta.1.clone()),
                     _ => String::new(),
                 };
+                if let Dialog::TrackInfo(track) = &dialog {
+                    let Some(token) = self.token() else { return Task::none() };
+                    let id = track.id.clone();
+                    self.track_info = None;
+                    self.dialog = Some(dialog);
+                    return Task::perform(background({
+                        let id = id.clone();
+                        move || api::credits(&id, &token)
+                    }), move |r| Message::TrackInfoLoaded(id.clone(), r));
+                }
                 let focus = !matches!(dialog, Dialog::Delete(_) | Dialog::WaveTune);
                 self.dialog = Some(dialog);
                 if focus {
@@ -2029,6 +2055,15 @@ impl App {
                 }
             }
             Message::DialogInput(value) => self.dialog_text = value,
+            Message::TrackInfoLoaded(id, result) => {
+                if matches!(&self.dialog, Some(Dialog::TrackInfo(track)) if track.id == id) {
+                    self.track_info = Some((id, result.unwrap_or_default()));
+                }
+            }
+            Message::MenuLyrics => {
+                self.menu = None;
+                return self.handle(Message::Open(Section::Lyrics));
+            }
             Message::DialogConfirm => {
                 let (Some(uid), Some(token), Some(dialog)) = (self.uid.clone(), self.token(), self.dialog.clone()) else { return Task::none() };
                 let title = self.dialog_text.trim().to_string();
@@ -2037,7 +2072,7 @@ impl App {
                 }
                 self.dialog = None;
                 return match dialog {
-                    Dialog::WaveTune => Task::none(),
+                    Dialog::WaveTune | Dialog::TrackInfo(_) => Task::none(),
                     Dialog::Create => Task::perform(background(move || api::create_playlist(&uid, &title, &token)), Message::PlaylistCreated),
                     Dialog::Rename(list) => {
                         let kind = list.kind;
@@ -2184,6 +2219,7 @@ impl App {
                 return self.play(index);
             }
             Message::QueueRemove(index) => {
+                self.menu = None;
                 if index < self.queue.len() && self.current != Some(index) {
                     let track = self.queue.remove(index);
                     if self.current.is_some_and(|i| index < i) {
@@ -2540,6 +2576,7 @@ impl App {
     fn view_dialog<'a>(&'a self, dialog: &'a Dialog) -> Element<'a, Message> {
         let (title, confirm, danger): (String, &str, bool) = match dialog {
             Dialog::WaveTune => return self.view_wave_tune(),
+            Dialog::TrackInfo(track) => return self.view_track_info(track),
             Dialog::Create => ("Новый плейлист".to_string(), "Создать", false),
             Dialog::Rename(_) => ("Название плейлиста".to_string(), "Сохранить", false),
             Dialog::Describe(_) => ("Описание плейлиста".to_string(), "Сохранить", false),
@@ -2558,6 +2595,34 @@ impl App {
         .spacing(8);
         let window = reveal(container(body.push(buttons)).width(DIALOG_WIDTH).padding(24).style(ui::popover_faded(alpha))).scale(0.94 + 0.06 * alpha, 0.5, 0.5).shift(0.0, 10.0 * (1.0 - alpha));
         // Затемнение ловит клики, чтобы страница под окном не реагировала.
+        let dim = ui::BLACK.scale_alpha(0.6 * alpha);
+        reveal(mouse_area(container(mouse_area(window).on_press(Message::DialogInput(self.dialog_text.clone()))).center(Length::Fill).style(move |_| container::Style::default().background(dim))).on_press(Message::MenuClose)).inert(!self.dialog_fade.live).into()
+    }
+
+    /// Окно со сведениями о треке.
+    fn view_track_info<'a>(&'a self, track: &'a Track) -> Element<'a, Message> {
+        let alpha = self.dialog_fade.shown();
+        let close = glow(button(ui::icon(ui::CLOSE, 20.0, ui::MUTED.scale_alpha(alpha))).padding(4).style(ui::ghost).on_press(Message::MenuClose), 16.0);
+        let head = row![text("Сведения о треке").size(20).font(ui::font_medium()).color(ui::TEXT.scale_alpha(alpha)), Space::new().width(Length::Fill), close].align_y(Alignment::Center);
+        let mut body = column![].spacing(14).width(Length::Fill).padding(Padding::ZERO.right(SCROLLBAR));
+        let mut rows: Vec<(&str, &str)> = vec![("Название", track.title.as_str())];
+        if !track.album_title.is_empty() {
+            rows.push(("Альбом", track.album_title.as_str()));
+        }
+        let duration = clock(track.duration);
+        rows.push(("Длительность", duration.as_str()));
+        let credits = self.track_info.as_ref().filter(|(id, _)| *id == track.id);
+        rows.extend(credits.into_iter().flat_map(|(_, list)| list.iter().map(|(title, value)| (title.as_str(), value.as_str()))));
+        for (title, value) in rows {
+            body = body.push(column![text(title.to_string()).size(13).color(ui::MUTED.scale_alpha(alpha)), text(value.to_string()).color(ui::TEXT.scale_alpha(alpha))].spacing(2));
+        }
+        if credits.is_none() {
+            body = body.push(text("Загружаем сведения…").color(ui::MUTED.scale_alpha(alpha)));
+        }
+        // Голова стоит первой: прокрутка занимает остаток, сколько бы ни было авторов.
+        let content = column![head, ui::scroll(body).width(Length::Fill).style(ui::scroll_still)].spacing(14);
+        let tall = WINDOW.lock().unwrap().1 - INFO_MARGIN;
+        let window = reveal(container(content).width(DIALOG_WIDTH).max_height(tall).padding(24).style(ui::popover_faded(alpha))).scale(0.94 + 0.06 * alpha, 0.5, 0.5).shift(0.0, 10.0 * (1.0 - alpha));
         let dim = ui::BLACK.scale_alpha(0.6 * alpha);
         reveal(mouse_area(container(mouse_area(window).on_press(Message::DialogInput(self.dialog_text.clone()))).center(Length::Fill).style(move |_| container::Style::default().background(dim))).on_press(Message::MenuClose)).inert(!self.dialog_fade.live).into()
     }
@@ -2709,8 +2774,20 @@ impl App {
             });
             count += 1.0;
         }
+        if self.section == Section::Queue {
+            if let Some(index) = self.queue.iter().enumerate().position(|(index, queued)| queued.id == track.id && self.current != Some(index)) {
+                items = items.push(item(ui::CLOSE, "Убрать из очереди", Message::QueueRemove(index)));
+                count += 1.0;
+            }
+        }
+        // Страница текста показывает только играющий трек.
+        if track.lyrics && self.section != Section::Lyrics && self.current_track().is_some_and(|current| current.id == track.id) {
+            items = items.push(item(ui::LYRICS, "Текст песни", Message::MenuLyrics));
+            count += 1.0;
+        }
         items = items.push(item(ui::LINK, "Скопировать ссылку", Message::CopyLink(track.clone())));
-        count += 1.0;
+        items = items.push(item(ui::INFO, "Сведения о треке", Message::DialogOpen(Dialog::TrackInfo(track.clone()))));
+        count += 2.0;
         popup(items.into(), x, y, MENU_WIDTH, count * MENU_ITEM, alpha, live)
     }
 
@@ -4087,6 +4164,7 @@ fn main() -> iced::Result {
             "likes-end" => Preview::LikesEnd,
             "panels" => Preview::Panels,
             "menu" => Preview::Menu,
+            "track-info" => Preview::TrackInfo,
             "collection" => Preview::Collection,
             "playlists" => Preview::Playlists,
             "playlist" => Preview::Playlist,
