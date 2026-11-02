@@ -1806,7 +1806,7 @@ impl App {
                         if matches!(self.preview, Some(Preview::Lyrics)) {
                             self.section = Section::Lyrics;
                             self.current = self.queue.iter().position(|track| track.lyrics).or(self.current);
-                            self.position = Duration::from_secs(70);
+                            self.position = Duration::from_secs(180);
                         }
                         if matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded | Preview::Lyrics)) {
                             self.preview = None;
