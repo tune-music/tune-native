@@ -924,6 +924,22 @@ pub fn wave_new(seeds: &[String], token: &str) -> Result<Wave, String> {
     Ok(Wave { session: session.to_string(), tracks: parse_sequence(v) })
 }
 
+/// Разбирает последнюю волну: зёрна без настроек (они выбираются отдельно) и название.
+/// У обычной Моей волны названия нет: её подпись и так постоянная.
+fn parse_last_wave(v: &Value) -> Option<(Vec<String>, Option<String>)> {
+    let seeds: Vec<String> = v["seeds"].as_array()?.iter().filter_map(|seed| seed.as_str()).filter(|seed| !seed.starts_with("setting") && !seed.starts_with("activity:")).map(str::to_string).collect();
+    if seeds.is_empty() || seeds == [MY_WAVE] {
+        return Some((vec![MY_WAVE.to_string()], None));
+    }
+    Some((seeds, v["name"].as_str().filter(|name| !name.is_empty()).map(str::to_string)))
+}
+
+/// Какая волна играла в прошлый раз.
+pub fn wave_last(token: &str) -> Result<(Vec<String>, Option<String>), String> {
+    let v = get("rotor/wave/last", &[], token)?;
+    parse_last_wave(result(&v)).ok_or_else(|| "Яндекс не вернул последнюю волну".to_string())
+}
+
 /// Следующая пачка волны; `queue` — уже показанные треки.
 pub fn wave_more(session: &str, queue: &[String], token: &str) -> Result<Vec<Track>, String> {
     let body = json!({ "queue": queue, "allowExplicit": true }).to_string();
@@ -1127,6 +1143,17 @@ mod tests {
         assert!(cache.entries.len() <= CACHE_SIZE);
         assert_eq!(cache.get("k0", now + CACHE_TIME / 2), None);
         assert!(!cacheable("music-history") && !cacheable("get-file-info") && cacheable("albums/1/with-tracks"));
+    }
+
+    #[test]
+    fn parses_last_wave() {
+        let last = |json: &str| parse_last_wave(&serde_json::from_str(json).unwrap());
+        let mine = Some((vec![MY_WAVE.to_string()], None));
+        assert_eq!(last(r#"{"name":"Моя волна","seeds":["user:onyourwave"]}"#), mine);
+        // Настройки не считаются источником волны.
+        assert_eq!(last(r#"{"seeds":["settingLanguage:russian"]}"#), mine);
+        assert_eq!(last(r#"{"name":"Metallica","seeds":["artist:3121","settingLanguage:russian"]}"#), Some((vec!["artist:3121".to_string()], Some("Metallica".to_string()))));
+        assert_eq!(last(r#"{}"#), None);
     }
 
     #[test]

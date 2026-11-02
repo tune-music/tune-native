@@ -503,6 +503,8 @@ enum Message {
     Like(Track),
     LikeSaved(Track, bool, Result<(), String>),
     WaveStart,
+    /// Какая волна играла в прошлый раз.
+    WaveLast(Result<(Vec<String>, Option<String>), String>),
     /// Обратно к Моей волне без настроек.
     WaveReset,
     /// Группа настроек и выбранный вариант.
@@ -1382,7 +1384,7 @@ impl App {
                             self.restore(saved);
                             Task::none()
                         }
-                        None => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
+                        None => self.token().map_or(Task::none(), |token| Task::perform(background(move || api::wave_last(&token)), Message::WaveLast)),
                     },
                     None => Task::none(),
                 };
@@ -1729,6 +1731,13 @@ impl App {
                 return self.fail(e);
             }
             Message::WaveStart => return self.update(Message::WaveStartSeeds(vec![api::MY_WAVE.to_string()], None)),
+            // Не вышло узнать — начинаем обычную Мою волну.
+            Message::WaveLast(result) => {
+                if self.queue.is_empty() {
+                    let (seeds, title) = result.unwrap_or_else(|_| (vec![api::MY_WAVE.to_string()], None));
+                    return self.wave_load(seeds, title, false);
+                }
+            }
             Message::WaveReset => {
                 self.wave_tuning = [0; 4];
                 self.save_settings();
