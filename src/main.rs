@@ -1191,6 +1191,7 @@ impl App {
     }
 
     fn fail(&mut self, error: String) -> Task<Message> {
+        eprintln!("ошибка: {error}");
         self.retry = None;
         if error == NEED_LOGIN {
             self.reset();
@@ -3700,7 +3701,7 @@ impl App {
                 .push(shine(button(text("Войти через Яндекс").font(ui::font_headline())).padding([10, 20]).style(ui::accent).on_press(Message::LoginOpen), 24.0));
         }
         if let Some(error) = &self.error {
-            content = content.push(text(error).color(ui::DANGER));
+            content = content.push(text(human_error(error)).color(ui::DANGER));
         }
         container(content).center(Length::Fill).style(ui::root).into()
     }
@@ -3730,11 +3731,12 @@ impl App {
         let page: Element<'_, Message> = reveal(page).shift(self.page_shift.0 * rest, self.page_shift.1 * rest).veil(back.scale_alpha(rest)).into();
         let mut page = column![page].spacing(12).height(Length::Fill);
         if let Some(error) = &self.error {
-            let mut line = row![text(error).color(ui::DANGER)].spacing(12).align_y(Alignment::Center);
+            // Плашка с понятным текстом: подробности ошибки нужны только в журнале.
+            let mut line = row![ui::icon(ui::INFO, 20.0, ui::DANGER), text(human_error(error)).color(ui::TEXT).width(Length::Fill)].spacing(12).align_y(Alignment::Center);
             if self.retry.is_some() {
                 line = line.push(shine(button(text("Повторить").color(ui::TEXT)).padding([6, 14]).style(ui::secondary).on_press(Message::Retry), 24.0));
             }
-            page = page.push(line);
+            page = page.push(container(line).width(Length::Fill).padding([10, 16]).style(ui::tile));
         }
         let mut main = column![container(page).padding(24).width(Length::Fill).height(Length::Fill).style(ui::content).clip(true)].spacing(12);
         if let Some(bar) = self.view_bar() {
@@ -3767,7 +3769,7 @@ impl App {
         }
         if let Some(notice) = &self.notice_fade.item {
             let alpha = self.notice_fade.shown();
-            let body = container(text(notice).color(ui::TEXT.scale_alpha(alpha))).padding([12, 18]).style(ui::popover_faded(alpha));
+            let body = container(text(human_error(notice)).color(ui::TEXT.scale_alpha(alpha))).padding([12, 18]).style(ui::popover_faded(alpha));
             layers = layers.push(
                 container(reveal(body).shift(0.0, -16.0 * (1.0 - alpha)).scale(0.97 + 0.03 * alpha, 0.5, 0.0).inert(true))
                     .width(Length::Fill)
@@ -4363,7 +4365,9 @@ impl App {
     /// середина свободна под будущую анимацию.
     fn view_wave(&self) -> Element<'_, Message> {
         if self.uid.is_none() {
-            return placeholder("Настраиваем волну…", None);
+            // Пока висит ошибка, волна не настраивается: обещать загрузку нечестно.
+            let note = if self.error.is_some() { "Не удалось загрузить волну" } else { "Настраиваем волну…" };
+            return placeholder(note, None);
         }
         let tuned = settings::wave_names(self.wave_tuning).join(", ");
         let title = match &self.wave_title {
@@ -5320,6 +5324,21 @@ fn popup<'a>(content: Element<'a, Message>, x: f32, y: f32, width: f32, height: 
         .into()
 }
 
+/// Ошибка словами для человека. Внутренний текст с кодами и сообщениями системы
+/// остаётся в журнале, а на экране — что случилось и что делать.
+fn human_error(error: &str) -> String {
+    const OFFLINE: &str = "Нет связи с Яндексом. Проверьте подключение к интернету";
+    let network = ["Не удалось связаться с Яндексом", "Не удалось получить файл трека", "Не удалось загрузить текст"];
+    if network.iter().any(|prefix| error.starts_with(prefix)) {
+        return OFFLINE.to_string();
+    }
+    match error.strip_prefix("Яндекс ответил ") {
+        Some(code) if code.starts_with('5') => "Яндекс сейчас не отвечает. Попробуйте чуть позже".to_string(),
+        Some(_) => "Яндекс не смог выполнить запрос. Попробуйте ещё раз".to_string(),
+        None => error.to_string(),
+    }
+}
+
 /// Подпись волны, запущенной от трека, альбома, исполнителя или плейлиста.
 fn wave_label(seed: &str, name: &str) -> String {
     let kind = match seed.split(':').next() {
@@ -6126,6 +6145,15 @@ mod lyrics_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn errors_read_like_words() {
+        let offline = "Не удалось связаться с Яндексом: io: Подключение не установлено (os error 10061)";
+        assert_eq!(human_error(offline), "Нет связи с Яндексом. Проверьте подключение к интернету");
+        assert_eq!(human_error("Яндекс ответил 503: ошибка"), "Яндекс сейчас не отвечает. Попробуйте чуть позже");
+        assert_eq!(human_error("Яндекс ответил 400: validate"), "Яндекс не смог выполнить запрос. Попробуйте ещё раз");
+        assert_eq!(human_error("Здесь пока нет треков"), "Здесь пока нет треков");
+    }
 
     #[test]
     fn picks_artist_by_name() {
