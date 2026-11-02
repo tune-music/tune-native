@@ -45,6 +45,10 @@ pub struct Track {
     pub unavailable: bool,
     /// Точки плавного перехода в секундах: нарастание и затухание. Есть только у музыки.
     pub fade: Option<Fade>,
+    /// Выпуск подкаста или глава книги: Яндекс помнит, где остановились.
+    pub remember: bool,
+    /// Где остановились в прошлый раз, секунды.
+    pub progress: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -324,7 +328,7 @@ fn fetch(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, Strin
 
 fn post(path: &str, content_type: &str, body: String, token: &str) -> Result<Value, String> {
     // Отзывы волны и отчёты о прослушивании ничего из сохранённого не меняют.
-    if !path.starts_with("rotor") && !path.starts_with("plays") && !path.starts_with("availability") {
+    if !path.starts_with("rotor") && !path.starts_with("plays") && !path.starts_with("availability") && !path.starts_with("streams") {
         forget_cache();
     }
     let resp = agent()
@@ -397,6 +401,8 @@ fn parse_track(v: &Value) -> Option<Track> {
         unavailable: v["available"].as_bool() == Some(false),
         // Как в оригинале: переход только между музыкальными треками, не подкастами и книгами.
         fade: Fade::parse(&v["fade"]).filter(|_| v["type"].as_str() == Some("music")),
+        remember: v["rememberPosition"].as_bool() == Some(true),
+        progress: v["streamProgress"]["endPositionSec"].as_f64().map(|x| x as f32),
     })
 }
 
@@ -785,10 +791,12 @@ fn album_card(v: &Value) -> Option<Card> {
 
 /// Год и вид релиза, как на карточках официального клиента: «2020 · Сингл».
 fn album_subtitle(v: &Value) -> String {
-    let kind = match v["type"].as_str() {
+    // На лендинге книг и подкастов вид альбома лежит в albumType.
+    let kind = match v["type"].as_str().or(v["albumType"].as_str()) {
         Some("single") => Some("Сингл"),
         Some("compilation") => Some("Сборник"),
         Some("podcast") => Some("Подкаст"),
+        Some("audiobook") => Some("Аудиокнига"),
         _ => None,
     };
     match (v["year"].as_u64(), kind) {
@@ -1104,6 +1112,13 @@ fn parse_home_block(title: &str, v: &Value) -> HomeBlock {
     if v["playlist"].is_object() {
         items.extend(parse_home_playlist(&v["playlist"]));
     }
+    // Промо ведёт на альбом: подкаст или книгу.
+    items.extend(v["promotions"].as_array().into_iter().flatten().filter_map(|promo| {
+        let id = promo["action"]["weblink"].as_str()?.strip_prefix("/album/")?.trim_matches('/').to_string();
+        let title = promo["title"].as_str().filter(|t| !t.is_empty())?.to_string();
+        let subtitle = promo["subtitle"].as_str().unwrap_or_default().to_string();
+        Some(HomeItem::Album(Card { id, title, subtitle, cover: promo["imageUrl"].as_str().map(str::to_string) }))
+    }));
     let favorites = &v["favorites"];
     if favorites.is_object() {
         items.push(HomeItem::Likes { count: favorites["count"].as_u64().unwrap_or(0), cover: cover_uri(favorites) });
@@ -1123,11 +1138,14 @@ fn parse_home_block(title: &str, v: &Value) -> HomeBlock {
     HomeBlock { title: title.to_string(), items, tracks, tabs }
 }
 
-/// Главная: скелет страницы и все её блоки. Блоки грузятся одновременно, порядок сохраняется.
-pub fn home(tab: usize, token: &str) -> Result<Home, String> {
-    let skeleton = get("landing/skeleton/main", &[], token)?;
+/// Страница из блоков: главная (`main`) или книги и подкасты (`non_music`). Скелет страницы
+/// и все блоки выбранной вкладки; блоки грузятся одновременно, порядок сохраняется.
+pub fn landing(skeleton: &str, tab: usize, token: &str) -> Result<Home, String> {
+    let skeleton = get(&format!("landing/skeleton/{skeleton}"), &[], token)?;
     let skeleton = result(&skeleton);
-    let tabs = &skeleton["blocks"][0]["data"]["tabs"];
+    // У книг и подкастов вкладки идут не первым блоком.
+    let blocks = skeleton["blocks"].as_array().cloned().unwrap_or_default();
+    let tabs = blocks.iter().map(|block| &block["data"]["tabs"]).find(|tabs| tabs.is_array()).unwrap_or(&Value::Null);
     let names = tabs.as_array().into_iter().flatten().filter_map(|t| t["title"].as_str().map(str::to_string)).collect();
     let sources: Vec<(String, String)> = tabs[tab]["blocks"]
         .as_array()
@@ -1148,6 +1166,13 @@ pub fn home(tab: usize, token: &str) -> Result<Home, String> {
         blocks.extend(handles.into_iter().filter_map(|h| h.join().ok().flatten()).filter(|b| (!b.title.is_empty() || b.items.iter().all(HomeItem::is_shortcut)) && (!b.items.is_empty() || !b.tracks.is_empty())));
     }
     Ok(Home { tabs: names, blocks })
+}
+
+/// Где остановились в выпуске подкаста или главе книги. Так же место видят другие устройства.
+pub fn save_progress(track: &str, position: f32, length: f32, finished: bool, token: &str) -> Result<(), String> {
+    let stamp = now();
+    let body = json!({ "lastSyncTimestamp": stamp, "trackStreams": [{ "trackId": track, "positionSec": position, "trackLengthSec": length, "finished": finished, "timestamp": stamp }] });
+    post("streams/progress/sync", "application/json", body.to_string(), token).map(|_| ())
 }
 
 /// Значение для адреса или формы.

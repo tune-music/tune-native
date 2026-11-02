@@ -207,6 +207,12 @@ const ALBUM_COVER: &str = "album:";
 const ARTIST_COVER: &str = "artist:";
 /// За сколько до конца трека начать качать следующий.
 const PRELOAD_BEFORE: Duration = Duration::from_secs(30);
+/// Выпуски и книги: шаг кнопок перемотки, как часто место уходит Яндексу, и границы,
+/// внутри которых выпуск продолжается с места, а не с начала.
+const PODCAST_STEP: f32 = 15.0;
+const PROGRESS_SAVE: Duration = Duration::from_secs(30);
+const PROGRESS_MIN: f32 = 5.0;
+const PROGRESS_TAIL: f32 = 10.0;
 /// Высота шапки страницы очереди: заголовок, играющий трек и «Далее в очереди».
 /// Сколько карточек показываем в «Похожем».
 const SIMILAR_LIMIT: usize = 12;
@@ -280,6 +286,8 @@ enum Screen {
 enum Section {
     Home,
     Wave,
+    /// Книги и подкасты: такая же страница из блоков, как главная.
+    Books,
     Collection,
     Likes,
     Playlists,
@@ -409,6 +417,7 @@ enum Preview {
     /// Восстановленная очередь и плеер на всё окно.
     Full,
     EqBar,
+    Books,
     /// Восстановленная очередь на странице волны, без звука.
     WaveRestored,
     /// В лайках набирается фильтр по буквам: в stderr — остался ли фокус.
@@ -450,6 +459,14 @@ struct App {
     home: Home,
     home_tab: usize,
     home_loading: bool,
+    /// Чья страница из блоков сейчас загружена: главная или книги и подкасты.
+    home_page: Section,
+    /// Последняя открытая вкладка главной и книг с подкастами.
+    landing_tabs: [usize; 2],
+    /// Где остановились в выпусках и книгах за этот запуск: свежее ответа сервера.
+    progress: HashMap<String, f32>,
+    /// Когда место в выпуске последний раз ушло Яндексу.
+    progress_at: Option<Instant>,
     /// С какой карточки показан блок главной.
     home_pages: HashMap<usize, usize>,
     /// Выбранная вкладка в блоках главной, у которых они есть.
@@ -681,7 +698,7 @@ enum Message {
     FilterLoaded(u64, Result<Vec<Track>, String>),
     SearchTabSet(SearchTab),
     ListOpen(Playlist),
-    HomeLoaded(usize, Result<Home, String>),
+    HomeLoaded(Section, usize, Result<Home, String>),
     HomeTab(usize),
     HomePage(usize, bool),
     /// Вкладка внутри блока главной.
@@ -864,6 +881,10 @@ impl App {
             home: Home::default(),
             home_tab: 0,
             home_loading: false,
+            home_page: Section::Home,
+            landing_tabs: [0; 2],
+            progress: HashMap::new(),
+            progress_at: None,
             home_pages: HashMap::new(),
             home_block_tabs: HashMap::new(),
             found: Found::default(),
@@ -1153,7 +1174,7 @@ impl App {
 
     /// Обложки главной: только показанных сейчас карточек.
     fn home_covers(&self) -> Task<Message> {
-        if self.section != Section::Home {
+        if !is_landing(self.section) {
             return Task::none();
         }
         let shown = self.home.blocks.iter().enumerate().flat_map(|(index, block)| block.items[self.home_shown(index, block)].iter());
@@ -1419,6 +1440,23 @@ impl App {
         self.send_plays(vec![listen.report(position, Some(reason), false)]);
     }
 
+    /// Отдаёт Яндексу место в играющем выпуске или книге и запоминает его до конца запуска.
+    fn progress_save(&mut self, finished: bool) {
+        let (Some(track), Some(token)) = (self.current_track().filter(|track| track.remember).cloned(), self.token()) else { return };
+        if !self.active && !finished {
+            return;
+        }
+        let length = track.duration.as_secs_f32();
+        let place = if finished { length } else { self.player.as_ref().map_or(self.position, Player::position).as_secs_f32() };
+        self.progress.insert(track.id.clone(), place);
+        self.progress_at = Some(Instant::now());
+        std::thread::spawn(move || {
+            if let Err(e) = api::save_progress(&track.id, place, length, finished, &token) {
+                eprintln!("место в выпуске не сохранилось: {e}");
+            }
+        });
+    }
+
     /// Откуда играет трек: контекст, его номер и страница, как их называет официальный клиент.
     fn listen_new(&self, track: &Track) -> api::Listen {
         let screen = |page: &str| format!("desktop-{page}_screen-default");
@@ -1522,9 +1560,18 @@ impl App {
         }
         let restart = self.restart.take();
         // Место прошлого запуска относится только к тому же треку.
-        let resume = self.resume.take().filter(|_| self.current == Some(index));
+        let mut resume = self.resume.take().filter(|_| self.current == Some(index));
+        // Выпуск подкаста и глава книги продолжаются там, где остановились, если не дослушаны.
+        if resume.is_none() && restart.is_none() && track.remember {
+            let place = self.progress.get(&track.id).copied().or(track.progress).unwrap_or(0.0);
+            let end = track.duration.as_secs_f32();
+            if place > PROGRESS_MIN && place < end - PROGRESS_TAIL {
+                resume = Some(Duration::from_secs_f32(place));
+            }
+        }
         // Прошлый трек закрывается, пока плеер ещё знает его место.
         if restart.is_none() {
+            self.progress_save(self.change_reason == Some("finish"));
             let again = self.change_reason == Some("finish") && self.listen.as_ref().is_some_and(|listen| listen.track == track.id);
             self.listen_finish();
             let mut listen = self.listen_new(&track);
@@ -1644,15 +1691,18 @@ impl App {
         self.play(index)
     }
 
-    fn home_load(&mut self, tab: usize) -> Task<Message> {
+    fn home_load(&mut self, page: Section, tab: usize) -> Task<Message> {
         let Some(token) = self.token() else { return Task::none() };
+        self.home_page = page;
         self.home_tab = tab;
+        self.landing_tabs[landing_index(page)] = tab;
         self.home_loading = true;
         self.home_pages.clear();
         self.home_block_tabs.clear();
         self.home.blocks.clear();
         self.error = None;
-        Task::perform(background(move || api::home(tab, &token)), move |r| Message::HomeLoaded(tab, r))
+        let skeleton = if page == Section::Books { "non_music" } else { "main" };
+        Task::perform(background(move || api::landing(skeleton, tab, &token)), move |r| Message::HomeLoaded(page, tab, r))
     }
 
     fn here(&self) -> Place {
@@ -1810,7 +1860,7 @@ impl App {
             Section::Likes | Section::Collection => &self.liked,
             Section::Playlists => &self.playlist_tracks,
             Section::Artist => self.artist.as_ref().map_or(&[], |a| a.popular.as_slice()),
-            Section::Albums | Section::Artists | Section::Home | Section::Discography | Section::Tag => &[],
+            Section::Albums | Section::Artists | Section::Home | Section::Books | Section::Discography | Section::Tag => &[],
             // На странице очереди список — то, что будет после играющего трека.
             Section::History => &self.history_tracks,
             Section::Dislikes => &self.disliked_list,
@@ -1895,7 +1945,7 @@ impl App {
             // Открыли исполнителя, альбом или другую страницу из плеера на всё окно — он уезжает.
             self.player_full = false;
             let here = self.list_place();
-            let section_root = matches!(here.0, Section::Home | Section::Likes | Section::Collection | Section::Albums | Section::Artists | Section::History | Section::Dislikes | Section::Search | Section::Settings)
+            let section_root = matches!(here.0, Section::Home | Section::Books | Section::Likes | Section::Collection | Section::Albums | Section::Artists | Section::History | Section::Dislikes | Section::Search | Section::Settings)
                 || (here.0 == Section::Playlists && here.1.is_none());
             let restore = self.scroll_places.get(&here).copied().filter(|_| remembers_scroll(here.0) && (section_root || travel));
             self.scroll_wait = restore.filter(|_| !self.page_ready());
@@ -1923,7 +1973,7 @@ impl App {
             }
         }
         if place == self.list_place() {
-            let tabbed = matches!(self.section, Section::Search | Section::Home);
+            let tabbed = matches!(self.section, Section::Search | Section::Home | Section::Books);
             if tabbed && (self.search_tab, self.home_tab) != tab {
                 // Другая вкладка проявляется на месте, без сдвига: шапка и кнопки не трогаются.
                 self.area_veil = 1.0;
@@ -1984,7 +2034,7 @@ impl App {
     fn area_loading(&self) -> bool {
         match self.section {
             Section::Search => self.searching,
-            Section::Home => self.home_loading,
+            Section::Home | Section::Books => self.home_loading,
             _ => false,
         }
     }
@@ -1998,7 +2048,7 @@ impl App {
     fn page_ready(&self) -> bool {
         match self.section {
             Section::Likes | Section::Playlists if self.filtering() => true,
-            Section::Home => !self.home.blocks.is_empty(),
+            Section::Home | Section::Books => self.home_page == self.section && !self.home.blocks.is_empty(),
             Section::Wave => self.current_track().is_some(),
             Section::Collection | Section::Settings => true,
             Section::Lyrics => self.lyrics.as_ref().is_some_and(|(id, _)| self.current_track().is_some_and(|track| track.id == *id)),
@@ -2149,6 +2199,11 @@ impl App {
                         self.preview = None;
                         self.section = Section::Wave;
                         session::load().map_or(Task::none(), |saved| self.restore(saved))
+                    }
+                    Some(Preview::Books) => {
+                        self.preview = None;
+                        self.section = Section::Books;
+                        self.home_load(Section::Books, 1)
                     }
                     Some(Preview::EqBar) => {
                         self.preview = None;
@@ -2399,7 +2454,10 @@ impl App {
                     self.playlist = None;
                 }
                 return match section {
-                    Section::Home if self.home.blocks.is_empty() && !self.home_loading => self.home_load(self.home_tab),
+                    Section::Home | Section::Books if self.home_page != section || (self.home.blocks.is_empty() && !self.home_loading) => {
+                        let tab = self.landing_tabs[landing_index(section)];
+                        self.home_load(section, tab)
+                    }
                     Section::Dislikes => {
                         let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
                         self.history_loading = true;
@@ -2485,9 +2543,9 @@ impl App {
                 }
             }
             Message::ListOpen(playlist) => return self.open_list(playlist),
-            Message::HomeLoaded(tab, result) => {
-                // Пока грузилось, могли выбрать другую вкладку.
-                if tab == self.home_tab {
+            Message::HomeLoaded(page, tab, result) => {
+                // Пока грузилось, могли выбрать другую вкладку или другую страницу.
+                if tab == self.home_tab && page == self.home_page {
                     self.home_loading = false;
                     match result {
                         Ok(home) => self.home = home,
@@ -2495,7 +2553,7 @@ impl App {
                     }
                 }
             }
-            Message::HomeTab(tab) => return self.home_load(tab),
+            Message::HomeTab(tab) => return self.home_load(self.home_page, tab),
             Message::HomeBlockTab(index, tab) => {
                 let Some(block) = self.home.blocks.get_mut(index) else { return Task::none() };
                 let Some((_, items)) = block.tabs.get(tab) else { return Task::none() };
@@ -3541,8 +3599,11 @@ impl App {
                     return self.play(index);
                 }
                 self.listen_count();
-                if let Some(p) = &self.player {
+                if let Some(p) = self.player.clone() {
                     p.toggle();
+                    if p.is_paused() {
+                        self.progress_save(false);
+                    }
                     // Пауза у самого конца паузой не считается, как и в официальном клиенте.
                     if p.is_paused() && self.current_track().is_some_and(|t| t.duration.saturating_sub(p.position()) > Duration::from_millis(200)) {
                         if let Some(listen) = self.listen.as_mut() {
@@ -3571,6 +3632,9 @@ impl App {
                 }
             }
             Message::Tick => {
+                if self.active && self.progress_at.is_none_or(|at| at.elapsed() >= PROGRESS_SAVE) && self.player.as_ref().is_some_and(|p| !p.is_paused()) {
+                    self.progress_save(false);
+                }
                 self.preload_next();
                 self.listen_count();
                 if let Some(listen) = self.listen.as_ref().filter(|listen| listen.started.is_some() && listen.played >= self.listen_next) {
@@ -3708,7 +3772,7 @@ impl App {
 
     fn view_main(&self) -> Element<'_, Message> {
         let page: Element<'_, Message> = match self.section {
-            Section::Home => self.view_home(),
+            Section::Home | Section::Books => self.view_home(),
             Section::Queue => self.view_queue(),
             Section::Lyrics => self.view_lyrics(),
             Section::Settings => self.view_settings(),
@@ -4273,9 +4337,10 @@ impl App {
         let item = |icon, label, section| {
             let tint = if opened == section { ui::TEXT } else { ui::MUTED };
             glow(
-                button(row![ui::icon(icon, 24.0, tint), text(label).color(tint)].spacing(12).align_y(Alignment::Center))
+                // Подписи в одну строку: «Книги и подкасты» иначе переносится.
+                button(row![ui::icon(icon, 24.0, tint), text(label).color(tint).wrapping(Wrapping::None)].spacing(12).align_y(Alignment::Center))
                     .width(Length::Fill)
-                    .padding(Padding::new(12.0).right(24))
+                    .padding(Padding::new(12.0).right(12))
                     .style(ui::nav)
                     .on_press(Message::Open(section)),
                 24.0,
@@ -4296,6 +4361,7 @@ impl App {
                     item(ui::HOME, "Главная", Section::Home),
                     item(ui::SEARCH, "Поиск", Section::Search),
                     item(ui::WAVE, "Моя волна", Section::Wave),
+                    item(ui::HEADPHONES, "Книги и подкасты", Section::Books),
                     item(ui::HEART_OUTLINE, "Коллекция", Section::Collection),
                 ]
                 .spacing(4),
@@ -4833,7 +4899,8 @@ impl App {
         if self.home_loading && self.home.tabs.is_empty() {
             tabs = SKELETON_TABS.iter().fold(tabs, |tabs, &width| tabs.push(container(Space::new()).width(width).height(SKELETON_TAB).style(skeleton_round(SKELETON_TAB / 2.0))));
         }
-        let page = column![text("Главная").size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None), tabs].spacing(16).height(Length::Fill);
+        let title = if self.section == Section::Books { "Книги и подкасты" } else { "Главная" };
+        let page = column![text(title).size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None), tabs].spacing(16).height(Length::Fill);
         if self.home_loading || self.home.blocks.is_empty() {
             return page.push(self.area(if self.home_loading { skeleton_home(self.cards_in_row()) } else { placeholder("Пока здесь пусто", None) })).into();
         }
@@ -5264,11 +5331,20 @@ impl App {
 
         // В волне порядок задаёт она сама, поэтому этих кнопок там нет.
         let mut buttons = row![].spacing(BAR_GAP).align_y(Alignment::Center);
-        if !self.wave_queue {
+        // У выпусков и книг вместо перемешивания и повтора — шаг на 15 секунд, как в оригинале.
+        let jump = |icon, step: f32| {
+            let face = stack![ui::icon(icon, 26.0, ui::MUTED), container(text("15").size(8).font(ui::font_medium()).color(ui::MUTED)).center(26.0).padding(Padding::ZERO.top(3))];
+            glow(button(face).padding(6).style(ui::ghost).on_press(Message::SeekBy(step)), 20.0)
+        };
+        if track.remember {
+            buttons = buttons.push(jump(ui::REPLAY, -PODCAST_STEP));
+        } else if !self.wave_queue {
             buttons = buttons.push(mode(ui::SHUFFLE, self.shuffle, Message::ShuffleToggle));
         }
         buttons = buttons.push(side(ui::PREVIOUS, Message::Previous)).push(toggle).push(side(ui::NEXT, Message::Next));
-        if !self.wave_queue {
+        if track.remember {
+            buttons = buttons.push(jump(ui::FORWARD, PODCAST_STEP));
+        } else if !self.wave_queue {
             let icon = if self.repeat == Repeat::One { ui::REPEAT_ONE } else { ui::REPEAT };
             buttons = buttons.push(mode(icon, self.repeat != Repeat::Off, Message::RepeatNext));
         }
@@ -5322,6 +5398,16 @@ fn popup<'a>(content: Element<'a, Message>, x: f32, y: f32, width: f32, height: 
         .height(Length::Fill)
         .padding(Padding::new(0.0).left(placed_x).top(placed_y))
         .into()
+}
+
+/// Страница из блоков: главная и книги с подкастами устроены одинаково.
+fn is_landing(section: Section) -> bool {
+    matches!(section, Section::Home | Section::Books)
+}
+
+/// Номер страницы из блоков для запоминания её вкладки.
+fn landing_index(section: Section) -> usize {
+    usize::from(section == Section::Books)
 }
 
 /// Ошибка словами для человека. Внутренний текст с кодами и сообщениями системы
@@ -5842,8 +5928,8 @@ fn smoke_settings() -> Result<(), String> {
 /// Печатает блоки обеих вкладок главной: что из ответа Яндекса дошло до экрана.
 fn smoke_home() -> Result<(), String> {
     let token = api::load_token().ok_or("нет токена")?;
-    for tab in 0..2 {
-        let home = api::home(tab, &token)?;
+    for (skeleton, tab) in [("main", 0), ("main", 1), ("non_music", 0), ("non_music", 1)] {
+        let home = api::landing(skeleton, tab, &token)?;
         println!("=== {}", home.tabs.get(tab).cloned().unwrap_or_default());
         for block in &home.blocks {
             let kinds: Vec<String> = block.items.iter().take(4).map(|item| format!("{item:?}").split(['{', '(', ' ']).next().unwrap_or_default().to_string()).collect();
@@ -6100,6 +6186,7 @@ fn main() -> iced::Result {
             "scroll-return" => Preview::ScrollReturn,
             "full" => Preview::Full,
             "eq-bar" => Preview::EqBar,
+            "books" => Preview::Books,
             "wave-restored" => Preview::WaveRestored,
             "filter-focus" => Preview::FilterFocus,
             query => Preview::Search(query.to_string()),
