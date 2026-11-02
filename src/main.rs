@@ -266,6 +266,8 @@ enum Section {
     Search,
     Lyrics,
     Settings,
+    /// Все релизы исполнителя или сборники с ним.
+    Discography,
 }
 
 /// Окно поверх страницы.
@@ -362,6 +364,10 @@ enum Preview {
     Playlist,
     Album(String),
     Artist(String),
+    /// Исполнитель, прокрученный до описания.
+    ArtistAbout(String),
+    /// Все релизы исполнителя.
+    Discography(String),
     /// Первый плейлист в очереди, открыта главная.
     PlaylistHome,
     /// Открытое меню первого трека.
@@ -553,6 +559,12 @@ struct App {
     session_at: Option<Instant>,
     /// «Меньше ИИ»; пока не знаем ответа сервера, переключатель не работает.
     ai_less: Option<bool>,
+    discography: Vec<Card>,
+    discography_total: u64,
+    discography_also: bool,
+    discography_by_year: bool,
+    /// Какой запрос релизов ждём: старые ответы отбрасываются.
+    discography_key: Option<String>,
     /// Какую волну ждём: опоздавший ответ о прежней не должен её заменить.
     wave_wanted: Vec<String>,
     last_frame: Option<Instant>,
@@ -611,6 +623,7 @@ enum Message {
     QueueToggle,
     QueueSource,
     PreviewQueueDown,
+    PreviewArtistEnd,
     Frame(Instant),
     QueuePlay(usize),
     QueueRemove(usize),
@@ -639,6 +652,14 @@ enum Message {
     PinMenu(usize),
     PinTracks(u64, Playlist, String, Result<Vec<Track>, String>),
     OpenLink(&'static str),
+    /// Ссылка из ответа Яндекса, например официальная страница исполнителя.
+    OpenUrl(String),
+    /// Все релизы исполнителя; `true` — сборники.
+    DiscographyOpen(bool),
+    /// Сортировка по дате выхода или по популярности.
+    DiscographySort(bool),
+    DiscographyMore,
+    DiscographyLoaded(String, Result<api::Releases, String>),
     /// Окно закрывают: сначала надо запомнить, что играло.
     Quit,
     /// Новая сессия для волны, восстановленной после запуска.
@@ -832,6 +853,11 @@ impl App {
             session_key: None,
             session_at: None,
             ai_less: None,
+            discography: Vec::new(),
+            discography_total: 0,
+            discography_also: false,
+            discography_by_year: false,
+            discography_key: None,
             wave_wanted: Vec::new(),
             last_frame: None,
             error,
@@ -1351,6 +1377,18 @@ impl App {
         self.forward.clear();
     }
 
+    fn discography_load(&mut self, page: u64) -> Task<Message> {
+        let (Some(artist), Some(token)) = (self.artist.as_ref(), self.token()) else { return Task::none() };
+        if page == 0 {
+            self.discography.clear();
+            self.discography_total = 0;
+        }
+        let (id, also, by_year) = (artist.id.clone(), self.discography_also, self.discography_by_year);
+        let key = format!("{id}:{also}:{by_year}:{page}");
+        self.discography_key = Some(key.clone());
+        Task::perform(background(move || api::releases(&id, also, by_year, page, &token)), move |result| Message::DiscographyLoaded(key.clone(), result))
+    }
+
     fn go(&mut self, place: Place) -> Task<Message> {
         self.section = place.section;
         self.artist = place.artist;
@@ -1364,6 +1402,9 @@ impl App {
             self.playlist_tracks.clear();
         }
         self.prune_covers();
+        if place.section == Section::Discography {
+            return self.discography_load(0);
+        }
         Task::none()
     }
 
@@ -1481,7 +1522,7 @@ impl App {
             Section::Likes | Section::Collection => &self.liked,
             Section::Playlists => &self.playlist_tracks,
             Section::Artist => self.artist.as_ref().map_or(&[], |a| a.popular.as_slice()),
-            Section::Albums | Section::Artists | Section::Home => &[],
+            Section::Albums | Section::Artists | Section::Home | Section::Discography => &[],
             // На странице очереди список — то, что будет после играющего трека.
             Section::History => &self.history_tracks,
             Section::Dislikes => &self.disliked_list,
@@ -1610,6 +1651,7 @@ impl App {
             Section::Albums => !self.liked_albums.is_empty(),
             Section::Artists => !self.liked_artists.is_empty(),
             Section::Artist => self.artist.is_some(),
+            Section::Discography => self.discography_key.is_none(),
             Section::Playlists if self.playlist.is_none() => !self.playlists.is_empty(),
             section => !self.list(section).is_empty(),
         }
@@ -1701,6 +1743,8 @@ impl App {
                         self.preview = None;
                         self.update(Message::ArtistOpen(id))
                     }
+                    // Подсказка снимается, когда исполнитель загрузится.
+                    Some(Preview::ArtistAbout(id) | Preview::Discography(id)) => self.update(Message::ArtistOpen(id)),
                     Some(Preview::Filter(query)) => {
                         self.preview = None;
                         let page = self.update(Message::Open(Section::Likes));
@@ -1841,6 +1885,45 @@ impl App {
                     return self.fail(e);
                 }
             }
+            Message::OpenUrl(url) => {
+                if !(url.starts_with("https://") || url.starts_with("http://")) {
+                    return Task::none();
+                }
+                if let Err(e) = std::process::Command::new("explorer").arg(&url).spawn() {
+                    return self.fail(format!("Не удалось открыть браузер: {e}"));
+                }
+            }
+            Message::DiscographyOpen(also) => {
+                self.discography_also = also;
+                self.discography_by_year = false;
+                return self.handle(Message::Open(Section::Discography));
+            }
+            Message::DiscographySort(by_year) => {
+                if by_year != self.discography_by_year {
+                    self.discography_by_year = by_year;
+                    return self.discography_load(0);
+                }
+            }
+            Message::DiscographyMore => {
+                if self.discography_key.is_none() && (self.discography.len() as u64) < self.discography_total {
+                    return self.discography_load(self.discography.len() as u64 / api::RELEASES_PAGE);
+                }
+            }
+            Message::DiscographyLoaded(key, result) => {
+                if self.discography_key.as_ref() != Some(&key) {
+                    return Task::none();
+                }
+                self.discography_key = None;
+                match result {
+                    Ok(releases) => {
+                        let jobs = releases.albums.iter().filter_map(|c| Some((format!("{ALBUM_COVER}{}", c.id), c.cover.clone()?))).collect();
+                        self.discography.extend(releases.albums);
+                        self.discography_total = releases.total;
+                        return self.fetch_cover_jobs(jobs, "300x300");
+                    }
+                    Err(e) => return self.fail(e),
+                }
+            }
             Message::OpenLink(link) => {
                 // Покупки и настройки аккаунта живут на сайтах Яндекса.
                 if let Err(e) = std::process::Command::new("explorer").arg(link).spawn() {
@@ -1895,6 +1978,7 @@ impl App {
                     Section::Likes if self.liked.is_empty() => self.likes_more(),
                     Section::Playlists if self.playlists.is_empty() => self.playlists_load(),
                     Section::Search => operation::focus(Id::new(SEARCH_INPUT)),
+                    Section::Discography => self.discography_load(0),
                     Section::Settings if self.ai_less.is_none() => {
                         let Some(token) = self.token() else { return Task::none() };
                         Task::perform(background(move || api::ai_reduction(&token)), Message::AiLessLoaded)
@@ -2115,7 +2199,19 @@ impl App {
                         let main = artist.cover.clone().map(|uri| (format!("{ARTIST_COVER}{}", artist.id), uri));
                         let jobs = main.into_iter().chain(artists).chain(albums).collect();
                         self.artist = Some(artist);
-                        return self.fetch_cover_jobs(jobs, "300x300");
+                        let covers = self.fetch_cover_jobs(jobs, "300x300");
+                        return match self.preview.clone() {
+                            Some(Preview::Discography(_)) => {
+                                self.preview = None;
+                                Task::batch([covers, self.handle(Message::DiscographyOpen(false))])
+                            }
+                            Some(Preview::ArtistAbout(_)) => {
+                                self.preview = None;
+                                let down = Task::perform(background(|| std::thread::sleep(Duration::from_secs(2))), |()| Message::PreviewArtistEnd);
+                                Task::batch([covers, down])
+                            }
+                            _ => covers,
+                        };
                     }
                     Err(e) => return self.fail_retry(e, Message::ArtistLoad(id)),
                 }
@@ -2631,6 +2727,7 @@ impl App {
                     return self.play(index);
                 }
             }
+            Message::PreviewArtistEnd => return operation::snap_to(Id::new(LIST), scrollable::RelativeOffset::END),
             Message::PreviewQueueDown => {
                 let down = operation::scroll_to(Id::new(LIST), scrollable::AbsoluteOffset { x: 0.0, y: 1200.0 });
                 let press = Task::perform(background(|| std::thread::sleep(Duration::from_secs(1))), |()| Message::QueuePlay(25));
@@ -2990,6 +3087,7 @@ impl App {
             Section::Queue => self.view_queue(),
             Section::Lyrics => self.view_lyrics(),
             Section::Settings => self.view_settings(),
+            Section::Discography => self.view_discography(),
             Section::History => self.view_track_page("История", &self.history_tracks, "Здесь появятся треки, которые вы слушали", Section::History),
             Section::Dislikes => self.view_track_page("Дизлайки", &self.disliked_list, "Здесь появятся треки, которые вам не понравились", Section::Dislikes),
             Section::Wave => self.view_wave(),
@@ -4125,15 +4223,51 @@ impl App {
         }
         let albums = |cards: &'_ [Card]| !cards.is_empty();
         if albums(&artist.albums) {
-            page = page.push(Space::new().height(8)).push(block("Альбомы")).push(self.view_cards(&artist.albums, ALBUM_COVER, false, open_album));
+            page = page.push(Space::new().height(8)).push(more_title("Альбомы", Message::DiscographyOpen(false))).push(self.view_cards(&artist.albums, ALBUM_COVER, false, open_album));
         }
         if albums(&artist.also) {
-            page = page.push(Space::new().height(8)).push(block("Сборники")).push(self.view_cards(&artist.also, ALBUM_COVER, false, open_album));
+            page = page.push(Space::new().height(8)).push(more_title("Сборники", Message::DiscographyOpen(true))).push(self.view_cards(&artist.also, ALBUM_COVER, false, open_album));
         }
         if albums(&artist.similar) {
             page = page.push(Space::new().height(8)).push(block("Похожие исполнители")).push(self.view_cards(&artist.similar, ARTIST_COVER, true, open_artist));
         }
+        if !artist.about.is_empty() || !artist.links.is_empty() {
+            page = page.push(Space::new().height(8)).push(block("Об исполнителе"));
+            if !artist.about.is_empty() {
+                page = page.push(container(text(&artist.about).size(15).line_height(1.5).color(ui::TEXT)).max_width(760));
+            }
+            let links = artist.links.iter().fold(row![].spacing(8), |line, link| {
+                let mut label = column![text(&link.title).color(ui::TEXT)];
+                if !link.subtitle.is_empty() {
+                    label = label.push(text(&link.subtitle).size(12).color(ui::MUTED));
+                }
+                line.push(shine(button(label).padding([8, 16]).style(ui::secondary).on_press(Message::OpenUrl(link.url.clone())), 20.0))
+            });
+            page = page.push(links.wrap());
+        }
         ui::scroll(page).id(LIST).height(Length::Fill).into()
+    }
+
+    fn view_discography(&self) -> Element<'_, Message> {
+        let back = glow(button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0);
+        let title = if self.discography_also { "Сборники" } else { "Альбомы и синглы" };
+        let name = self.artist.as_ref().map_or(String::new(), |artist| artist.name.clone());
+        let head = row![back, column![text(title).size(36).font(ui::font_headline()).color(ui::TEXT), text(name).color(ui::MUTED)]].spacing(12).align_y(Alignment::Center);
+        let chip = |label, by_year: bool| {
+            let chosen = by_year == self.discography_by_year;
+            shine(button(text(label)).padding([7, 16]).style(if chosen { ui::accent } else { ui::secondary }).on_press(Message::DiscographySort(by_year)), 20.0)
+        };
+        let sort = row![chip("По популярности", false), chip("По дате выхода", true)].spacing(8);
+        let mut list = column![self.view_cards(&self.discography, ALBUM_COVER, false, open_album)].spacing(16);
+        if (self.discography.len() as u64) < self.discography_total && self.discography_key.is_none() {
+            list = list.push(container(shine(button(text("Показать ещё")).padding([9, 18]).style(ui::secondary).on_press(Message::DiscographyMore), 20.0)).center_x(Length::Fill));
+        }
+        let center: Element<'_, Message> = if self.discography.is_empty() && self.discography_key.is_none() {
+            placeholder("Пока пусто", Some("У исполнителя нет таких релизов"))
+        } else {
+            ui::scroll(container(list).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).height(Length::Fill).into()
+        };
+        column![head, sort, center].spacing(16).height(Length::Fill).into()
     }
 
     /// Строятся только видимые строки: остальные заменяет пустое место той же высоты.
@@ -4405,6 +4539,15 @@ fn home_item_cover(item: &HomeItem) -> Option<String> {
 
 fn open_album(card: &Card) -> Message {
     Message::AlbumOpen(card.id.clone(), card.title.clone())
+}
+
+/// Заголовок блока со стрелкой, ведущий на полный список.
+fn more_title<'a>(title: &'a str, press: Message) -> Element<'a, Message> {
+    glow(button(row![text(title).size(24).font(ui::font_headline()).color(ui::TEXT), ui::icon(ui::CHEVRON, 24.0, ui::MUTED)].spacing(6).align_y(Alignment::Center))
+        .padding([4, 8])
+        .style(ui::ghost)
+        .on_press(press), 20.0)
+        .into()
 }
 
 fn open_artist(card: &Card) -> Message {
@@ -4966,6 +5109,8 @@ fn main() -> iced::Result {
             }
             what if what.starts_with("album:") => Preview::Album(what[6..].to_string()),
             what if what.starts_with("artist:") => Preview::Artist(what[7..].to_string()),
+            what if what.starts_with("artist-about:") => Preview::ArtistAbout(what[13..].to_string()),
+            what if what.starts_with("discography:") => Preview::Discography(what[12..].to_string()),
             query => Preview::Search(query.to_string()),
         }),
         _ => None,

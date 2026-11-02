@@ -645,7 +645,26 @@ pub struct Artist {
     pub albums: Vec<Card>,
     pub also: Vec<Card>,
     pub similar: Vec<Card>,
+    /// «Об исполнителе»: текст и официальные страницы.
+    pub about: String,
+    pub links: Vec<ArtistLink>,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArtistLink {
+    pub title: String,
+    pub subtitle: String,
+    pub url: String,
+}
+
+/// Страница релизов исполнителя: свои или сборники, где он есть.
+#[derive(Clone, Debug)]
+pub struct Releases {
+    pub albums: Vec<Card>,
+    pub total: u64,
+}
+
+pub const RELEASES_PAGE: u64 = 100;
 
 fn cover_uri(v: &Value) -> Option<String> {
     v["coverUri"].as_str().or(v["cover"]["uri"].as_str()).filter(|u| !u.is_empty()).map(str::to_string)
@@ -669,9 +688,25 @@ fn album_card(v: &Value) -> Option<Card> {
     Some(Card {
         id: id_text(&v["id"])?,
         title: v["title"].as_str()?.to_string(),
-        subtitle: v["year"].as_u64().map_or_else(|| "Альбом".to_string(), |year| year.to_string()),
+        subtitle: album_subtitle(v),
         cover: cover_uri(v),
     })
+}
+
+/// Год и вид релиза, как на карточках официального клиента: «2020 · Сингл».
+fn album_subtitle(v: &Value) -> String {
+    let kind = match v["type"].as_str() {
+        Some("single") => Some("Сингл"),
+        Some("compilation") => Some("Сборник"),
+        Some("podcast") => Some("Подкаст"),
+        _ => None,
+    };
+    match (v["year"].as_u64(), kind) {
+        (Some(year), Some(kind)) => format!("{year} · {kind}"),
+        (Some(year), None) => year.to_string(),
+        (None, Some(kind)) => kind.to_string(),
+        (None, None) => "Альбом".to_string(),
+    }
 }
 
 fn artist_card(v: &Value) -> Option<Card> {
@@ -689,7 +724,31 @@ fn parse_artist(v: &Value) -> Option<Artist> {
         albums: parse_cards(&v["albums"], album_card),
         also: parse_cards(&v["alsoAlbums"], album_card),
         similar: parse_cards(&v["similarArtists"], artist_card),
+        about: String::new(),
+        links: Vec::new(),
     })
+}
+
+fn parse_about(v: &Value) -> (String, Vec<ArtistLink>) {
+    let links = v["links"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|link| {
+            let url = link["url"].as_str().filter(|url| url.starts_with("https://") || url.starts_with("http://"))?;
+            Some(ArtistLink { title: link["title"].as_str()?.to_string(), subtitle: link["subtitle"].as_str().unwrap_or_default().to_string(), url: url.to_string() })
+        })
+        .collect();
+    (v["description"].as_str().unwrap_or_default().trim().to_string(), links)
+}
+
+/// Свои релизы (`direct-albums`) или сборники с исполнителем (`also-albums`).
+pub fn releases(id: &str, also: bool, by_year: bool, page: u64, token: &str) -> Result<Releases, String> {
+    let path = format!("artists/{id}/{}", if also { "also-albums" } else { "direct-albums" });
+    let (page, size) = (page.to_string(), RELEASES_PAGE.to_string());
+    let v = get(&path, &[("page", &page), ("pageSize", &size), ("sort-by", if by_year { "year" } else { "rating" }), ("sort-order", "desc")], token)?;
+    let v = result(&v);
+    Ok(Releases { albums: parse_cards(&v["albums"], album_card), total: v["pager"]["total"].as_u64().unwrap_or(0) })
 }
 
 pub fn album(id: &str, token: &str) -> Result<(Album, Vec<Track>), String> {
@@ -701,7 +760,12 @@ pub fn album(id: &str, token: &str) -> Result<(Album, Vec<Track>), String> {
 
 pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
     let v = get(&format!("artists/{id}/brief-info"), &[], token)?;
-    parse_artist(result(&v)).ok_or_else(|| "Яндекс не прислал исполнителя".to_string())
+    let mut artist = parse_artist(result(&v)).ok_or_else(|| "Яндекс не прислал исполнителя".to_string())?;
+    // Описание не главное: без него страница всё равно откроется.
+    if let Ok(v) = get(&format!("artists/{id}/about-artist"), &[], token) {
+        (artist.about, artist.links) = parse_about(result(&v));
+    }
+    Ok(artist)
 }
 
 /// Что нашёл смешанный поиск.
@@ -1308,6 +1372,17 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_artist_about_and_release_kind() {
+        let v = json!({"description":" Группа. ","links":[{"title":"Сайт","subtitle":"q.com","url":"http://q.com/"},{"title":"Плохая","url":"javascript:alert(1)"}]});
+        let (about, links) = parse_about(&v);
+        assert_eq!(about, "Группа.");
+        assert_eq!(links, vec![ArtistLink { title: "Сайт".into(), subtitle: "q.com".into(), url: "http://q.com/".into() }]);
+        assert_eq!(album_subtitle(&json!({"year":2020,"type":"single"})), "2020 · Сингл");
+        assert_eq!(album_subtitle(&json!({"year":1975})), "1975");
+        assert_eq!(album_subtitle(&json!({})), "Альбом");
+    }
 
     #[test]
     fn labels_sound() {
