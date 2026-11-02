@@ -3982,7 +3982,7 @@ impl App {
         .spacing(28)
         .max_width(700)
         .padding(Padding::ZERO.right(20));
-        ui::scroll(page).height(Length::Fill).into()
+        ui::scroll(page).width(Length::Fill).height(Length::Fill).into()
     }
 
     fn view_collection(&self) -> Element<'_, Message> {
@@ -4036,7 +4036,7 @@ impl App {
             let shown = &self.liked_artists[..self.liked_artists.len().min(COLLECTION_CARDS)];
             page = page.push(Space::new().height(8)).push(self.block_title("Исполнители", Section::Artists)).push(self.view_cards(shown, ARTIST_COVER, true, open_artist));
         }
-        ui::scroll(page).height(Length::Fill).into()
+        ui::scroll(page).width(Length::Fill).height(Length::Fill).into()
     }
 
     fn view_card_page<'a>(&'a self, title: &'a str, cards: &'a [Card], prefix: &str, round: bool, empty: &'a str) -> Element<'a, Message> {
@@ -4046,7 +4046,7 @@ impl App {
             placeholder("Пока пусто", Some(empty))
         } else {
             let open = if round { open_artist } else { open_album };
-            ui::scroll(container(self.view_cards(cards, prefix, round, open)).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).height(Length::Fill).into()
+            ui::scroll(container(self.view_cards(cards, prefix, round, open)).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).width(Length::Fill).height(Length::Fill).into()
         };
         column![head, center].spacing(16).height(Length::Fill).into()
     }
@@ -4176,7 +4176,7 @@ impl App {
         let create = shine(button(row![ui::icon(ui::PLUS, 20.0, ui::TEXT), text("Новый плейлист").color(ui::TEXT)].spacing(6).align_y(Alignment::Center)).padding([6, 14]).style(ui::secondary).on_press(Message::DialogOpen(Dialog::Create)), 24.0);
         let title = row![back, text("Плейлисты").size(36).font(ui::font_headline()).color(ui::TEXT), Space::new().width(Length::Fill), create].spacing(12).align_y(Alignment::Center);
         let center: Element<'_, Message> = if !self.playlists.is_empty() {
-            ui::scroll(container(self.view_playlist_cards(&self.playlists)).padding(Padding::ZERO.right(SCROLLBAR))).height(Length::Fill).into()
+            ui::scroll(container(self.view_playlist_cards(&self.playlists)).padding(Padding::ZERO.right(SCROLLBAR))).width(Length::Fill).height(Length::Fill).into()
         } else if self.playlists_loading || self.uid.is_none() {
             skeleton_cards()
         } else {
@@ -4204,7 +4204,7 @@ impl App {
                 let line = row![ui::icon(ui::SEARCH, 20.0, ui::MUTED), text(query).color(ui::TEXT).wrapping(Wrapping::None)].spacing(12).align_y(Alignment::Center);
                 rows.push(glow(button(line).width(Length::Fill).padding([10, 12]).style(ui::row).on_press(Message::SearchAgain(query.clone())), 8.0))
             });
-            let history = column![head, ui::scroll(container(rows).padding(Padding::ZERO.right(SCROLLBAR))).height(Length::Fill)].spacing(12).max_width(760);
+            let history = column![container(head).padding(Padding::ZERO.right(SCROLLBAR)), ui::scroll(container(rows).padding(Padding::ZERO.right(SCROLLBAR))).width(Length::Fill).height(Length::Fill)].spacing(12);
             return page.push(history).into();
         }
         let tabs = SearchTab::ALL.into_iter().fold(row![].spacing(8), |tabs, tab| {
@@ -4238,7 +4238,7 @@ impl App {
             if !found.playlists.is_empty() {
                 blocks = blocks.push(block("Плейлисты")).push(self.view_playlist_cards(&found.playlists));
             }
-            ui::scroll(blocks).id(LIST).height(Length::Fill).into()
+            ui::scroll(blocks).id(LIST).width(Length::Fill).height(Length::Fill).into()
         };
         page.push(center).into()
     }
@@ -4279,7 +4279,7 @@ impl App {
             }
             blocks.push(body).push(Space::new().height(8))
         });
-        page.push(ui::scroll(blocks).id(LIST).height(Length::Fill)).into()
+        page.push(ui::scroll(blocks).id(LIST).width(Length::Fill).height(Length::Fill)).into()
     }
 
     fn view_home_item<'a>(&self, item: &'a HomeItem) -> Element<'a, Message> {
@@ -4438,7 +4438,7 @@ impl App {
             });
             page = page.push(links.wrap());
         }
-        ui::scroll(page).id(LIST).height(Length::Fill).into()
+        ui::scroll(page).id(LIST).width(Length::Fill).height(Length::Fill).into()
     }
 
     fn view_tag(&self) -> Element<'_, Message> {
@@ -4451,7 +4451,7 @@ impl App {
             placeholder("Пока пусто", Some("В этом миксе нет плейлистов"))
         } else {
             let cards = self.tag_lists.iter().fold(row![].spacing(4), |cards, item| cards.push(self.view_home_item(item)));
-            ui::scroll(container(cards.wrap()).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).height(Length::Fill).into()
+            ui::scroll(container(cards.wrap()).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).width(Length::Fill).height(Length::Fill).into()
         };
         column![head, center].spacing(16).height(Length::Fill).into()
     }
@@ -4473,7 +4473,7 @@ impl App {
         let center: Element<'_, Message> = if self.discography.is_empty() && self.discography_key.is_none() {
             placeholder("Пока пусто", Some("У исполнителя нет таких релизов"))
         } else {
-            ui::scroll(container(list).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).height(Length::Fill).into()
+            ui::scroll(container(list).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).width(Length::Fill).height(Length::Fill).into()
         };
         column![head, sort, center].spacing(16).height(Length::Fill).into()
     }
