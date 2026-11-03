@@ -391,10 +391,25 @@ enum SearchTab {
     Albums,
     Artists,
     Playlists,
+    Podcasts,
+    Books,
+    Waves,
 }
 
+/// Вкладки с фильтром Яндекс ищет по всем типам сразу, а отбирает сам.
+const SEARCH_FILTERED_TYPES: &str = "album,artist,playlist,track,wave,podcast,podcast_episode";
+
 impl SearchTab {
-    const ALL: [SearchTab; 5] = [SearchTab::All, SearchTab::Tracks, SearchTab::Albums, SearchTab::Artists, SearchTab::Playlists];
+    const ALL: [SearchTab; 8] = [
+        SearchTab::All,
+        SearchTab::Tracks,
+        SearchTab::Albums,
+        SearchTab::Artists,
+        SearchTab::Playlists,
+        SearchTab::Podcasts,
+        SearchTab::Books,
+        SearchTab::Waves,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -403,6 +418,9 @@ impl SearchTab {
             SearchTab::Albums => "Альбомы",
             SearchTab::Artists => "Исполнители",
             SearchTab::Playlists => "Плейлисты",
+            SearchTab::Podcasts => "Подкасты",
+            SearchTab::Books => "Аудиокниги",
+            SearchTab::Waves => "Волны",
         }
     }
 
@@ -413,6 +431,16 @@ impl SearchTab {
             SearchTab::Albums => "album",
             SearchTab::Artists => "artist",
             SearchTab::Playlists => "playlist",
+            SearchTab::Podcasts | SearchTab::Books | SearchTab::Waves => SEARCH_FILTERED_TYPES,
+        }
+    }
+
+    fn filter(self) -> Option<&'static str> {
+        match self {
+            SearchTab::Podcasts => Some("podcast"),
+            SearchTab::Books => Some("book"),
+            SearchTab::Waves => Some("waves"),
+            _ => None,
         }
     }
 }
@@ -460,6 +488,8 @@ enum Preview {
     SearchHistory,
     /// Поиск сам перебирает вкладки: номер следующей.
     SearchTabs(usize),
+    /// Поиск сразу во вкладке: подкасты, книги, волны.
+    SearchIn(SearchTab, &'static str),
     /// Поиск набирает запрос по буквам и пишет в stderr, где фокус.
     SearchFocus,
     /// Лайки прокручиваются, открывается главная и снова лайки: в stderr — где прокрутка.
@@ -1484,7 +1514,7 @@ impl App {
         let tab = self.search_tab;
         let size = if tab == SearchTab::All { SEARCH_ALL } else { SEARCH_TAB };
         let asked = text.clone();
-        Task::perform(background(move || api::search_mixed(&asked, tab.types(), size, &token)), move |r| Message::Found(id, tab, text.clone(), r))
+        Task::perform(background(move || api::search_mixed(&asked, tab.types(), tab.filter(), size, &token)), move |r| Message::Found(id, tab, text.clone(), r))
     }
 
     fn search_show(&mut self, found: Found) -> Task<Message> {
@@ -1492,7 +1522,8 @@ impl App {
         self.found = found;
         self.searched = true;
         self.prune_covers();
-        self.fetch_card_covers(self.found.albums.iter(), self.found.artists.iter(), &self.found.playlists)
+        let waves = self.found.waves.iter().filter_map(|item| Some((home_item_key(item), home_item_cover(item)?))).collect();
+        Task::batch([self.fetch_card_covers(self.found.albums.iter(), self.found.artists.iter(), &self.found.playlists), self.fetch_cover_jobs(waves, "200x200")])
     }
 
     /// Экран волны показывает обложку крупно.
@@ -1558,7 +1589,7 @@ impl App {
         cards.extend(self.album.iter().map(|a| format!("{ALBUM_COVER}{}", a.id)));
         let album_cards = self.album.iter().flat_map(|a| &a.versions).chain(&self.album_others).chain(&self.discography);
         cards.extend(album_cards.map(|c| format!("{ALBUM_COVER}{}", c.id)));
-        cards.extend(self.similar.iter().chain(&self.tag_lists).map(home_item_key));
+        cards.extend(self.similar.iter().chain(&self.tag_lists).chain(&self.found.waves).map(home_item_key));
         for found in self.search_cache.values() {
             cards.extend(found.albums.iter().map(|c| format!("{ALBUM_COVER}{}", c.id)));
             cards.extend(found.artists.iter().map(|c| format!("{ARTIST_COVER}{}", c.id)));
@@ -2533,6 +2564,13 @@ impl App {
                         self.query = "Queen".to_string();
                         self.update(Message::Search)
                     }
+                    Some(Preview::SearchIn(tab, query)) => {
+                        self.preview = None;
+                        self.section = Section::Search;
+                        self.search_tab = tab;
+                        self.query = query.to_string();
+                        self.update(Message::Search)
+                    }
                     Some(Preview::SearchHistory) => {
                         self.preview = None;
                         self.searches = ["Queen", "Земфира", "Linkin Park Numb", "лоу-фай"].map(String::from).to_vec();
@@ -3168,7 +3206,7 @@ impl App {
                 self.menu = None;
                 let Some(token) = self.token() else { return Task::none() };
                 let wanted = name.clone();
-                return Task::perform(background(move || api::search_mixed(&name, SearchTab::Artists.types(), ARTIST_SEARCH, &token)), move |r| Message::ArtistFound(wanted.clone(), r));
+                return Task::perform(background(move || api::search_mixed(&name, SearchTab::Artists.types(), None, ARTIST_SEARCH, &token)), move |r| Message::ArtistFound(wanted.clone(), r));
             }
             Message::ArtistFound(name, result) => match result {
                 Ok(found) => match pick_artist(&found.artists, &name) {
@@ -5595,7 +5633,14 @@ impl App {
             page = page.push(text(format!("Показаны результаты по запросу «{corrected}»")).color(ui::MUTED));
         }
         let found = &self.found;
-        let nothing = found.tracks.is_empty() && found.albums.is_empty() && found.artists.is_empty() && found.playlists.is_empty();
+        let nothing = found.tracks.is_empty() && found.albums.is_empty() && found.artists.is_empty() && found.playlists.is_empty() && found.waves.is_empty();
+        // В подкастах и книгах альбомы — это сами подкасты и книги, а треки — их выпуски.
+        let (albums_title, tracks_title) = match self.search_tab {
+            SearchTab::Podcasts => ("Подкасты", "Выпуски"),
+            // Среди глав Яндекс подмешивает и песни: подпись общая.
+            SearchTab::Books => ("Аудиокниги", "Треки"),
+            _ => ("Альбомы", "Треки"),
+        };
         let center: Element<'_, Message> = if self.searching {
             skeleton_list()
         } else if nothing {
@@ -5605,15 +5650,24 @@ impl App {
         } else {
             let block = |title| text(title).size(24).font(ui::font_headline()).color(ui::TEXT);
             let mut blocks = column![].spacing(12).padding(Padding::ZERO.right(SCROLLBAR));
+            if !found.waves.is_empty() {
+                let waves = found.waves.iter().fold(row![].spacing(4), |line, item| line.push(self.view_home_item(item)));
+                blocks = blocks.push(block("Волны")).push(waves.wrap()).push(Space::new().height(8));
+            }
             if !found.artists.is_empty() {
                 blocks = blocks.push(block("Исполнители")).push(self.view_cards(&found.artists, ARTIST_COVER, true, open_artist)).push(Space::new().height(8));
             }
+            // Во вкладках подкастов и книг сначала они сами, выпуски потом.
+            let spoken_first = matches!(self.search_tab, SearchTab::Podcasts | SearchTab::Books);
+            if spoken_first && !found.albums.is_empty() {
+                blocks = blocks.push(block(albums_title)).push(self.view_cards(&found.albums, ALBUM_COVER, false, open_album)).push(Space::new().height(8));
+            }
             if !found.tracks.is_empty() {
                 let shown = found.tracks.iter().take(SEARCH_ALL_TRACKS).enumerate();
-                blocks = blocks.push(block("Треки")).push(shown.fold(column![], |list, (index, track)| list.push(self.view_track(Section::Search, index, track)))).push(Space::new().height(8));
+                blocks = blocks.push(block(tracks_title)).push(shown.fold(column![], |list, (index, track)| list.push(self.view_track(Section::Search, index, track)))).push(Space::new().height(8));
             }
-            if !found.albums.is_empty() {
-                blocks = blocks.push(block("Альбомы")).push(self.view_cards(&found.albums, ALBUM_COVER, false, open_album)).push(Space::new().height(8));
+            if !spoken_first && !found.albums.is_empty() {
+                blocks = blocks.push(block(albums_title)).push(self.view_cards(&found.albums, ALBUM_COVER, false, open_album)).push(Space::new().height(8));
             }
             if !found.playlists.is_empty() {
                 blocks = blocks.push(block("Плейлисты")).push(self.view_playlist_cards(&found.playlists));
@@ -7116,7 +7170,7 @@ fn smoke_library(query: &str) -> Result<(), String> {
     println!("Лайк появился: {added}, снялся: {}, список как был: {}", !after.contains(&track.id), after == ids);
     let (albums, artists) = api::liked_pages(&uid, &token)?;
     println!("Альбомов в коллекции: {}, исполнителей: {}", albums.len(), artists.len());
-    let found = api::search_mixed(query, SearchTab::All.types(), SEARCH_ALL, &token)?;
+    let found = api::search_mixed(query, SearchTab::All.types(), None, SEARCH_ALL, &token)?;
     println!("Смешанный поиск: треков {}, альбомов {}, исполнителей {}, плейлистов {}", found.tracks.len(), found.albums.len(), found.artists.len(), found.playlists.len());
     if let Some(album) = found.albums.iter().find(|c| !albums.iter().any(|a| a.id == c.id)) {
         api::set_album_liked(&uid, &album.id, true, &token)?;
@@ -7265,6 +7319,9 @@ fn main() -> iced::Result {
             what if what.starts_with("tag:") => Preview::Tag(what[4..].to_string()),
             "search-history" => Preview::SearchHistory,
             "search-tabs" => Preview::SearchTabs(1),
+            "search-podcasts" => Preview::SearchIn(SearchTab::Podcasts, "история"),
+            "search-books" => Preview::SearchIn(SearchTab::Books, "гарри поттер"),
+            "search-waves" => Preview::SearchIn(SearchTab::Waves, "рок"),
             "search-focus" => Preview::SearchFocus,
             "scroll-return" => Preview::ScrollReturn,
             "full" => Preview::Full,

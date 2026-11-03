@@ -994,6 +994,8 @@ pub struct Found {
     pub albums: Vec<Card>,
     pub artists: Vec<Card>,
     pub playlists: Vec<Playlist>,
+    /// Волны по жанру, настроению или занятию.
+    pub waves: Vec<HomeItem>,
     /// Яндекс исправил опечатку и искал вот это.
     pub corrected: Option<String>,
 }
@@ -1004,6 +1006,15 @@ fn parse_found(v: &Value) -> Found {
         match item["type"].as_str() {
             Some("track") => found.tracks.extend(parse_track(&item["track"])),
             Some("album") => found.albums.extend(album_card(&item["album"])),
+            // Подкаст и книга — тот же альбом, только без исполнителя в подписи.
+            Some("podcast") => found.albums.extend(album_card(&item["podcast"]).map(|mut card| {
+                if card.subtitle.is_empty() {
+                    card.subtitle = if item["podcast"]["type"].as_str() == Some("audiobook") { "Аудиокнига" } else { "Подкаст" }.to_string();
+                }
+                card
+            })),
+            Some("podcast_episode") => found.tracks.extend(parse_track(&item["podcast_episode"])),
+            Some("wave") => found.waves.extend(parse_home_item(&item["wave"]).filter(|wave| matches!(wave, HomeItem::Wave { .. }))),
             Some("artist") => found.artists.extend(artist_card(&item["artist"])),
             Some("playlist") => {
                 let owner = id_text(&item["playlist"]["uid"]).unwrap_or_default();
@@ -1015,10 +1026,13 @@ fn parse_found(v: &Value) -> Found {
     found
 }
 
-/// `types` — что искать через запятую: track, album, artist, playlist.
-pub fn search_mixed(text: &str, types: &str, page_size: u32, token: &str) -> Result<Found, String> {
+/// `types` — что искать через запятую: track, album, artist, playlist, podcast, wave.
+/// `filter` — вкладка, как у Яндекса: podcast, book, waves. Без неё ищется по типам.
+pub fn search_mixed(text: &str, types: &str, filter: Option<&str>, page_size: u32, token: &str) -> Result<Found, String> {
     let size = page_size.to_string();
-    let v = get("search/instant/mixed", &[("text", text), ("type", types), ("page", "0"), ("pageSize", &size)], token)?;
+    let mut params = vec![("text", text), ("type", types), ("page", "0"), ("pageSize", &size)];
+    params.extend(filter.map(|filter| ("filter", filter)));
+    let v = get("search/instant/mixed", &params, token)?;
     Ok(parse_found(result(&v)))
 }
 
@@ -2247,6 +2261,13 @@ mod tests {
         assert_eq!((found.playlists[0].owner.as_str(), found.playlists[0].kind.as_str()), ("7", "8"));
         assert_eq!(found.corrected.as_deref(), Some("нойз"));
         assert!(parse_found(&serde_json::json!({"misspellCorrected":false,"text":"а"})).corrected.is_none());
+        let v: Value = serde_json::from_str(r##"{"results":[
+            {"type":"podcast","podcast":{"id":4,"title":"К","type":"audiobook"}},
+            {"type":"podcast_episode","podcast_episode":{"id":"5","title":"Глава","durationMs":1000}},
+            {"type":"wave","wave":{"seeds":["genre:allrock"],"title":"Рок","agent":{"cover":{"uri":"w/%%","color":"#3779BC"}}}}]}"##).unwrap();
+        let found = parse_found(&v);
+        assert_eq!((found.albums[0].subtitle.as_str(), found.tracks.len()), ("Аудиокнига", 1));
+        assert!(matches!(&found.waves[0], HomeItem::Wave { title, seeds, .. } if title == "Рок" && seeds == &["genre:allrock"]));
     }
 
     #[test]
