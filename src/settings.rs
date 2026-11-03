@@ -7,6 +7,34 @@ use serde_json::{json, Value};
 use crate::api;
 use crate::equalizer::{self, EqSettings};
 
+/// Тема оформления. «Как в системе» следит за настройкой Windows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Look {
+    Dark,
+    Light,
+    System,
+}
+
+impl Look {
+    pub const ALL: [Look; 3] = [Look::Dark, Look::Light, Look::System];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Look::Dark => "Тёмная",
+            Look::Light => "Светлая",
+            Look::System => "Как в системе",
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Look::Dark => "dark",
+            Look::Light => "light",
+            Look::System => "system",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Repeat {
     Off,
@@ -87,6 +115,7 @@ pub struct Settings {
     pub kids: bool,
     /// Скорость подкастов и книг; музыка всегда играет как есть.
     pub speed: f32,
+    pub look: Look,
 }
 
 /// Скорости, как в оригинале: кнопка перебирает их по кругу.
@@ -108,6 +137,7 @@ fn parse(v: &Value) -> Settings {
         crossfade: v["crossfade"].as_bool().unwrap_or(true),
         kids: v["kids"].as_bool().unwrap_or(true),
         speed: v["speed"].as_f64().map(|x| x as f32).filter(|x| SPEEDS.contains(x)).unwrap_or(1.0),
+        look: Look::ALL.into_iter().find(|look| v["theme"].as_str() == Some(look.code())).unwrap_or(Look::Dark),
     }
 }
 
@@ -136,7 +166,7 @@ pub fn save(settings: Settings) {
     };
     let eq = settings.eq;
     let equalizer = json!({ "enabled": eq.enabled, "preset": eq.preset, "preamp": eq.preamp, "gains": eq.gains });
-    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "kids": settings.kids, "speed": settings.speed });
+    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "kids": settings.kids, "speed": settings.speed, "theme": settings.look.code() });
     let dir = api::data_dir();
     if fs::create_dir_all(&dir).is_ok() {
         let _ = fs::write(dir.join("settings.json"), value.to_string());
@@ -150,11 +180,12 @@ mod tests {
     #[test]
     fn reads_saved_and_broken_values() {
         let saved = parse(&json!({ "volume": 0.25, "muted": true, "repeat": "one", "shuffle": true, "quality": "lossless" }));
-        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default(), crossfade: true, kids: true, speed: 1.0 });
+        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default(), crossfade: true, kids: true, speed: 1.0, look: Look::Dark });
         let empty = parse(&Value::Null);
-        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default(), crossfade: true, kids: true, speed: 1.0 });
+        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default(), crossfade: true, kids: true, speed: 1.0, look: Look::Dark });
         assert!(!parse(&json!({ "crossfade": false })).crossfade);
         assert!(!parse(&json!({ "kids": false })).kids);
+        assert_eq!((parse(&json!({ "theme": "system" })).look, parse(&json!({ "theme": "pink" })).look), (Look::System, Look::Dark));
         assert_eq!((parse(&json!({ "speed": 1.5 })).speed, parse(&json!({ "speed": 7 })).speed), (1.5, 1.0));
         let eq = parse(&json!({ "equalizer": { "enabled": true, "preset": 14, "preamp": 9, "gains": [40, -3.5] } })).eq;
         assert_eq!((eq.enabled, eq.preset, eq.preamp, eq.gains[0], eq.gains[1], eq.gains[2]), (true, 14, 1.5, 12.0, -3.5, 0.0));

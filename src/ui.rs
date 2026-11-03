@@ -1,4 +1,4 @@
-//! Оформление. Цвета и размеры сняты с интерфейса Яндекс Музыки (тёмная тема, токены --ym-*).
+//! Оформление. Цвета и размеры сняты с интерфейса Яндекс Музыки (тёмная и светлая темы, токены --ym-*).
 
 use iced::border::{self, Border};
 use iced::font::{Family, Weight};
@@ -11,20 +11,104 @@ use iced::overlay::menu;
 use iced::widget::{button, container, pick_list, scrollable, slider, svg, text_input, Scrollable};
 use iced::{color, Background, Color, Element, Font, Length, Shadow, Theme};
 
-pub const BLACK: Color = color!(0x000000);
-pub const CONTENT: Color = color!(0x121212);
-pub const PLAYER: Color = color!(0x141414);
-pub const TILE: Color = color!(0x292929);
-pub const WHITE: Color = color!(0xffffff);
-pub const TEXT: Color = color!(0xe6e6e6);
-pub const MUTED: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.5 };
-pub const CONTROL: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.08 };
-pub const CONTROL_HOVER: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.12 };
-pub const CONTROL_PRESSED: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.24 };
-pub const ACCENT: Color = color!(0xffff00);
-pub const ACCENT_HOVER: Color = color!(0xdada0b);
-pub const ON_ACCENT: Color = color!(0x000000);
-pub const DANGER: Color = color!(0xf87171);
+/// Цвета одной темы. Сняты с токенов --ym-* оригинала: тёмная тема и светлая.
+pub struct Colors {
+    /// Фон окна и боковой панели.
+    pub base: Color,
+    pub content: Color,
+    pub player: Color,
+    pub tile: Color,
+    /// Всплывающие окна и меню.
+    pub popover: Color,
+    pub menu: Color,
+    pub tooltip: Color,
+    /// Самый контрастный текст: названия, наведённые ссылки.
+    pub strong: Color,
+    pub text: Color,
+    pub muted: Color,
+    /// Недоступное: ещё бледнее приглушённого.
+    pub faint: Color,
+    pub control: Color,
+    pub control_hover: Color,
+    pub control_pressed: Color,
+    pub accent: Color,
+    pub accent_hover: Color,
+    pub on_accent: Color,
+    pub danger: Color,
+}
+
+const fn white(a: f32) -> Color {
+    Color { r: 1.0, g: 1.0, b: 1.0, a }
+}
+
+const fn black(a: f32) -> Color {
+    Color { r: 0.0, g: 0.0, b: 0.0, a }
+}
+
+pub const DARK: Colors = Colors {
+    base: color!(0x000000),
+    content: color!(0x121212),
+    player: color!(0x141414),
+    tile: color!(0x292929),
+    popover: color!(0x1a1a1a),
+    menu: color!(0x1f1f1f),
+    tooltip: color!(0x2a2a2a),
+    strong: color!(0xffffff),
+    text: color!(0xe6e6e6),
+    muted: white(0.5),
+    faint: white(0.3),
+    control: white(0.08),
+    control_hover: white(0.12),
+    control_pressed: white(0.24),
+    accent: color!(0xffff00),
+    accent_hover: color!(0xdada0b),
+    on_accent: color!(0x000000),
+    danger: color!(0xf87171),
+};
+
+pub const LIGHT: Colors = Colors {
+    base: color!(0xf5f5f5),
+    content: color!(0xffffff),
+    player: color!(0xffffff),
+    tile: color!(0xebebeb),
+    popover: color!(0xffffff),
+    menu: color!(0xffffff),
+    tooltip: color!(0xffffff),
+    strong: color!(0x000000),
+    text: color!(0x1a1a1a),
+    muted: color!(0x666666),
+    faint: black(0.3),
+    control: black(0.06),
+    control_hover: black(0.1),
+    control_pressed: black(0.2),
+    accent: color!(0xffee00),
+    accent_hover: color!(0xf5e400),
+    on_accent: color!(0x000000),
+    danger: color!(0xe5484d),
+};
+
+/// Светлая ли сейчас тема. Меняется на ходу: стили читают её при каждой отрисовке.
+static LIGHT_THEME: AtomicBool = AtomicBool::new(false);
+
+pub fn set_light(light: bool) {
+    LIGHT_THEME.store(light, Ordering::Relaxed);
+}
+
+pub fn is_light() -> bool {
+    LIGHT_THEME.load(Ordering::Relaxed)
+}
+
+/// Полноэкранный плеер лежит на тёмном цвете обложки и в любой теме рисуется тёмной палитрой.
+static FULL_DARK: AtomicBool = AtomicBool::new(false);
+
+pub fn set_full_dark(dark: bool) {
+    FULL_DARK.store(dark, Ordering::Relaxed);
+}
+
+/// Цвета текущей темы.
+pub fn c() -> &'static Colors {
+    if is_light() && !FULL_DARK.load(Ordering::Relaxed) { &LIGHT } else { &DARK }
+}
 
 /// Загружены ли шрифты Яндекса; если нет, используется системный.
 pub static YANDEX_FONTS: AtomicBool = AtomicBool::new(false);
@@ -49,7 +133,7 @@ pub fn font_headline() -> Font {
 }
 
 pub fn theme() -> Theme {
-    Theme::custom("Tune", Palette { background: BLACK, text: TEXT, primary: ACCENT, success: ACCENT, warning: ACCENT, danger: DANGER })
+    Theme::custom("Tune", Palette { background: c().base, text: c().text, primary: c().accent, success: c().accent, warning: c().accent, danger: c().danger })
 }
 
 pub const LYRICS: &str = "M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-5 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z";
@@ -122,66 +206,66 @@ fn flat(background: Option<Color>, text_color: Color, radius: f32) -> button::St
 /// Кнопка без фона: значки плеера.
 pub fn ghost(_: &Theme, status: button::Status) -> button::Style {
     match status {
-        button::Status::Pressed => flat(Some(CONTROL), TEXT, 20.0),
-        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(None, TEXT, 20.0),
+        button::Status::Pressed => flat(Some(c().control), c().text, 20.0),
+        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(None, c().text, 20.0),
     }
 }
 
 /// Пункт боковой панели: в оригинале это текст без подложки.
 pub fn nav(_: &Theme, status: button::Status) -> button::Style {
     match status {
-        button::Status::Pressed => flat(Some(CONTROL), TEXT, 24.0),
-        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(None, TEXT, 24.0),
+        button::Status::Pressed => flat(Some(c().control), c().text, 24.0),
+        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(None, c().text, 24.0),
     }
 }
 
 /// Строка трека, карточка и другие большие области.
 pub fn row(_: &Theme, status: button::Status) -> button::Style {
     match status {
-        button::Status::Pressed => flat(Some(CONTROL), TEXT, 8.0),
-        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(None, TEXT, 8.0),
+        button::Status::Pressed => flat(Some(c().control), c().text, 8.0),
+        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(None, c().text, 8.0),
     }
 }
 
 pub fn accent(_: &Theme, status: button::Status) -> button::Style {
-    flat(Some(if status == button::Status::Pressed { ACCENT_HOVER } else { ACCENT }), ON_ACCENT, 24.0)
+    flat(Some(if status == button::Status::Pressed { c().accent_hover } else { c().accent }), c().on_accent, 24.0)
 }
 
 pub fn secondary(_: &Theme, status: button::Status) -> button::Style {
     match status {
-        button::Status::Pressed => flat(Some(CONTROL_PRESSED), TEXT, 24.0),
-        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(Some(CONTROL), TEXT, 24.0),
+        button::Status::Pressed => flat(Some(c().control_pressed), c().text, 24.0),
+        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(Some(c().control), c().text, 24.0),
     }
 }
 
 /// Круглая кнопка запуска и паузы.
 pub fn round(_: &Theme, status: button::Status) -> button::Style {
-    flat(Some(if status == button::Status::Pressed { ACCENT_HOVER } else { ACCENT }), ON_ACCENT, 40.0)
+    flat(Some(if status == button::Status::Pressed { c().accent_hover } else { c().accent }), c().on_accent, 40.0)
 }
 
 fn fill(color: Color) -> container::Style {
-    container::Style { background: Some(Background::Color(color)), text_color: Some(TEXT), ..container::Style::default() }
+    container::Style { background: Some(Background::Color(color)), text_color: Some(c().text), ..container::Style::default() }
 }
 
 pub fn root(_: &Theme) -> container::Style {
-    fill(BLACK)
+    fill(c().base)
 }
 
 pub fn content(_: &Theme) -> container::Style {
-    container::Style { border: Border { color: CONTROL, width: 1.0, radius: 12.0.into() }, ..fill(CONTENT) }
+    container::Style { border: Border { color: c().control, width: 1.0, radius: 12.0.into() }, ..fill(c().content) }
 }
 
 pub fn player(_: &Theme) -> container::Style {
-    container::Style { border: border::rounded(12), ..fill(PLAYER) }
+    container::Style { border: border::rounded(12), ..fill(c().player) }
 }
 
 pub fn tile(_: &Theme) -> container::Style {
-    container::Style { border: border::rounded(6), ..fill(TILE) }
+    container::Style { border: border::rounded(6), ..fill(c().tile) }
 }
 
 /// Всплывающее меню и уведомление: --ym-background-color-primary-enabled-popover.
 pub fn popover(_: &Theme) -> container::Style {
-    container::Style { border: Border { color: CONTROL, width: 1.0, radius: 12.0.into() }, ..fill(color!(0x1a1a1a)) }
+    container::Style { border: Border { color: c().control, width: 1.0, radius: 12.0.into() }, ..fill(c().popover) }
 }
 
 /// Всплывающее окно посреди появления.
@@ -220,23 +304,23 @@ pub fn input_faded(alpha: f32) -> impl Fn(&Theme, text_input::Status) -> text_in
 }
 
 pub fn avatar(_: &Theme) -> container::Style {
-    container::Style { border: border::rounded(24), ..fill(TILE) }
+    container::Style { border: border::rounded(24), ..fill(c().tile) }
 }
 
 /// Пункт всплывающего меню.
 pub fn menu_item(_: &Theme, status: button::Status) -> button::Style {
     match status {
-        button::Status::Pressed => flat(Some(CONTROL), TEXT, 6.0),
-        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(None, TEXT, 6.0),
+        button::Status::Pressed => flat(Some(c().control), c().text, 6.0),
+        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(None, c().text, 6.0),
     }
 }
 
 /// Фильтр поиска.
 pub fn chip(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, status| match (active, status) {
-        (true, _) => flat(Some(TEXT), BLACK, 18.0),
-        (false, button::Status::Pressed) => flat(Some(CONTROL_HOVER), TEXT, 18.0),
-        (false, _) => flat(Some(CONTROL), TEXT, 18.0),
+        (true, _) => flat(Some(c().text), c().base, 18.0),
+        (false, button::Status::Pressed) => flat(Some(c().control_hover), c().text, 18.0),
+        (false, _) => flat(Some(c().control), c().text, 18.0),
     }
 }
 
@@ -252,39 +336,39 @@ pub fn chip_faded(active: bool, alpha: f32) -> impl Fn(&Theme, button::Status) -
 /// Карточка альбома, исполнителя, плейлиста: подсвечивается при наведении.
 pub fn card(_: &Theme, status: button::Status) -> button::Style {
     match status {
-        button::Status::Pressed => flat(Some(CONTROL), TEXT, 12.0),
-        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(None, TEXT, 12.0),
+        button::Status::Pressed => flat(Some(c().control), c().text, 12.0),
+        button::Status::Hovered | button::Status::Active | button::Status::Disabled => flat(None, c().text, 12.0),
     }
 }
 
 /// Значок explicit.
 pub fn explicit(_: &Theme) -> container::Style {
-    container::Style { border: border::rounded(3), ..fill(CONTROL_PRESSED) }
+    container::Style { border: border::rounded(3), ..fill(c().control_pressed) }
 }
 
 /// Значок подписки.
 pub fn plus(_: &Theme) -> container::Style {
-    container::Style { background: Some(Background::Color(color!(0xff5c4d))), text_color: Some(WHITE), border: border::rounded(10), ..container::Style::default() }
+    container::Style { background: Some(Background::Color(color!(0xff5c4d))), text_color: Some(Color::WHITE), border: border::rounded(10), ..container::Style::default() }
 }
 
 /// Значок поверх обложки играющего трека.
 pub fn overlay(_: &Theme) -> container::Style {
-    container::Style { background: Some(Background::Color(Color { a: 0.5, ..BLACK })), border: border::rounded(6), ..container::Style::default() }
+    container::Style { background: Some(Background::Color(Color { a: 0.5, ..Color::BLACK })), border: border::rounded(6), ..container::Style::default() }
 }
 
 pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
     let edge = match status {
-        text_input::Status::Focused { .. } => MUTED,
-        text_input::Status::Hovered => CONTROL_PRESSED,
-        text_input::Status::Active | text_input::Status::Disabled => CONTROL_HOVER,
+        text_input::Status::Focused { .. } => c().muted,
+        text_input::Status::Hovered => c().control_pressed,
+        text_input::Status::Active | text_input::Status::Disabled => c().control_hover,
     };
     text_input::Style {
-        background: Background::Color(CONTROL),
+        background: Background::Color(c().control),
         border: Border { color: edge, width: 1.0, radius: 26.0.into() },
-        icon: MUTED,
-        placeholder: MUTED,
-        value: TEXT,
-        selection: Color { a: 0.35, ..ACCENT },
+        icon: c().muted,
+        placeholder: c().muted,
+        value: c().text,
+        selection: Color { a: 0.35, ..c().accent },
     }
 }
 
@@ -306,11 +390,11 @@ pub fn eq_slider(enabled: bool, alpha: f32) -> impl Fn(&Theme, slider::Status) -
 /// Выпадающий список во всплывающем окне посреди появления.
 pub fn select_faded(alpha: f32) -> impl Fn(&Theme, pick_list::Status) -> pick_list::Style {
     move |_, status| {
-        let back = if matches!(status, pick_list::Status::Active) { CONTROL } else { CONTROL_HOVER };
+        let back = if matches!(status, pick_list::Status::Active) { c().control } else { c().control_hover };
         pick_list::Style {
-            text_color: TEXT.scale_alpha(alpha),
-            placeholder_color: MUTED.scale_alpha(alpha),
-            handle_color: MUTED.scale_alpha(alpha),
+            text_color: c().text.scale_alpha(alpha),
+            placeholder_color: c().muted.scale_alpha(alpha),
+            handle_color: c().muted.scale_alpha(alpha),
             background: Background::Color(back.scale_alpha(alpha)),
             border: border::rounded(8),
         }
@@ -320,20 +404,20 @@ pub fn select_faded(alpha: f32) -> impl Fn(&Theme, pick_list::Status) -> pick_li
 /// Раскрытый выпадающий список.
 pub fn select_menu(_: &Theme) -> menu::Style {
     menu::Style {
-        background: Background::Color(color!(0x1f1f1f)),
-        border: Border { color: CONTROL, width: 1.0, radius: 8.0.into() },
-        text_color: TEXT,
-        selected_text_color: TEXT,
-        selected_background: Background::Color(CONTROL_HOVER),
+        background: Background::Color(c().menu),
+        border: Border { color: c().control, width: 1.0, radius: 8.0.into() },
+        text_color: c().text,
+        selected_text_color: c().text,
+        selected_background: Background::Color(c().control_hover),
         shadow: Shadow::default(),
     }
 }
 
 fn eq_slider_style(enabled: bool, status: slider::Status) -> slider::Style {
-    let fill = if enabled { ACCENT } else { MUTED };
-    let handle = if matches!(status, slider::Status::Dragged) && enabled { ACCENT_HOVER } else { fill };
+    let fill = if enabled { c().accent } else { c().muted };
+    let handle = if matches!(status, slider::Status::Dragged) && enabled { c().accent_hover } else { fill };
     slider::Style {
-        rail: slider::Rail { backgrounds: (Background::Color(fill), Background::Color(CONTROL_PRESSED)), width: 4.0, border: Border { radius: 2.0.into(), ..Border::default() } },
+        rail: slider::Rail { backgrounds: (Background::Color(fill), Background::Color(c().control_pressed)), width: 4.0, border: Border { radius: 2.0.into(), ..Border::default() } },
         handle: slider::Handle { shape: slider::HandleShape::Circle { radius: 7.0 }, background: Background::Color(handle), border_width: 0.0, border_color: Color::TRANSPARENT },
     }
 }
@@ -396,7 +480,7 @@ fn scroll_look(theme: &Theme, status: scrollable::Status, alpha: f32) -> scrolla
     let rail = scrollable::Rail {
         background: None,
         border: Border::default(),
-        scroller: scrollable::Scroller { background: Background::Color(Color { a: alpha, ..WHITE }), border: border::rounded(SCROLL_WIDTH / 2.0) },
+        scroller: scrollable::Scroller { background: Background::Color(Color { a: alpha, ..c().strong }), border: border::rounded(SCROLL_WIDTH / 2.0) },
     };
     scrollable::Style { vertical_rail: rail, horizontal_rail: rail, ..scrollable::default(theme, status) }
 }

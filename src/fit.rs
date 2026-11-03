@@ -229,9 +229,9 @@ impl From<Fit> for Element<'_, Message> {
         }
         let cut = Rc::new(Cell::new(false));
         fit.cut = Some(cut.clone());
-        let full = container(label(fit.content.clone()).size(13).color(crate::ui::TEXT)).max_width(TIP_WIDTH).padding([6, 10]).style(|_| container::Style {
-            background: Some(iced::color!(0x2a2a2a).into()),
-            border: border::rounded(6).color(crate::ui::CONTROL).width(1),
+        let full = container(label(fit.content.clone()).size(13).color(crate::ui::c().text)).max_width(TIP_WIDTH).padding([6, 10]).style(|_| container::Style {
+            background: Some(crate::ui::c().tooltip.into()),
+            border: border::rounded(6).color(crate::ui::c().control).width(1),
             ..container::Style::default()
         });
         tooltip(Element::new(fit), Element::new(Tip { cut, content: full.into() }), tooltip::Position::Bottom).gap(6).padding(0).delay(TIP_DELAY).into()

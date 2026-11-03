@@ -127,7 +127,7 @@ impl Widget<Message, Theme, Renderer> for Glow<'_> {
         let quad = renderer::Quad { bounds, border: border::rounded(self.radius), ..renderer::Quad::default() };
         let paint = |renderer: &mut Renderer| {
             if state.level > 0.0 && !self.shine {
-                renderer.fill_quad(quad, Color { a: ui::CONTROL.a * state.level, ..ui::CONTROL });
+                renderer.fill_quad(quad, Color { a: ui::c().control.a * state.level, ..ui::c().control });
             }
             self.content.as_widget().draw(&tree.children[0], renderer, theme, style, layout, cursor, viewport);
             // Фон рисуется раньше текста, поэтому осветление ложится между ними.

@@ -73,12 +73,12 @@ impl canvas::Program<Message> for Seek {
         let bar = |frame: &mut Frame, width: f32, color: Color| {
             frame.fill(&Path::rounded_rectangle(Point::new(0.0, top), Size::new(width, thick), (thick / 2.0).into()), color);
         };
-        bar(&mut frame, bounds.width, ui::CONTROL_PRESSED);
+        bar(&mut frame, bounds.width, ui::c().control_pressed);
         let to = (self.value / self.total.max(0.001)).clamp(0.0, 1.0) * bounds.width;
-        bar(&mut frame, to, if state.level > 0.0 { ui::ACCENT } else { ui::WHITE });
+        bar(&mut frame, to, if state.level > 0.0 { ui::c().accent } else { ui::c().strong });
         if state.level > 0.0 {
             let center = Point::new(to.clamp(KNOB, (bounds.width - KNOB).max(KNOB)), bounds.height / 2.0);
-            frame.fill(&Path::circle(center, KNOB * state.level), ui::WHITE);
+            frame.fill(&Path::circle(center, KNOB * state.level), ui::c().strong);
         }
         vec![frame.into_geometry()]
     }
