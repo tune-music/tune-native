@@ -111,6 +111,8 @@ const WAVE_HISTORY: usize = 50;
 const MAX_FAILURES: u32 = 3;
 /// Высота строки трека. Одинаковая у всех: по ней считается, какие строки видны.
 const ROW: f32 = 58.0;
+/// Сколько треков «Знакомо вам» видно на странице исполнителя; играют все.
+const FAMILIAR_SHOWN: usize = 5;
 /// Заголовок дня и заголовок блока «откуда слушали» в истории.
 const HISTORY_DAY: f32 = 64.0;
 const HISTORY_HEAD: f32 = 40.0;
@@ -492,6 +494,8 @@ enum Preview {
     ArtistAbout(String),
     /// Страница исполнителя с открытым меню «…».
     ArtistMenu(String),
+    /// Страница исполнителя, прокрученная до «Знакомо вам».
+    ArtistFamiliar(String),
     /// Страница дизлайков на вкладке исполнителей.
     DislikedArtists,
     /// Микс по тегу.
@@ -588,6 +592,8 @@ struct App {
     /// Исполнители с дизлайком и открыта ли их вкладка на странице дизлайков.
     disliked_artists: Vec<Card>,
     dislikes_artists: bool,
+    /// В «Знакомо вам» открыта вкладка Моей волны.
+    familiar_wave: bool,
     searching: bool,
     search_id: u64,
     uid: Option<String>,
@@ -841,6 +847,9 @@ enum Message {
     HomePlay(usize, usize),
     HomeOpen(HomeItem),
     LikedPages(Result<(Vec<Card>, Vec<Card>, Vec<Card>), String>),
+    /// «Знакомо вам» на странице исполнителя: вкладка (в волне ли) и запуск трека из неё.
+    FamiliarTab(bool),
+    FamiliarPlay(usize),
     /// Дизлайк исполнителя на открытой странице или его снятие.
     ArtistDislike,
     ArtistDisliked(bool, Result<(), String>),
@@ -1079,6 +1088,7 @@ impl App {
             liked_artists: Vec::new(),
             disliked_artists: Vec::new(),
             dislikes_artists: false,
+            familiar_wave: false,
             searching: false,
             search_id: 0,
             uid: None,
@@ -1379,6 +1389,17 @@ impl App {
             }
             section => visible_rows(self.list_offset, WINDOW.lock().unwrap().1, self.row_count(section)),
         }
+    }
+
+    /// Треки открытой вкладки «Знакомо вам».
+    fn familiar_tracks<'a>(&self, artist: &'a api::Artist) -> &'a [Track] {
+        if self.familiar_wave { &artist.familiar_wave } else { &artist.familiar_collection }
+    }
+
+    fn artist_familiar_covers(&self) -> Task<Message> {
+        let Some(artist) = &self.artist else { return Task::none() };
+        let jobs = self.familiar_tracks(artist).iter().take(FAMILIAR_SHOWN).filter_map(|t| Some((t.id.clone(), t.cover.clone()?))).collect();
+        self.fetch_cover_jobs(jobs, "100x100")
     }
 
     /// Строки истории по порядку и их высота: день, откуда слушали, треки.
@@ -2698,7 +2719,7 @@ impl App {
                         self.update(Message::ArtistOpen(id))
                     }
                     // Подсказка снимается, когда исполнитель загрузится.
-                    Some(Preview::ArtistAbout(id) | Preview::Discography(id) | Preview::ArtistMenu(id)) => self.update(Message::ArtistOpen(id)),
+                    Some(Preview::ArtistAbout(id) | Preview::Discography(id) | Preview::ArtistMenu(id) | Preview::ArtistFamiliar(id)) => self.update(Message::ArtistOpen(id)),
                     Some(Preview::DislikedArtists) => {
                         self.preview = None;
                         self.dislikes_artists = true;
@@ -3184,6 +3205,17 @@ impl App {
                 return self.notify(text.to_string());
             }
             Message::ArtistDisliked(_, Err(e)) => return Task::batch([self.liked_pages_load(), self.fail(e)]),
+            Message::FamiliarTab(wave) => {
+                self.familiar_wave = wave;
+                return self.artist_familiar_covers();
+            }
+            Message::FamiliarPlay(index) => {
+                let Some(artist) = &self.artist else { return Task::none() };
+                let tracks = self.familiar_tracks(artist).to_vec();
+                let title = artist.name.clone();
+                self.queue_from = QueueFrom::Unknown;
+                return self.play_list(tracks, title, index);
+            }
             Message::DislikesTab(artists) => {
                 self.dislikes_artists = artists;
                 if artists {
@@ -3361,12 +3393,19 @@ impl App {
                         let artists = artist.similar.iter().filter_map(|c| Some((format!("{ARTIST_COVER}{}", c.id), c.cover.clone()?)));
                         let main = artist.cover.clone().map(|uri| (format!("{ARTIST_COVER}{}", artist.id), uri));
                         let jobs = main.into_iter().chain(artists).chain(albums).collect();
+                        self.familiar_wave = artist.familiar_collection.is_empty();
                         self.artist = Some(artist);
-                        let covers = self.fetch_cover_jobs(jobs, "300x300");
+                        let covers = Task::batch([self.fetch_cover_jobs(jobs, "300x300"), self.artist_familiar_covers()]);
                         return match self.preview.clone() {
                             Some(Preview::Discography(_)) => {
                                 self.preview = None;
                                 Task::batch([covers, self.handle(Message::DiscographyOpen(false))])
+                            }
+                            Some(Preview::ArtistFamiliar(_)) => {
+                                self.preview = None;
+                                let popular = self.artist.as_ref().map_or(0, |artist| artist.popular.len()) as f32;
+                                let down = operation::scroll_to(Id::new(LIST), scrollable::AbsoluteOffset { x: 0.0, y: 300.0 + popular * ROW });
+                                Task::batch([covers, down])
                             }
                             Some(Preview::ArtistMenu(_)) => {
                                 self.preview = None;
@@ -6134,6 +6173,20 @@ impl App {
             page = page.push(block("Популярные треки"));
             page = page.push(artist.popular.iter().enumerate().fold(column![], |list, (index, track)| list.push(self.view_track(Section::Artist, index, track))));
         }
+        if !artist.familiar_collection.is_empty() || !artist.familiar_wave.is_empty() {
+            // Как в оригинале: две части — что есть в коллекции и что звучало в Моей волне.
+            let chip = |label: String, wave: bool| shine(button(text(label).size(14)).padding([5, 14]).style(ui::chip(wave == self.familiar_wave)).on_press(Message::FamiliarTab(wave)), 16.0);
+            let mut chips = row![].spacing(8);
+            if !artist.familiar_collection.is_empty() {
+                chips = chips.push(chip(format!("У вас в Коллекции · {}", artist.familiar_collection.len()), false));
+            }
+            if !artist.familiar_wave.is_empty() {
+                chips = chips.push(chip(format!("Слушали в Моей волне · {}", artist.familiar_wave.len()), true));
+            }
+            let rows = self.familiar_tracks(artist).iter().take(FAMILIAR_SHOWN).enumerate();
+            page = page.push(Space::new().height(8)).push(block("Знакомо вам")).push(chips.wrap());
+            page = page.push(rows.fold(column![], |list, (index, track)| list.push(self.view_track_row(Message::FamiliarPlay(index), track))));
+        }
         let albums = |cards: &'_ [Card]| !cards.is_empty();
         if albums(&artist.albums) {
             page = page.push(Space::new().height(8)).push(more_title("Альбомы", Message::DiscographyOpen(false))).push(self.view_cards(&artist.albums, ALBUM_COVER, false, open_album));
@@ -7656,6 +7709,7 @@ fn main() -> iced::Result {
             }
             what if what.starts_with("album:") => Preview::Album(what[6..].to_string()),
             what if what.starts_with("artist:") => Preview::Artist(what[7..].to_string()),
+            what if what.starts_with("artist-familiar:") => Preview::ArtistFamiliar(what[16..].to_string()),
             what if what.starts_with("artist-menu:") => Preview::ArtistMenu(what[12..].to_string()),
             "disliked-artists" => Preview::DislikedArtists,
             what if what.starts_with("artist-about:") => Preview::ArtistAbout(what[13..].to_string()),

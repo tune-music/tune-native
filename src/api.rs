@@ -830,6 +830,9 @@ pub struct Artist {
     /// «Об исполнителе»: текст и официальные страницы.
     pub about: String,
     pub links: Vec<ArtistLink>,
+    /// «Знакомо вам»: его треки в коллекции и те, что звучали в Моей волне.
+    pub familiar_collection: Vec<Track>,
+    pub familiar_wave: Vec<Track>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -937,6 +940,8 @@ fn parse_artist(v: &Value) -> Option<Artist> {
         similar: parse_cards(&v["similarArtists"], artist_card),
         about: String::new(),
         links: Vec::new(),
+        familiar_collection: Vec::new(),
+        familiar_wave: Vec::new(),
     })
 }
 
@@ -984,7 +989,19 @@ pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
     if let Ok(v) = get(&format!("artists/{id}/about-artist"), &[], token) {
         (artist.about, artist.links) = parse_about(result(&v));
     }
+    let limit = FAMILIAR_LIMIT.to_string();
+    if let Ok(v) = get(&format!("artists/{id}/familiar-you"), &[("waveTracksLimit", &limit), ("collectionTracksLimit", &limit), ("collectionAlbumsLimit", "0")], token) {
+        (artist.familiar_collection, artist.familiar_wave) = parse_familiar(result(&v));
+    }
     Ok(artist)
+}
+
+/// Сколько знакомых треков просится в каждой части.
+const FAMILIAR_LIMIT: usize = 50;
+
+fn parse_familiar(v: &Value) -> (Vec<Track>, Vec<Track>) {
+    let tracks = |key: &str| v[key]["tracks"].as_array().into_iter().flatten().filter_map(parse_track).collect();
+    (tracks("collection"), tracks("wave"))
 }
 
 /// Что нашёл смешанный поиск.
@@ -2173,6 +2190,13 @@ mod tests {
         assert_eq!(parse_liked_list(&v).unwrap().owner, "5");
         let v = json!({"owner":{"uid":6},"kind":"8","title":"Р"});
         assert_eq!(parse_liked_list(&v).unwrap().kind, "8");
+    }
+
+    #[test]
+    fn reads_familiar_tracks() {
+        let v = json!({"wave":{"tracks":[{"id":"1","title":"А","durationMs":1000},{"id":"2","title":"Б","durationMs":1000}]},"collection":{}});
+        let (collection, wave) = parse_familiar(&v);
+        assert_eq!((collection.len(), wave.len(), wave[1].title.as_str()), (0, 2, "Б"));
     }
 
     #[test]
