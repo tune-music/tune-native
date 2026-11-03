@@ -995,6 +995,10 @@ fn parse_home_item(v: &Value) -> Option<HomeItem> {
     if let Some(tag) = data["action"]["weblink"].as_str().and_then(|link| link.strip_prefix("/tag/")).map(|tag| tag.trim_matches('/')).filter(|tag| !tag.is_empty()) {
         return Some(HomeItem::Mix { tag: tag.to_string(), title: data["title"].as_str()?.to_string(), cover: data["covers"][0]["uri"].as_str().map(str::to_string) });
     }
+    // Категория книг и подкастов — своя страница из блоков: «Юмор», «Детективы».
+    if let Some(page) = data["action"]["weblink"].as_str().and_then(|link| link.strip_prefix("/landing/")).map(|page| page.trim_matches('/')).filter(|page| page.starts_with("category_")) {
+        return Some(HomeItem::Mix { tag: format!("{CATEGORY}{page}"), title: data["title"].as_str()?.to_string(), cover: data["covers"][0]["uri"].as_str().map(str::to_string) });
+    }
     // В похожем волна лежит глубже: название и зёрна в wave, обложка в agent.
     let wave = &data["wave"];
     let seeds: Vec<String> = data["seeds"].as_array().or(wave["seeds"].as_array())?.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
@@ -1012,6 +1016,66 @@ impl HomeItem {
     pub fn is_shortcut(&self) -> bool {
         matches!(self, HomeItem::Likes { .. } | HomeItem::History { .. })
     }
+}
+
+/// Так помечен микс, который на самом деле категория книг и подкастов.
+pub const CATEGORY: &str = "category:";
+/// В категории бывает больше тысячи книг: страница показывает самые первые.
+const CATEGORY_LIMIT: usize = 100;
+
+/// Карточки категории книг и подкастов: все её блоки подряд, без повторов.
+pub fn category(page: &str, token: &str) -> Result<Vec<HomeItem>, String> {
+    let landing = landing(page, 0, token)?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(landing.blocks.into_iter().flat_map(|block| block.items).filter(|item| seen.insert(item_key(item))).take(CATEGORY_LIMIT).collect())
+}
+
+/// Чем карточка отличается от других: вид и номер.
+fn item_key(item: &HomeItem) -> String {
+    match item {
+        HomeItem::Album(card) => format!("album:{}", card.id),
+        HomeItem::Artist(card) => format!("artist:{}", card.id),
+        HomeItem::Playlist(list) => format!("playlist:{}:{}", list.owner, list.kind),
+        HomeItem::Wave { seeds, .. } => format!("wave:{}", seeds.join(",")),
+        HomeItem::Mix { tag, .. } => format!("mix:{tag}"),
+        HomeItem::Likes { .. } => "likes".to_string(),
+        HomeItem::History { .. } => "history".to_string(),
+    }
+}
+
+/// Альбомы из ответов полки и новых выпусков: они лежат то списком, то внутри блоков.
+fn shelf_albums(v: &Value) -> Vec<HomeItem> {
+    let mut found = Vec::new();
+    let mut take = |entry: &Value| {
+        let album = if entry["album"].is_object() { &entry["album"] } else if entry["data"]["album"].is_object() { &entry["data"]["album"] } else { entry };
+        if let Some(card) = album_card(album) {
+            found.push(HomeItem::Album(card));
+        }
+    };
+    for key in ["albums", "items", "entities"] {
+        v[key].as_array().into_iter().flatten().for_each(&mut take);
+    }
+    for block in v["blocks"].as_array().into_iter().flatten() {
+        block["entities"].as_array().into_iter().flatten().for_each(&mut take);
+    }
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|item| seen.insert(item_key(item)));
+    found
+}
+
+/// Полка книг и подкастов и новые выпуски: первыми на странице раздела. Пустые не показываются.
+fn shelf_blocks(podcasts: bool, token: &str) -> Vec<HomeBlock> {
+    let handles: Vec<_> = [("non-music/bookshelf/recently-played", "Продолжить слушать"), ("new-episodes", "Новые выпуски"), ("non-music/bookshelf/liked", "Вы отложили")]
+        .into_iter()
+        // Новые выпуски бывают только у подкастов.
+        .filter(|(path, _)| podcasts || *path != "new-episodes")
+        .map(|(path, title)| {
+            let token = token.to_string();
+            let path = if path == "new-episodes" { "non-music/new-episodes" } else { path };
+            std::thread::spawn(move || get(path, &[], &token).ok().map(|v| HomeBlock { title: title.to_string(), items: shelf_albums(result(&v)), ..HomeBlock::default() }))
+        })
+        .collect();
+    handles.into_iter().filter_map(|h| h.join().ok().flatten()).filter(|block| !block.items.is_empty()).collect()
 }
 
 /// Название тега и его плейлисты: сначала номера, потом сами плейлисты одним запросом.
@@ -1141,6 +1205,7 @@ fn parse_home_block(title: &str, v: &Value) -> HomeBlock {
 /// Страница из блоков: главная (`main`) или книги и подкасты (`non_music`). Скелет страницы
 /// и все блоки выбранной вкладки; блоки грузятся одновременно, порядок сохраняется.
 pub fn landing(skeleton: &str, tab: usize, token: &str) -> Result<Home, String> {
+    let skeleton_id = skeleton;
     let skeleton = get(&format!("landing/skeleton/{skeleton}"), &[], token)?;
     let skeleton = result(&skeleton);
     // У книг и подкастов вкладки идут не первым блоком.
@@ -1164,6 +1229,12 @@ pub fn landing(skeleton: &str, tab: usize, token: &str) -> Result<Home, String> 
             })
             .collect();
         blocks.extend(handles.into_iter().filter_map(|h| h.join().ok().flatten()).filter(|b| (!b.title.is_empty() || b.items.iter().all(HomeItem::is_shortcut)) && (!b.items.is_empty() || !b.tracks.is_empty())));
+    }
+    if skeleton_id == "non_music" {
+        let podcasts = tabs[tab]["id"].as_str() == Some("podcasts");
+        let mut shelf = shelf_blocks(podcasts, token);
+        shelf.append(&mut blocks);
+        blocks = shelf;
     }
     Ok(Home { tabs: names, blocks })
 }

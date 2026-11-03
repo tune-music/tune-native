@@ -808,7 +808,7 @@ enum Message {
     /// Сортировка по дате выхода или по популярности.
     DiscographySort(bool),
     DiscographyMore,
-    TagLoaded(String, Result<(Option<String>, Vec<Playlist>), String>),
+    TagLoaded(String, Result<(Option<String>, Vec<HomeItem>), String>),
     /// Повторить недавний запрос.
     SearchAgain(String),
     SearchHistoryClear,
@@ -2573,7 +2573,7 @@ impl App {
                         if let (Some(name), Some((_, title))) = (name, self.tag.as_mut()) {
                             *title = name;
                         }
-                        self.tag_lists = lists.into_iter().map(HomeItem::Playlist).collect();
+                        self.tag_lists = lists;
                         let jobs = self.tag_lists.iter().filter_map(|item| Some((home_item_key(item), home_item_cover(item)?))).collect();
                         return self.fetch_cover_jobs(jobs, "200x200");
                     }
@@ -2780,7 +2780,12 @@ impl App {
                     self.tag = Some((tag.clone(), title));
                     let open = self.handle(Message::Open(Section::Tag));
                     let wanted = tag.clone();
-                    return Task::batch([open, Task::perform(background(move || api::tag_playlists(&tag, &token)), move |result| Message::TagLoaded(wanted.clone(), result))]);
+                    // Категория книг и подкастов грузится как страница из блоков, микс — по тегу.
+                    let load = move || match tag.strip_prefix(api::CATEGORY) {
+                        Some(page) => api::category(page, &token).map(|items| (None, items)),
+                        None => api::tag_playlists(&tag, &token).map(|(name, lists)| (name, lists.into_iter().map(HomeItem::Playlist).collect())),
+                    };
+                    return Task::batch([open, Task::perform(background(load), move |result| Message::TagLoaded(wanted.clone(), result))]);
                 }
                 HomeItem::History { .. } => return self.update(Message::Open(Section::History)),
             },
@@ -5230,7 +5235,7 @@ impl App {
             HomeItem::Artist(card) => (&card.title, card.subtitle.clone(), true),
             HomeItem::Playlist(list) => (&list.title, if list.count > 0 { format!("{} {}", list.count, tracks_word(list.count as usize)) } else { "Плейлист".to_string() }, false),
             HomeItem::Wave { title, .. } => (title, "Волна".to_string(), true),
-            HomeItem::Mix { title, .. } => (title, "Микс".to_string(), false),
+            HomeItem::Mix { title, tag, .. } => (title, if tag.starts_with(api::CATEGORY) { "Категория" } else { "Микс" }.to_string(), false),
             HomeItem::Likes { count, .. } => ("Мне нравится", format!("{count} {}", tracks_word(*count as usize)), false),
             HomeItem::History { subtitle, .. } => ("История", if subtitle.is_empty() { "Недавно прослушанное".to_string() } else { subtitle.clone() }, false),
         };
@@ -5523,13 +5528,24 @@ impl App {
         // У недоступных треков Яндекс длительности не присылает: вместо «00:00» пустое место той же ширины.
         if self.main_width() >= TRACK_TIME_WIDTH {
             let time_color = if track.duration.is_zero() { iced::Color::TRANSPARENT } else { names_color };
-            line = line.push(text(clock(track.duration)).color(time_color));
+            line = line.push(text(self.track_time(track)).color(time_color));
         }
         let mut line = line.push(self.more_button(track, 18.0));
         if let Some(grip) = grip {
             line = line.push(grip);
         }
         mouse_area(glow(button(line).width(Length::Fill).height(ROW).padding([8, 8]).style(ui::row).on_press(play), 8.0)).on_right_press(Message::MenuOpen(track.clone())).into()
+    }
+
+    /// Длительность трека, а у начатого выпуска или главы — сколько осталось.
+    fn track_time(&self, track: &Track) -> String {
+        let end = track.duration.as_secs_f32();
+        let place = if track.remember { self.progress.get(&track.id).copied().or(track.progress) } else { None };
+        match place {
+            Some(place) if place >= end - PROGRESS_TAIL && end > 0.0 => "прослушано".to_string(),
+            Some(place) if place > PROGRESS_MIN => format!("осталось {}", clock(Duration::from_secs_f32(end - place))),
+            _ => clock(track.duration),
+        }
     }
 
     fn like_button<'a>(&self, track: &Track, size: f32) -> Element<'a, Message> {
@@ -6239,6 +6255,8 @@ fn smoke_home() -> Result<(), String> {
             println!("{} | карточек {} | треков {} | вкладок {} | {}", block.title, block.items.len(), block.tracks.len(), block.tabs.len(), kinds.join(","));
         }
     }
+    let items = api::category("category_non-music_comedy", &token)?;
+    println!("=== Категория «Юмор»: {} карточек, первые: {}", items.len(), items.iter().take(3).map(|item| format!("{item:?}").chars().take(60).collect::<String>()).collect::<Vec<_>>().join(" | "));
     Ok(())
 }
 
