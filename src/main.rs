@@ -11,6 +11,7 @@ mod seek;
 mod session;
 mod crossfade;
 mod fit;
+mod offline;
 use fit::{fit, fit_row};
 mod pick;
 mod equalizer;
@@ -18,7 +19,7 @@ mod settings;
 mod ui;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -308,6 +309,8 @@ enum Section {
     Books,
     /// Детский раздел, тоже страница из блоков.
     Kids,
+    /// Скачанные треки: играют и без интернета.
+    Downloads,
     Collection,
     Likes,
     Playlists,
@@ -357,6 +360,7 @@ enum QueueFrom {
     History,
     Dislikes,
     Search,
+    Downloads,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -371,6 +375,8 @@ enum Dialog {
     TrackInfo(Track),
     Logout,
     Account,
+    /// Удалить всё скачанное с компьютера.
+    ClearDownloads,
 }
 
 /// Вкладка поиска.
@@ -459,6 +465,7 @@ enum Preview {
     EqBar,
     PageMenu,
     Books,
+    Downloads,
     Kids,
     /// Восстановленная очередь на странице волны, без звука.
     WaveRestored,
@@ -545,6 +552,15 @@ struct App {
     dialog_text: String,
     history_tracks: Vec<Track>,
     history_loading: bool,
+    /// Скачанные треки, их номера и сами треки для списка; новые первыми.
+    downloads: Vec<offline::Saved>,
+    download_ids: HashSet<String>,
+    download_tracks: Vec<Track>,
+    /// Что ждёт скачивания, что качается сейчас и итог текущей пачки: скачано и не вышло.
+    download_queue: VecDeque<Track>,
+    download_now: Option<String>,
+    download_done: usize,
+    download_failed: usize,
     /// Сведения о треке для окна: номер трека и строки. Пока идёт загрузка, строк нет.
     track_info: Option<(String, api::TrackDetails)>,
     /// Поиск внутри открытого плейлиста или лайков.
@@ -891,6 +907,11 @@ enum Message {
     DragEnd,
     TrackMoved(Result<(), String>),
     CrossfadeToggle,
+    /// Скачать треки, итог одного трека, убрать скачанные по номерам, убрать всё.
+    Download(Vec<Track>),
+    Downloaded(String, Result<offline::Saved, String>),
+    DownloadRemove(Vec<String>),
+    DownloadsClear,
     KidsToggle,
     EqToggle,
     EqPreset(usize),
@@ -948,6 +969,7 @@ impl App {
             Err(e) => (None, Some(e)),
         };
         let saved = settings::load();
+        let downloads = offline::load();
         let token = api::load_token();
         let task = match &token {
             Some(token) => load_account(token.clone()),
@@ -993,6 +1015,13 @@ impl App {
             dialog_text: String::new(),
             history_tracks: Vec::new(),
             history_loading: false,
+            download_ids: downloads.iter().map(|saved| saved.track.id.clone()).collect(),
+            download_tracks: downloads.iter().map(|saved| saved.track.clone()).collect(),
+            downloads,
+            download_queue: VecDeque::new(),
+            download_now: None,
+            download_done: 0,
+            download_failed: 0,
             track_info: None,
             filter: String::new(),
             filter_tracks: Vec::new(),
@@ -1457,7 +1486,7 @@ impl App {
             let (tx, jobs) = (tx.clone(), jobs.clone());
             std::thread::spawn(move || loop {
                 let Some((id, uri)) = jobs.lock().unwrap().pop() else { break };
-                if let Some(handle) = api::cover(&uri, size).and_then(|bytes| decoded(&bytes)) {
+                if let Some(handle) = offline::cover(&id).or_else(|| api::cover(&uri, size)).and_then(|bytes| decoded(&bytes)) {
                     if tx.unbounded_send((id, handle)).is_err() {
                         break;
                     }
@@ -1573,9 +1602,11 @@ impl App {
                         let label = if album.finished { "Отметить непрослушанным" } else { "Отметить прослушанным" };
                         items.push((ui::CHECK, label.to_string(), Message::AlbumFinished(!album.finished), false));
                     }
+                    items.extend(self.download_item());
                     return items;
                 }
                 let mut items = link_and_pin(PinRef::Playlist(list.owner.clone(), list.kind.clone()), format!("https://music.yandex.ru/users/{}/playlists/{}", list.owner, list.kind));
+                items.extend(self.download_item());
                 if self.is_own(list) {
                     items.push((ui::EDIT, "Переименовать".to_string(), Message::DialogOpen(Dialog::Rename(list.clone())), false));
                     items.push((ui::NOTES, "Изменить описание".to_string(), Message::DialogOpen(Dialog::Describe(list.clone())), false));
@@ -1615,6 +1646,45 @@ impl App {
             ))
         });
         popup(list.into(), x, y, MENU_WIDTH, count as f32 * MENU_ITEM, alpha, live)
+    }
+
+    /// Скачивает следующий трек из очереди скачивания. Качается по одному, чтобы не мешать звуку.
+    fn download_next(&mut self) -> Task<Message> {
+        if self.download_now.is_some() {
+            return Task::none();
+        }
+        let (Some(token), Some(track)) = (self.token(), self.download_queue.pop_front()) else { return Task::none() };
+        self.download_now = Some(track.id.clone());
+        let (quality, id) = (self.quality.code(), track.id.clone());
+        Task::perform(background(move || offline::download(&track, quality, &token)), move |result| Message::Downloaded(id.clone(), result))
+    }
+
+    /// Список скачанного поменялся: обновить номера, список для страницы и файл со списком.
+    fn downloads_changed(&mut self) {
+        self.download_ids = self.downloads.iter().map(|saved| saved.track.id.clone()).collect();
+        self.download_tracks = self.downloads.iter().map(|saved| saved.track.clone()).collect();
+        offline::save(&self.downloads);
+    }
+
+    /// Пункт меню страницы: скачать её треки или убрать их, если скачаны все.
+    fn download_item(&self) -> Option<(&'static str, String, Message, bool)> {
+        let tracks: Vec<&Track> = self.playlist_tracks.iter().filter(|track| !track.unavailable).collect();
+        if tracks.is_empty() {
+            return None;
+        }
+        if tracks.iter().all(|track| self.download_ids.contains(&track.id)) {
+            let ids = tracks.iter().map(|track| track.id.clone()).collect();
+            return Some((ui::DELETE, "Удалить из скачанного".to_string(), Message::DownloadRemove(ids), false));
+        }
+        Some((ui::DOWNLOAD, "Скачать".to_string(), Message::Download(tracks.into_iter().cloned().collect()), false))
+    }
+
+    /// У скачанного трека перед исполнителем значок: он играет и без интернета.
+    fn download_mark<'a>(&self, track: &Track, names: Element<'a, Message>) -> Element<'a, Message> {
+        if !self.download_ids.contains(&track.id) {
+            return names;
+        }
+        row![ui::icon(ui::DOWNLOAD_DONE, 14.0, ui::ACCENT), names].spacing(4).align_y(Alignment::Center).into()
     }
 
     /// Переставляет трек: в очереди только в окне, в своём плейлисте ещё и на сервере.
@@ -1695,6 +1765,7 @@ impl App {
             QueueFrom::Artist(id) => ("artist", "artist", Some(id.clone()), None),
             QueueFrom::Search => ("search", "search", None, None),
             QueueFrom::Likes | QueueFrom::Dislikes => ("playlist", "other", None, None),
+            QueueFrom::Downloads => ("downloads", "other", None, None),
             QueueFrom::History => ("history", "other", None, None),
             QueueFrom::List(_) | QueueFrom::Unknown => ("main", "other", None, None),
         };
@@ -1824,8 +1895,13 @@ impl App {
         }
         let id = track.id.clone();
         let quality = self.quality;
+        let local = self.downloads.iter().find(|saved| saved.track.id == track.id).map(|saved| (saved.path(), saved.codec.clone(), saved.sound()));
         let start = Task::perform(
             background(move || {
+                if let Some((path, codec, sound)) = local.filter(|(path, _, _)| path.exists()) {
+                    player.play_file(generation, &path, &codec)?;
+                    return Ok(sound);
+                }
                 if let Some(started) = player.play_prepared(generation, &preload_key(&id, quality)) {
                     return started;
                 }
@@ -1864,6 +1940,10 @@ impl App {
             return;
         }
         let Some(next) = self.next_index().and_then(|i| self.queue.get(i)) else { return };
+        // Скачанный следующий трек и так на диске.
+        if self.download_ids.contains(&next.id) {
+            return;
+        }
         let (id, quality) = (next.id.clone(), self.quality);
         let key = preload_key(&id, quality);
         if self.preloaded.as_ref() == Some(&key) {
@@ -2085,6 +2165,7 @@ impl App {
             // На странице очереди список — то, что будет после играющего трека.
             Section::History => &self.history_tracks,
             Section::Dislikes => &self.disliked_list,
+            Section::Downloads => &self.download_tracks,
             Section::Queue => self.current.and_then(|i| self.queue.get(i + 1..)).unwrap_or(&[]),
             Section::Lyrics | Section::Settings => &[],
             Section::Search => &self.results,
@@ -2174,7 +2255,7 @@ impl App {
             // Открыли исполнителя, альбом или другую страницу из плеера на всё окно — он уезжает.
             self.player_full = false;
             let here = self.list_place();
-            let section_root = matches!(here.0, Section::Home | Section::Books | Section::Kids | Section::Likes | Section::Collection | Section::Albums | Section::Artists | Section::History | Section::Dislikes | Section::Search | Section::Settings)
+            let section_root = matches!(here.0, Section::Home | Section::Books | Section::Kids | Section::Likes | Section::Collection | Section::Albums | Section::Artists | Section::History | Section::Dislikes | Section::Downloads | Section::Search | Section::Settings)
                 || (here.0 == Section::Playlists && here.1.is_none());
             let restore = self.scroll_places.get(&here).copied().filter(|_| remembers_scroll(here.0) && (section_root || travel));
             self.scroll_wait = restore.filter(|_| !self.page_ready());
@@ -2434,6 +2515,10 @@ impl App {
                         self.preview = None;
                         self.section = Section::Books;
                         self.home_load(Section::Books, 1)
+                    }
+                    Some(Preview::Downloads) => {
+                        self.preview = None;
+                        self.update(Message::Open(Section::Downloads))
                     }
                     Some(Preview::Kids) => {
                         self.preview = None;
@@ -3371,7 +3456,7 @@ impl App {
                         move || api::track_details(&id, &token)
                     }), move |r| Message::TrackInfoLoaded(id.clone(), r));
                 }
-                let focus = !matches!(dialog, Dialog::Delete(_) | Dialog::RemoveTrack(_) | Dialog::WaveTune | Dialog::Logout | Dialog::Account);
+                let focus = !matches!(dialog, Dialog::Delete(_) | Dialog::RemoveTrack(_) | Dialog::WaveTune | Dialog::Logout | Dialog::Account | Dialog::ClearDownloads);
                 self.dialog = Some(dialog);
                 if focus {
                     return operation::focus(Id::new(DIALOG_INPUT));
@@ -3403,6 +3488,7 @@ impl App {
                 return match dialog {
                     Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account => Task::none(),
                     Dialog::Logout => self.handle(Message::Logout),
+                    Dialog::ClearDownloads => self.handle(Message::DownloadsClear),
                     Dialog::Create => Task::perform(background(move || api::create_playlist(&uid, &title, &token)), Message::PlaylistCreated),
                     Dialog::Rename(list) => {
                         let kind = list.kind;
@@ -3627,6 +3713,7 @@ impl App {
                     QueueFrom::History => self.handle(Message::Open(Section::History)),
                     QueueFrom::Dislikes => self.handle(Message::Open(Section::Dislikes)),
                     QueueFrom::Search => self.handle(Message::Open(Section::Search)),
+                    QueueFrom::Downloads => self.handle(Message::Open(Section::Downloads)),
                 };
             }
             Message::QueueToggle => {
@@ -3813,6 +3900,60 @@ impl App {
                 self.crossfade = !self.crossfade;
                 self.save_settings();
             }
+            Message::Download(tracks) => {
+                self.menu = None;
+                let fresh: Vec<Track> = tracks
+                    .into_iter()
+                    .filter(|track| !track.unavailable && !self.download_ids.contains(&track.id) && self.download_now.as_deref() != Some(track.id.as_str()) && !self.download_queue.iter().any(|queued| queued.id == track.id))
+                    .collect();
+                if fresh.is_empty() {
+                    return self.notify("Уже скачано".to_string());
+                }
+                let count = fresh.len();
+                self.download_queue.extend(fresh);
+                let note = self.notify(if count == 1 { "Скачиваем трек".to_string() } else { format!("Скачиваем {count} {}", tracks_word(count)) });
+                return Task::batch([note, self.download_next()]);
+            }
+            Message::Downloaded(id, result) => {
+                self.download_now = None;
+                match result {
+                    Ok(saved) => {
+                        self.downloads.retain(|old| old.track.id != saved.track.id);
+                        self.downloads.insert(0, saved);
+                        self.downloads_changed();
+                        self.download_done += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("трек {id} не скачался: {e}");
+                        self.download_failed += 1;
+                    }
+                }
+                if !self.download_queue.is_empty() {
+                    return self.download_next();
+                }
+                let (done, failed) = (std::mem::take(&mut self.download_done), std::mem::take(&mut self.download_failed));
+                let note = match (done, failed) {
+                    (_, 0) => format!("Скачано: {done} {}", tracks_word(done)),
+                    (0, _) => "Не удалось скачать. Проверьте подключение к интернету".to_string(),
+                    _ => format!("Скачано: {done} {}, не удалось: {failed}", tracks_word(done)),
+                };
+                return self.notify(note);
+            }
+            Message::DownloadRemove(ids) => {
+                self.menu = None;
+                let (gone, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.downloads).into_iter().partition(|saved| ids.contains(&saved.track.id));
+                gone.iter().for_each(offline::remove);
+                self.downloads = keep;
+                self.download_queue.retain(|track| !ids.contains(&track.id));
+                self.downloads_changed();
+                return self.notify(if gone.len() == 1 { "Удалено из скачанного".to_string() } else { format!("Удалено из скачанного: {} {}", gone.len(), tracks_word(gone.len())) });
+            }
+            Message::DownloadsClear => {
+                self.download_queue.clear();
+                std::mem::take(&mut self.downloads).iter().for_each(offline::remove);
+                self.downloads_changed();
+                return self.notify("Скачанное удалено".to_string());
+            }
             Message::KidsToggle => {
                 self.kids = !self.kids;
                 self.save_settings();
@@ -3917,6 +4058,7 @@ impl App {
                         Section::Artist => self.artist.as_ref().map_or_else(String::new, |a| a.name.clone()),
                         Section::History => "История".to_string(),
                         Section::Dislikes => "Дизлайки".to_string(),
+                        Section::Downloads => "Скачанное".to_string(),
                         _ => "Мне нравится".to_string(),
                     };
                     self.queue_from = match section {
@@ -3925,6 +4067,7 @@ impl App {
                         Section::Search => QueueFrom::Search,
                         Section::History => QueueFrom::History,
                         Section::Dislikes => QueueFrom::Dislikes,
+                        Section::Downloads => QueueFrom::Downloads,
                         _ => QueueFrom::Likes,
                     };
                     return self.play_list(tracks, title, index);
@@ -4157,6 +4300,7 @@ impl App {
             Section::Tag => self.view_tag(),
             Section::History => self.view_track_page("История", &self.history_tracks, "Здесь появятся треки, которые вы слушали", Section::History),
             Section::Dislikes => self.view_track_page("Дизлайки", &self.disliked_list, "Здесь появятся треки, которые вам не понравились", Section::Dislikes),
+            Section::Downloads => self.view_track_page("Скачанное", &self.download_tracks, "Скачайте треки через меню «…» — они будут играть и без интернета", Section::Downloads),
             Section::Wave => self.view_wave(),
             Section::Collection => self.view_collection(),
             Section::Likes => self.view_likes(),
@@ -4238,6 +4382,7 @@ impl App {
             Dialog::TrackInfo(track) => return self.view_track_info(track),
             Dialog::Account => return self.view_account(),
             Dialog::Logout => ("Выйти из аккаунта?".to_string(), "Выйти", true),
+            Dialog::ClearDownloads => (format!("Удалить всё скачанное ({})?", offline::size_label(self.downloads.iter().map(|saved| saved.bytes).sum())), "Удалить", true),
             Dialog::Create => ("Новый плейлист".to_string(), "Создать", false),
             Dialog::Rename(_) => ("Название плейлиста".to_string(), "Сохранить", false),
             Dialog::Describe(_) => ("Описание плейлиста".to_string(), "Сохранить", false),
@@ -4544,6 +4689,15 @@ impl App {
             items = items.push(item(ui::CHECK, if finished { "Отметить непрослушанным" } else { "Отметить прослушанным" }, Message::EpisodeFinished(track.clone(), !finished)));
             count += 1.0;
         }
+        if !track.unavailable {
+            let saved = self.download_ids.contains(&track.id);
+            items = items.push(if saved {
+                item(ui::DELETE, "Удалить из скачанного", Message::DownloadRemove(vec![track.id.clone()]))
+            } else {
+                item(ui::DOWNLOAD, "Скачать", Message::Download(vec![track.clone()]))
+            });
+            count += 1.0;
+        }
         items = items.push(item(ui::LINK, "Скопировать ссылку", Message::CopyLink(track.clone())));
         items = items.push(item(ui::INFO, "Сведения о треке", Message::DialogOpen(Dialog::TrackInfo(track.clone()))));
         count += 2.0;
@@ -4621,6 +4775,7 @@ impl App {
             QueueFrom::Unknown => return plain(name).into(),
             QueueFrom::Search => return link("из поиска".to_string()).into(),
             QueueFrom::History => return link("из истории".to_string()).into(),
+            QueueFrom::Downloads => return link("из скачанного".to_string()).into(),
             QueueFrom::List(list) if list.source == Source::Album => "из альбома",
             QueueFrom::List(_) | QueueFrom::Likes | QueueFrom::Dislikes => "из плейлиста",
             QueueFrom::Artist(_) => "из популярных треков исполнителя",
@@ -4646,8 +4801,9 @@ impl App {
         } else if track.artist_list.is_empty() {
             fit(&track.artists).color(names_color).into()
         } else {
-            artist_links(&track.artist_list, 16.0, ui::font(), names_color).into()
+            artist_links(&track.artist_list, 16.0, ui::font(), names_color)
         };
+        let names = self.download_mark(track, names);
         let mut line = row![
             cover,
             column![track_title(track, 16.0, ui::font_medium(), title_color, false), names].width(Length::Fill).clip(true),
@@ -4726,7 +4882,7 @@ impl App {
 
     fn view_sidebar(&self) -> Element<'_, Message> {
         let opened = match self.section {
-            Section::Likes | Section::Playlists | Section::Albums | Section::Artists | Section::History | Section::Dislikes => Section::Collection,
+            Section::Likes | Section::Playlists | Section::Albums | Section::Artists | Section::History | Section::Dislikes | Section::Downloads => Section::Collection,
             section => section,
         };
         let item = |icon, label, section| {
@@ -5007,6 +5163,7 @@ impl App {
             self.view_equalizer(),
             cross,
             column![title("Рекомендации"), ai, kids].spacing(8),
+            self.view_stored(),
             view_hotkeys(),
             column![title("Аккаунт"), row![link("Управление аккаунтом", Message::DialogOpen(Dialog::Account)), link("Выйти", Message::DialogOpen(Dialog::Logout))].spacing(8)].spacing(12),
             column![
@@ -5020,6 +5177,22 @@ impl App {
         .max_width(700)
         .padding(Padding::ZERO.right(20));
         ui::scroll(page).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
+    }
+
+    /// Сколько скачано и сколько места занимает, с переходом к списку и очисткой.
+    fn view_stored(&self) -> Element<'_, Message> {
+        let count = self.downloads.len();
+        let summary = if count == 0 {
+            "Пока ничего не скачано. Скачать трек, альбом или плейлист можно через меню «…»".to_string()
+        } else {
+            format!("{count} {} · {}", tracks_word(count), offline::size_label(self.downloads.iter().map(|saved| saved.bytes).sum()))
+        };
+        let mut block = column![text("Скачанное").size(20).font(ui::font_medium()).color(ui::TEXT), text(summary).color(ui::MUTED)].spacing(12);
+        if count > 0 {
+            let link = |label, press| shine(button(text(label)).padding([9, 18]).style(ui::secondary).on_press(press), 20.0);
+            block = block.push(row![link("Открыть", Message::Open(Section::Downloads)), link("Удалить всё", Message::DialogOpen(Dialog::ClearDownloads))].spacing(8));
+        }
+        block.into()
     }
 
     /// Эквалайзер как в оригинале: уровень слева, десять полос, пресеты под ними.
@@ -5068,7 +5241,7 @@ impl App {
             })
         };
         let mut page = column![
-            row![text("Коллекция").size(36).font(ui::font_headline()).color(ui::TEXT), Space::new().width(Length::Fill), self.block_title("История", Section::History), self.block_title("Дизлайки", Section::Dislikes)].align_y(Alignment::Center),
+            row![text("Коллекция").size(36).font(ui::font_headline()).color(ui::TEXT), Space::new().width(Length::Fill), self.block_title("Скачанное", Section::Downloads), self.block_title("История", Section::History), self.block_title("Дизлайки", Section::Dislikes)].align_y(Alignment::Center),
             Space::new().height(16),
             likes,
             if self.main_width() >= COLLECTION_COLUMNS { Element::from(row![column_of(0..4), column_of(4..8)].spacing(24)) } else { column_of(0..8).into() },
@@ -5684,8 +5857,9 @@ impl App {
         } else if track.artist_list.is_empty() {
             fit(&track.artists).color(names_color).into()
         } else {
-            artist_links(&track.artist_list, 16.0, ui::font(), names_color).into()
+            artist_links(&track.artist_list, 16.0, ui::font(), names_color)
         };
+        let names = self.download_mark(track, names);
         let play = if track.unavailable { Message::Unavailable } else { play };
         let mut line = row![
             cover,
@@ -6671,6 +6845,51 @@ fn smoke_crossfade(query: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Проверка без окна: скачать трек, найти его в списке, сыграть с диска и удалить.
+fn smoke_download(query: &str) -> Result<(), String> {
+    // «keep:запрос» оставляет трек скачанным, чтобы посмотреть страницу; «clear» убирает всё.
+    if query == "clear" {
+        offline::load().iter().for_each(offline::remove);
+        offline::save(&[]);
+        println!("Скачанное очищено");
+        return Ok(());
+    }
+    let (query, keep) = match query.strip_prefix("keep:") {
+        Some(rest) => (rest, true),
+        None => (query, false),
+    };
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let track = api::search(query, &token)?.into_iter().find(|track| !track.unavailable).ok_or("Ничего не нашлось")?;
+    let started = std::time::Instant::now();
+    let saved = offline::download(&track, Quality::Normal.code(), &token)?;
+    println!("{} — {}: {} за {:.1} с, {}, файл есть: {}", track.artists, track.title, offline::size_label(saved.bytes), started.elapsed().as_secs_f32(), saved.sound().label, saved.path().exists());
+    let mut list = offline::load();
+    list.retain(|old| old.track.id != saved.track.id);
+    list.insert(0, saved.clone());
+    offline::save(&list);
+    println!("В списке после перечитывания: {}", offline::load().iter().any(|item| item.track.id == track.id));
+    println!("Обложка с диска: {}", offline::cover(&track.id).map_or(0, |bytes| bytes.len()));
+    let player = Player::new()?;
+    player.set_volume(0.0);
+    let generation = player.stop();
+    player.play_file(generation, &saved.path(), &saved.codec)?;
+    std::thread::sleep(Duration::from_secs(2));
+    println!("Играет с диска: место {:?}", player.position());
+    player.seek(Duration::from_secs(30))?;
+    std::thread::sleep(Duration::from_millis(500));
+    println!("Перемотка по файлу: {:?}", player.position());
+    player.stop();
+    println!("Файл после остановки на месте: {}", saved.path().exists());
+    if keep {
+        return Ok(());
+    }
+    offline::remove(&saved);
+    list.retain(|old| old.track.id != saved.track.id);
+    offline::save(&list);
+    println!("Удалён: файл {}, обложка {}", !saved.path().exists(), offline::cover(&track.id).is_none());
+    Ok(())
+}
+
 /// Проверка без окна: перемотка на паузе сдвигает место и не снимает паузу.
 fn smoke_pause_seek(query: &str) -> Result<(), String> {
     let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
@@ -6796,7 +7015,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-download" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -6809,6 +7028,7 @@ fn main() -> iced::Result {
             "--smoke-move" => smoke_move(query),
             "--smoke-cover" => smoke_cover(),
             "--smoke-pause-seek" => smoke_pause_seek(query),
+            "--smoke-download" => smoke_download(query),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
@@ -6867,6 +7087,7 @@ fn main() -> iced::Result {
             "full" => Preview::Full,
             "eq-bar" => Preview::EqBar,
             "books" => Preview::Books,
+            "downloads" => Preview::Downloads,
             "kids" => Preview::Kids,
             "wave-restored" => Preview::WaveRestored,
             "filter-focus" => Preview::FilterFocus,

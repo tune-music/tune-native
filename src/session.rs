@@ -24,7 +24,7 @@ pub struct Saved {
     pub position: Duration,
 }
 
-fn track_value(track: &Track) -> Value {
+pub fn track_value(track: &Track) -> Value {
     json!({
         "id": track.id,
         "title": track.title,
@@ -45,7 +45,7 @@ fn track_value(track: &Track) -> Value {
     })
 }
 
-fn track_from(v: &Value) -> Option<Track> {
+pub fn track_from(v: &Value) -> Option<Track> {
     Some(Track {
         id: v["id"].as_str()?.to_string(),
         title: v["title"].as_str()?.to_string(),

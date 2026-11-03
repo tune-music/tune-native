@@ -143,6 +143,27 @@ fn download(info: &FileInfo, path: &Path, progress: Arc<Progress>) -> Result<u64
     Ok(len)
 }
 
+/// Качает файл целиком и расшифровывает: так сохраняются скачанные треки. Блокирует поток.
+pub fn save_file(info: &FileInfo, path: &Path) -> Result<u64, String> {
+    let mut cipher = Cipher::new(info.key.as_deref())?;
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(20))).build().into();
+    let resp = agent.get(&info.url).call().map_err(|e| format!("Не удалось получить файл трека: {e}"))?;
+    let mut body = resp.into_body().into_with_config().limit(1024 * 1024 * 1024).reader();
+    let mut out = File::create(path).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0;
+    loop {
+        let n = body.read(&mut buf).map_err(|e| format!("Загрузка оборвалась: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        cipher.apply(&mut buf[..n]);
+        out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        total += n as u64;
+    }
+    Ok(total)
+}
+
 /// Следующий трек, который уже начал качаться.
 struct Prepared {
     key: String,
@@ -272,6 +293,16 @@ impl Player {
         *self.current.lock().unwrap() = Some(progress.clone());
         let len = download(info, &path, progress.clone())?;
         self.start(generation, &path, progress, len, &info.codec)
+    }
+
+    /// Играет скачанный файл: он уже целиком на диске и после трека не удаляется.
+    pub fn play_file(&self, generation: u64, path: &Path, codec: &str) -> Result<(), String> {
+        let len = std::fs::metadata(path).map_err(|_| "Скачанный файл пропал".to_string())?.len();
+        let progress = Arc::new(Progress::default());
+        progress.written.store(len, Ordering::Release);
+        progress.finished.store(true, Ordering::Release);
+        *self.current.lock().unwrap() = Some(progress.clone());
+        self.start(generation, path, progress, len, codec)
     }
 
     /// Начинает качать следующий трек заранее, чтобы он зазвучал без паузы.
