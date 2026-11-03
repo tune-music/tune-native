@@ -3,7 +3,9 @@
 mod api;
 mod anim;
 mod dpi;
+mod client;
 mod fonts;
+mod pipe;
 mod icons;
 mod glow;
 mod login;
@@ -873,6 +875,10 @@ enum Message {
     HomePlay(usize, usize),
     HomeOpen(HomeItem),
     LikedPages(Result<(Vec<Card>, Vec<Card>, Vec<Card>), String>),
+    /// Ссылку или ярлык открыли, когда программа уже работала.
+    LinkFromOutside(String),
+    /// Скачан клиент Яндекс Музыки, из которого берутся шрифты и значки.
+    ClientInstalled(Result<(), String>),
     /// «Знакомо вам» на странице исполнителя: вкладка (в волне ли) и запуск трека из неё.
     FamiliarTab(bool),
     FamiliarPlay(usize),
@@ -1277,7 +1283,9 @@ impl App {
         if let Some(player) = &app.player {
             player.set_eq(app.eq);
         }
-        (app, Task::batch([task, window_handle(), window::latest().then(|id| id.map_or(Task::none(), window::size)).map(Message::WindowSize)]))
+        // Без клиента Tune шрифты и значки свои; клиент скачивается в фоне к следующему запуску.
+        let client = if fonts::asar().is_none() && app.preview.is_none() { Task::perform(background(client::install), Message::ClientInstalled) } else { Task::none() };
+        (app, Task::batch([task, client, window_handle(), window::latest().then(|id| id.map_or(Task::none(), window::size)).map(Message::WindowSize)]))
     }
 
     fn animating(&self) -> bool {
@@ -1651,6 +1659,13 @@ impl App {
             api::Link::Album(id) => self.open_list(Playlist::album(&id, "")),
             api::Link::Artist(id) => self.handle(Message::ArtistOpen(id)),
             api::Link::Track(id) => Task::perform(background(move || api::tracks_by_ids(&[id], &token)), Message::LinkTrack),
+            api::Link::Page(page) => self.handle(Message::Open(page_section(&page))),
+            api::Link::Search(query) => {
+                let open = self.handle(Message::Open(Section::Search));
+                self.query = query;
+                Task::batch([open, self.search_run()])
+            }
+            api::Link::Tag(tag) => self.handle(Message::HomeOpen(HomeItem::Mix { title: String::new(), tag, cover: None })),
             link => Task::perform(background(move || api::link_playlist(&link, &token)), Message::LinkPlaylist),
         }
     }
@@ -3273,6 +3288,16 @@ impl App {
                 }
                 HomeItem::History { .. } => return self.update(Message::Open(Section::History)),
             },
+            Message::LinkFromOutside(text) => {
+                if let Some(hwnd) = self.hwnd {
+                    show_window(hwnd);
+                }
+                let (Some(link), Some(token)) = (api::parse_link(&text), self.token()) else { return Task::none() };
+                self.player_full = false;
+                return self.link_open(link, token);
+            }
+            Message::ClientInstalled(Ok(())) => return self.notify("Шрифты и значки Яндекса появятся после перезапуска".to_string()),
+            Message::ClientInstalled(Err(e)) => eprintln!("клиент Яндекс Музыки не скачан: {e}"),
             Message::LikedPages(Ok((albums, artists, disliked))) => {
                 self.liked_albums = albums;
                 self.liked_artists = artists;
@@ -6904,6 +6929,35 @@ fn track_title<'a>(track: &'a Track, size: f32, font: iced::Font, color: iced::C
 }
 
 /// Страницы, которые возвращаются на прежнее место. У текста песни, очереди и волны своя прокрутка.
+/// Раздел по пути из адреса страницы оригинала.
+fn page_section(page: &str) -> Section {
+    match page {
+        "search" => Section::Search,
+        "non-music" => Section::Books,
+        "kids" => Section::Kids,
+        "collection" => Section::Collection,
+        "collection/albums" => Section::Albums,
+        "collection/artists" => Section::Artists,
+        "collection/playlists" => Section::Playlists,
+        "collection/dislikes" => Section::Dislikes,
+        // Остальных разделов коллекции здесь пока нет: открывается она сама.
+        page if page.starts_with("collection") => Section::Collection,
+        _ => Section::Home,
+    }
+}
+
+/// Окно выходит вперёд, даже если было свёрнуто.
+fn show_window(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE};
+    let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        SetForegroundWindow(hwnd);
+    }
+}
+
 fn remembers_scroll(section: Section) -> bool {
     !matches!(section, Section::Lyrics | Section::Queue | Section::Wave)
 }
@@ -7216,7 +7270,7 @@ impl PipeMedia for Subscription<Message> {
             Event::Keyboard(keyboard::Event::KeyPressed { key, physical_key, modifiers, .. }) if status == event::Status::Ignored => hotkey(&key, physical_key, modifiers),
             _ => None,
         });
-        Subscription::batch([self, back, Subscription::run(media::events).map(Message::Media)])
+        Subscription::batch([self, back, Subscription::run(media::events).map(Message::Media), Subscription::run(pipe::links).map(Message::LinkFromOutside)])
     }
 }
 
@@ -7872,6 +7926,15 @@ fn main() -> iced::Result {
             }
             return Ok(());
         }
+    }
+    // Программа уже открыта: ссылка или ярлык уходят ей, второе окно не нужно.
+    let forwarded = match args.as_slice() {
+        [_] => pipe::forward(""),
+        [_, link] if api::parse_link(link).is_some() => pipe::forward(link),
+        _ => false,
+    };
+    if forwarded {
+        return Ok(());
     }
     // DirectX 12 занимает меньше всего памяти из графических API. Нет видеокарты — iced сам
     // перейдёт на отрисовку процессором.

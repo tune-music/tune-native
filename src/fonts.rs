@@ -13,8 +13,7 @@ use crate::api;
 const FILES: [&str; 4] = ["YSText-Regular", "YSText-Medium", "YSText-Bold", "YSMusic-HeadlineBold"];
 
 pub fn asar() -> Option<PathBuf> {
-    let root = PathBuf::from(std::env::var_os("APPDATA")?).join("dev.tune.music").join("client");
-    fs::read_dir(root).ok()?.flatten().map(|dir| dir.path().join("app.asar")).find(|path| path.exists())
+    fs::read_dir(crate::client::root()?).ok()?.flatten().map(|dir| dir.path().join("app.asar")).find(|path| path.exists())
 }
 
 /// Читает файл из папки архива asar, не распаковывая остальное.

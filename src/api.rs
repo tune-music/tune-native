@@ -1261,20 +1261,39 @@ pub enum Link {
     Artist(String),
     Playlist(String, String),
     PlaylistUuid(String),
+    /// Страница приложения: путь из адреса оригинала, например `collection/albums`.
+    Page(String),
+    Search(String),
+    /// Микс по тегу или категория книг и подкастов.
+    Tag(String),
 }
 
-/// Разбирает ссылку на music.yandex.*. Всё остальное не ссылка, а обычный поиск.
+/// Разбирает ссылку на music.yandex.*, ссылку протокола `yandexmusic://` и внутреннюю ссылку
+/// оригинала `music-application://desktop/…`. Всё остальное не ссылка, а обычный поиск.
 pub fn parse_link(text: &str) -> Option<Link> {
     let text = text.trim();
-    let rest = text.strip_prefix("https://").or_else(|| text.strip_prefix("http://")).unwrap_or(text);
-    let path = rest.split(['?', '#']).next()?;
+    let address = match text.strip_prefix("yandexmusic://").or_else(|| text.strip_prefix("music-application://desktop")) {
+        Some(path) => path,
+        None => {
+            let rest = text.strip_prefix("https://").or_else(|| text.strip_prefix("http://")).unwrap_or(text);
+            let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+            if !host.starts_with("music.yandex.") {
+                return None;
+            }
+            path
+        }
+    };
+    let (path, query) = address.split_once('?').unwrap_or((address, ""));
+    let path = path.split('#').next()?;
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-    let (host, parts) = parts.split_first()?;
-    if !host.starts_with("music.yandex.") {
-        return None;
-    }
     let number = |id: &str| (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then(|| id.to_string());
-    match parts {
+    let page = |parts: &[&str]| Some(Link::Page(parts.join("/")));
+    match parts.as_slice() {
+        [] | ["home"] => page(&["home"]),
+        ["search", ..] => Some(query_text(query).filter(|q| !q.is_empty()).map_or(Link::Page("search".to_string()), Link::Search)),
+        ["tag", tag, ..] => Some(Link::Tag(tag.to_string())),
+        ["non-music", "category", category, ..] => Some(Link::Tag(format!("{CATEGORY}{category}"))),
+        [first @ ("collection" | "non-music" | "kids" | "chart"), ..] => page(&parts[..parts.len().min(if *first == "collection" { 2 } else { 1 })]),
         ["album", album, ..] => number(album).map(Link::Album),
         ["track", track, ..] => number(track).map(Link::Track),
         ["artist", artist, ..] => number(artist).map(Link::Artist),
@@ -1283,6 +1302,24 @@ pub fn parse_link(text: &str) -> Option<Link> {
         ["playlists", id, ..] => Some(Link::PlaylistUuid(id.strip_prefix("lk.").unwrap_or(id).to_string())),
         _ => None,
     }
+}
+
+/// Значение `text` из строки запроса: `+` — пробел, `%xx` — байт.
+fn query_text(query: &str) -> Option<String> {
+    let value = query.split('&').find_map(|pair| pair.strip_prefix("text="))?;
+    let mut bytes = Vec::with_capacity(value.len());
+    let mut rest = value.bytes();
+    while let Some(byte) = rest.next() {
+        match byte {
+            b'+' => bytes.push(b' '),
+            b'%' => {
+                let hex: String = rest.by_ref().take(2).map(char::from).collect();
+                bytes.push(u8::from_str_radix(&hex, 16).ok()?);
+            }
+            byte => bytes.push(byte),
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Плейлист по ссылке: владелец в ней может быть логином, а приложению нужен номер.
@@ -2290,7 +2327,18 @@ mod tests {
         assert_eq!(link("https://music.yandex.kz/artist/3121/tracks"), Some(Link::Artist("3121".to_string())));
         assert_eq!(link("https://music.yandex.ru/users/music-blog/playlists/2131"), Some(Link::Playlist("music-blog".to_string(), "2131".to_string())));
         assert_eq!(link("https://music.yandex.ru/playlists/lk.ab-cd"), Some(Link::PlaylistUuid("ab-cd".to_string())));
-        for other in ["metallica", "https://example.com/album/1", "https://music.yandex.ru/album/abc", "https://music.yandex.ru/home", ""] {
+        let page = |path: &str| Some(Link::Page(path.to_string()));
+        assert_eq!(link("https://music.yandex.ru/home"), page("home"));
+        assert_eq!(link("https://music.yandex.ru"), page("home"));
+        assert_eq!(link("yandexmusic://album/7"), Some(Link::Album("7".to_string())));
+        assert_eq!(link("music-application://desktop/collection/albums?from=x"), page("collection/albums"));
+        assert_eq!(link("music-application://desktop/collection/playlists/created"), page("collection/playlists"));
+        assert_eq!(link("music.yandex.ru/non-music"), page("non-music"));
+        assert_eq!(link("https://music.yandex.ru/search?text=%D1%80%D0%BE%D0%BA+%26+roll"), Some(Link::Search("рок & roll".to_string())));
+        assert_eq!(link("https://music.yandex.ru/search"), page("search"));
+        assert_eq!(link("https://music.yandex.ru/tag/rock"), Some(Link::Tag("rock".to_string())));
+        assert_eq!(link("https://music.yandex.ru/non-music/category/kids"), Some(Link::Tag(format!("{CATEGORY}kids"))));
+        for other in ["metallica", "https://example.com/album/1", "https://music.yandex.ru/album/abc", "https://music.yandex.ru/settings/x", ""] {
             assert_eq!(link(other), None, "{other}");
         }
     }
