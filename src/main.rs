@@ -5905,8 +5905,33 @@ impl App {
             None if key.starts_with(PLAYLIST_COVER) => container(ui::icon(ui::PLAY, 48.0, ui::c().muted)).center(side).style(ui::tile).into(),
             None => container(Space::new()).width(side).height(side).style(if round { ui::avatar } else { ui::tile }).into(),
         };
+        // Играет то, что на карточке: на обложке кнопка паузы, как в оригинале.
+        let cover: Element<'a, Message> = if self.source_key().as_deref() == Some(key) {
+            let icon = if self.is_playing() { ui::PAUSE } else { ui::PLAY };
+            let toggle = shine(button(container(ui::icon(icon, 22.0, ui::c().on_accent)).center(22)).padding(9).style(ui::round).on_press(Message::Toggle), 24.0);
+            let toggle = hint(toggle, if self.is_playing() { "Пауза" } else { "Воспроизведение" });
+            stack![cover, container(toggle).padding(10).width(side).height(side).align_right(side).align_bottom(side)].into()
+        } else {
+            cover
+        };
         let body = column![cover, fit(title).font(ui::font_medium()).color(ui::c().text).lines(2), fit(subtitle).size(13).color(ui::c().muted)].spacing(6).width(side).clip(true);
         glow(button(body).padding(CARD_PAD).style(ui::card).on_press(press), 12.0)
+    }
+
+    /// Ключ обложки того, что сейчас играет: по нему карточка этого альбома или плейлиста
+    /// отмечена везде, где встречается.
+    fn source_key(&self) -> Option<String> {
+        self.current_track()?;
+        if self.wave_queue {
+            return self.wave_title.as_ref().map(|title| format!("{WAVE_CARD}{title}"));
+        }
+        match &self.queue_from {
+            QueueFrom::List(list) if list.source == Source::Album => Some(format!("{ALBUM_COVER}{}", list.kind)),
+            QueueFrom::List(list) => Some(playlist_cover_key(list)),
+            QueueFrom::Artist(id) => Some(format!("{ARTIST_COVER}{id}")),
+            QueueFrom::Likes => Some(format!("{WAVE_CARD}:likes")),
+            _ => None,
+        }
     }
 
     /// Заголовок карусели: ведёт на всё сразу, если есть куда, и стрелки, если карточки не влезают в ряд.
@@ -6591,7 +6616,7 @@ impl App {
         if let Some(grip) = grip {
             line = line.push(grip);
         }
-        mouse_area(glow(button(line).width(Length::Fill).height(ROW).padding([8, 8]).style(ui::row).on_press(play), 8.0)).on_right_press(Message::MenuOpen(track.clone())).into()
+        mouse_area(glow(button(line).width(Length::Fill).height(ROW).padding([8, 8]).style(if current { ui::row_current } else { ui::row }).on_press(play), 8.0)).on_right_press(Message::MenuOpen(track.clone())).into()
     }
 
     /// Длительность трека, а у начатого выпуска или главы — сколько осталось.

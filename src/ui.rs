@@ -256,6 +256,11 @@ pub fn row(_: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// Строка играющего трека: подсвечена и без наведения.
+pub fn row_current(_: &Theme, status: button::Status) -> button::Style {
+    flat(Some(if status == button::Status::Pressed { c().control_pressed } else { c().control }), c().text, 8.0)
+}
+
 pub fn accent(_: &Theme, status: button::Status) -> button::Style {
     flat(Some(if status == button::Status::Pressed { c().accent_hover } else { c().accent }), c().on_accent, 24.0)
 }
