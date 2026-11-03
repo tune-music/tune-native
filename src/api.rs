@@ -49,6 +49,10 @@ pub struct Track {
     pub remember: bool,
     /// Где остановились в прошлый раз, секунды.
     pub progress: Option<f32>,
+    /// Когда вышел выпуск подкаста: «25 сентября 2026».
+    pub published: Option<String>,
+    /// Выпуск или глава дослушаны или отмечены прослушанными: место тогда сброшено в начало.
+    pub finished: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -328,7 +332,7 @@ fn fetch(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, Strin
 
 fn post(path: &str, content_type: &str, body: String, token: &str) -> Result<Value, String> {
     // Отзывы волны и отчёты о прослушивании ничего из сохранённого не меняют.
-    if !path.starts_with("rotor") && !path.starts_with("plays") && !path.starts_with("availability") && !path.starts_with("streams") {
+    if !path.starts_with("rotor") && !path.starts_with("plays") && !path.starts_with("availability") && !path.starts_with("streams/progress/sync") {
         forget_cache();
     }
     let resp = agent()
@@ -403,6 +407,8 @@ fn parse_track(v: &Value) -> Option<Track> {
         fade: Fade::parse(&v["fade"]).filter(|_| v["type"].as_str() == Some("music")),
         remember: v["rememberPosition"].as_bool() == Some(true),
         progress: v["streamProgress"]["endPositionSec"].as_f64().map(|x| x as f32),
+        published: v["pubDate"].as_str().and_then(release_date),
+        finished: v["streamProgress"]["everFinished"].as_bool() == Some(true),
     })
 }
 
@@ -698,6 +704,98 @@ pub struct Album {
     pub released: Option<String>,
     /// Другие издания того же альбома.
     pub versions: Vec<Card>,
+    pub kind: AlbumKind,
+    /// Описание подкаста или книги простым текстом.
+    pub description: String,
+    /// С ненормативной лексикой: на странице «18+».
+    pub explicit: bool,
+    /// Подкаст или книга прослушаны целиком.
+    pub finished: bool,
+    /// Кнопка издателя, например «Читать в Яндекс Книгах»: подпись и адрес.
+    pub action: Option<(String, String)>,
+}
+
+/// Что за альбом: музыка, подкаст или аудиокнига.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum AlbumKind {
+    #[default]
+    Music,
+    Podcast,
+    Audiobook,
+}
+
+impl AlbumKind {
+    fn parse(v: &Value) -> AlbumKind {
+        match v["type"].as_str() {
+            Some("podcast") => AlbumKind::Podcast,
+            Some("audiobook") => AlbumKind::Audiobook,
+            _ if v["metaType"].as_str() == Some("podcast") => AlbumKind::Podcast,
+            _ => AlbumKind::Music,
+        }
+    }
+}
+
+/// Описание от Яндекса приходит с разметкой: переносы строк остаются, теги и сущности — нет.
+pub fn html_text(html: &str) -> String {
+    let html = html.replace("<br/>", "\n").replace("<br />", "\n").replace("<br>", "\n").replace("</p>", "\n");
+    let mut plain = String::new();
+    let mut inside = false;
+    for c in html.chars() {
+        match c {
+            '<' => inside = true,
+            '>' if inside => inside = false,
+            _ if !inside => plain.push(c),
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    let mut rest = plain.as_str();
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let Some(end) = rest.char_indices().take(10).find(|&(_, c)| c == ';').map(|(at, _)| at) else {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
+        };
+        let name = &rest[1..end];
+        let named = match name {
+            "laquo" => Some('«'),
+            "raquo" => Some('»'),
+            "quot" => Some('"'),
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "nbsp" => Some(' '),
+            "mdash" => Some('—'),
+            "ndash" => Some('–'),
+            "hellip" => Some('…'),
+            "apos" => Some('\''),
+            _ => name.strip_prefix('#').and_then(|code| code.parse::<u32>().ok()).and_then(char::from_u32),
+        };
+        match named {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    // Не больше одной пустой строки подряд.
+    let mut text = String::new();
+    let mut blank = 0;
+    for line in out.lines().map(str::trim) {
+        blank = if line.is_empty() { blank + 1 } else { 0 };
+        if blank < 2 {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    text.trim().to_string()
 }
 
 /// Альбом или исполнитель в сетке обложек.
@@ -756,6 +854,11 @@ fn parse_album(v: &Value) -> Option<Album> {
         labels: v["labels"].as_array().into_iter().flatten().filter_map(|label| label["name"].as_str().or(label.as_str()).map(str::to_string)).collect(),
         released: v["releaseDate"].as_str().and_then(release_date),
         versions: parse_cards(&v["duplicates"], version_card),
+        kind: AlbumKind::parse(v),
+        description: html_text(v["description"].as_str().unwrap_or_default()),
+        explicit: v["contentWarning"].as_str() == Some("explicit"),
+        finished: v["listeningFinished"].as_bool() == Some(true),
+        action: v["actionButton"]["text"].as_str().zip(v["actionButton"]["url"].as_str()).filter(|(_, url)| url.starts_with("https://")).map(|(label, url)| (label.to_string(), url.to_string())),
     })
 }
 
@@ -850,9 +953,15 @@ pub fn releases(id: &str, also: bool, by_year: bool, page: u64, token: &str) -> 
 }
 
 pub fn album(id: &str, token: &str) -> Result<(Album, Vec<Track>), String> {
-    let v = get(&format!("albums/{id}/with-tracks"), &[], token)?;
+    // Как в официальном клиенте: у выпусков и глав приходят место, где остановились, и дата выхода.
+    let v = get(&format!("albums/{id}/with-tracks"), &[("resumeStream", "true"), ("richTracks", "true"), ("withListeningFinished", "true")], token)?;
     let v = result(&v);
-    let disks: Vec<Vec<Track>> = v["volumes"].as_array().into_iter().flatten().map(|disk| disk.as_array().into_iter().flatten().filter_map(parse_track).collect()).collect();
+    let mut disks: Vec<Vec<Track>> = v["volumes"].as_array().into_iter().flatten().map(|disk| disk.as_array().into_iter().flatten().filter_map(parse_track).collect()).collect();
+    // Подкасты приходят от новых выпусков к старым: здесь всегда от первого сезона к последнему.
+    if v["sortOrder"].as_str() == Some("desc") {
+        disks.reverse();
+        disks.iter_mut().for_each(|disk| disk.reverse());
+    }
     let mut album = parse_album(v).ok_or("Яндекс не прислал альбом")?;
     album.volumes = disks.iter().map(Vec::len).filter(|&size| size > 0).collect();
     Ok((album, disks.into_iter().flatten().collect()))
@@ -1244,6 +1353,18 @@ pub fn save_progress(track: &str, position: f32, length: f32, finished: bool, to
     let stamp = now();
     let body = json!({ "lastSyncTimestamp": stamp, "trackStreams": [{ "trackId": track, "positionSec": position, "trackLengthSec": length, "finished": finished, "timestamp": stamp }] });
     post("streams/progress/sync", "application/json", body.to_string(), token).map(|_| ())
+}
+
+/// Отмечает выпуск или главу прослушанными либо снова непрослушанными.
+pub fn mark_finished(track: &str, finished: bool, token: &str) -> Result<(), String> {
+    let path = if finished { "mark-finished" } else { "mark-unfinished" };
+    post(&format!("streams/progress/{path}?trackId={}", encode(track)), "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
+}
+
+/// То же для подкаста или книги целиком.
+pub fn mark_album_finished(album: &str, finished: bool, token: &str) -> Result<(), String> {
+    let path = if finished { "mark-album-finished" } else { "mark-album-unfinished" };
+    post(&format!("streams/progress/{path}?albumId={}", encode(album)), "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
 }
 
 /// Значение для адреса или формы.
@@ -1976,6 +2097,7 @@ mod tests {
         }
         assert!(cache.entries.len() <= CACHE_SIZE);
         assert_eq!(cache.get("k0", now + CACHE_TIME / 2), None);
+        assert_eq!(html_text("Это подкаст &laquo;Время&raquo; &#8212; о деньгах.<br/><br/><br/>Сезон <b>пятый</b>&nbsp;&amp; финал"), "Это подкаст «Время» — о деньгах.\n\nСезон пятый & финал");
         assert!(!cacheable("music-history") && !cacheable("get-file-info") && cacheable("albums/1/with-tracks"));
     }
 

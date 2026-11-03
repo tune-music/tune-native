@@ -39,6 +39,8 @@ fn track_value(track: &Track) -> Value {
         "unavailable": track.unavailable,
         "remember": track.remember,
         "progress": track.progress,
+        "published": track.published,
+        "finished": track.finished,
         "fade": track.fade.map(|fade| json!({ "inStart": fade.in_start, "inStop": fade.in_stop, "outStart": fade.out_start, "outStop": fade.out_stop })),
     })
 }
@@ -60,6 +62,8 @@ fn track_from(v: &Value) -> Option<Track> {
         fade: api::Fade::parse(&v["fade"]),
         remember: v["remember"].as_bool().unwrap_or(false),
         progress: v["progress"].as_f64().map(|x| x as f32),
+        published: v["published"].as_str().map(str::to_string),
+        finished: v["finished"].as_bool().unwrap_or(false),
     })
 }
 
@@ -159,6 +163,8 @@ mod tests {
             fade: Some(api::Fade { in_start: 0.0, in_stop: 1.5, out_start: seconds as f32 - 5.0, out_stop: seconds as f32 }),
             remember: false,
             progress: None,
+            published: None,
+            finished: false,
         }
     }
 

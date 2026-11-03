@@ -31,7 +31,7 @@ use anim::{hover_line, reveal, smooth, Fade};
 use glow::{glow, shine};
 use iced::{event, mouse, time, window, Alignment, Event, Element, Length, Padding, Size, Subscription, Task};
 
-use api::{Album, Artist, Card, Found, Home, HomeBlock, HomeItem, Pin, PinRef, PinTarget, Playlist, Profile, Source, Track, Wave, NEED_LOGIN};
+use api::{Album, AlbumKind, Artist, Card, Found, Home, HomeBlock, HomeItem, Pin, PinRef, PinTarget, Playlist, Profile, Source, Track, Wave, NEED_LOGIN};
 use media::Media;
 use player::Player;
 use raw_window_handle::RawWindowHandle;
@@ -194,6 +194,9 @@ const CARD_SLOT: f32 = CARD + 20.0;
 /// Ширина содержимого, на которой нижний плеер отказывается от лишнего.
 /// Уже этой ширины в строке трека нет места для длительности.
 const TRACK_TIME_WIDTH: f32 = 520.0;
+/// Ширина колонки времени: у музыки «03:25», у выпусков «осталось 1:47:20».
+const TIME_WIDTH: f32 = 72.0;
+const TIME_WIDTH_EPISODE: f32 = 150.0;
 /// От этой ширины коллекция показывает треки в две колонки.
 const COLLECTION_COLUMNS: f32 = 860.0;
 const PAGE_COVER_SMALL: f32 = 120.0;
@@ -559,6 +562,12 @@ struct App {
     playlist_tracks: Vec<Track>,
     /// Шапка открытого альбома.
     album: Option<Album>,
+    /// Все выпуски подкаста по порядку сервера; на странице — выбранный сезон в выбранном порядке.
+    episodes: Vec<Track>,
+    /// Выпуски сначала старые; по умолчанию сначала новые.
+    episodes_old_first: bool,
+    /// Выбранный сезон подкаста, с нуля; `None` — все сезоны.
+    season: Option<usize>,
     artist: Option<Artist>,
     /// Какого исполнителя сейчас загружаем.
     artist_loading: Option<String>,
@@ -743,6 +752,13 @@ enum Message {
     HomeOpen(HomeItem),
     LikedPages(Result<(Vec<Card>, Vec<Card>), String>),
     AlbumLike,
+    /// Порядок выпусков (сначала старые) и выбор сезона на странице подкаста.
+    EpisodesOrder(bool),
+    SeasonPick(Option<usize>),
+    /// Отметка «прослушано» у выпуска или главы и у подкаста или книги целиком.
+    EpisodeFinished(Track, bool),
+    AlbumFinished(bool),
+    Marked(Result<(), String>),
     ArtistLike,
     PageLikeSaved(Result<(), String>),
     LikesMore,
@@ -983,6 +999,9 @@ impl App {
             playlist: None,
             playlist_tracks: Vec::new(),
             album: None,
+            episodes: Vec::new(),
+            episodes_old_first: false,
+            season: None,
             artist: None,
             artist_loading: None,
             preloaded: None,
@@ -1533,7 +1552,12 @@ impl App {
             Section::Playlists => {
                 let Some(list) = &self.playlist else { return Vec::new() };
                 if list.source == Source::Album {
-                    return link_and_pin(PinRef::Album(list.kind.clone()), format!("https://music.yandex.ru/album/{}", list.kind));
+                    let mut items = link_and_pin(PinRef::Album(list.kind.clone()), format!("https://music.yandex.ru/album/{}", list.kind));
+                    if let Some(album) = self.album.as_ref().filter(|album| album.kind != AlbumKind::Music) {
+                        let label = if album.finished { "Отметить непрослушанным" } else { "Отметить прослушанным" };
+                        items.push((ui::CHECK, label.to_string(), Message::AlbumFinished(!album.finished), false));
+                    }
+                    return items;
                 }
                 let mut items = link_and_pin(PinRef::Playlist(list.owner.clone(), list.kind.clone()), format!("https://music.yandex.ru/users/{}/playlists/{}", list.owner, list.kind));
                 if self.is_own(list) {
@@ -2796,6 +2820,33 @@ impl App {
             }
             // Коллекция покажется без этих блоков; музыке это не мешает.
             Message::LikedPages(Err(_)) => {}
+            Message::EpisodesOrder(old_first) => {
+                self.episodes_old_first = old_first;
+                self.playlist_tracks = self.episodes_arranged();
+            }
+            Message::SeasonPick(season) => {
+                self.season = season;
+                self.playlist_tracks = self.episodes_arranged();
+            }
+            Message::EpisodeFinished(track, finished) => {
+                self.menu = None;
+                let Some(token) = self.token() else { return Task::none() };
+                self.progress.insert(track.id.clone(), if finished { track.duration.as_secs_f32() } else { 0.0 });
+                let id = track.id.clone();
+                return Task::perform(background(move || api::mark_finished(&id, finished, &token)), Message::Marked);
+            }
+            Message::AlbumFinished(finished) => {
+                let (Some(token), Some(album)) = (self.token(), self.album.as_mut()) else { return Task::none() };
+                album.finished = finished;
+                let id = album.id.clone();
+                let all = if self.episodes.is_empty() { &self.playlist_tracks } else { &self.episodes };
+                for track in all.iter().filter(|track| track.remember) {
+                    self.progress.insert(track.id.clone(), if finished { track.duration.as_secs_f32() } else { 0.0 });
+                }
+                return Task::perform(background(move || api::mark_album_finished(&id, finished, &token)), Message::Marked);
+            }
+            Message::Marked(Ok(())) => {}
+            Message::Marked(Err(e)) => return self.fail(e),
             Message::AlbumLike => {
                 let (Some(uid), Some(token), Some(album)) = (self.uid.clone(), self.token(), self.album.clone()) else { return Task::none() };
                 let liked = !self.liked_albums.iter().any(|c| c.id == album.id);
@@ -2882,7 +2933,17 @@ impl App {
                         }
                         _ => Task::none(),
                     };
+                    let podcast = album.kind == AlbumKind::Podcast;
                     self.album = Some(album);
+                    self.episodes_old_first = false;
+                    self.season = None;
+                    let tracks = if podcast {
+                        self.episodes = tracks;
+                        self.episodes_arranged()
+                    } else {
+                        self.episodes.clear();
+                        tracks
+                    };
                     let cover = self.fetch_cover_jobs(cover, "300x300");
                     return Task::batch([cover, others, self.handle(Message::PlaylistLoaded(kind, Ok(tracks)))]);
                 }
@@ -4453,6 +4514,11 @@ impl App {
             items = items.push(item(ui::LYRICS, "Текст песни", Message::MenuLyrics));
             count += 1.0;
         }
+        if track.remember {
+            let finished = self.listened(track);
+            items = items.push(item(ui::CHECK, if finished { "Отметить непрослушанным" } else { "Отметить прослушанным" }, Message::EpisodeFinished(track.clone(), !finished)));
+            count += 1.0;
+        }
         items = items.push(item(ui::LINK, "Скопировать ссылку", Message::CopyLink(track.clone())));
         items = items.push(item(ui::INFO, "Сведения о треке", Message::DialogOpen(Dialog::TrackInfo(track.clone()))));
         count += 2.0;
@@ -4550,7 +4616,9 @@ impl App {
             (false, true) => (ui::MUTED, FAINT),
             (false, false) => (ui::WHITE, ui::MUTED),
         };
-        let names: Element<'a, Message> = if track.artist_list.is_empty() {
+        let names: Element<'a, Message> = if let Some(published) = track.published.as_ref().filter(|_| track.remember) {
+            text(published).color(names_color).wrapping(Wrapping::None).into()
+        } else if track.artist_list.is_empty() {
             text(&track.artists).color(names_color).wrapping(Wrapping::None).into()
         } else {
             artist_links(&track.artist_list, 16.0, ui::font(), names_color).into()
@@ -5309,6 +5377,9 @@ impl App {
         let Some(album) = &self.album else {
             return self.skeleton_page(false);
         };
+        if album.kind != AlbumKind::Music {
+            return self.view_book(playlist, album);
+        }
         let count = self.playlist_tracks.len();
         let mut about: Vec<String> = album.year.map(|year| year.to_string()).into_iter().collect();
         about.push(format!("{count} {}", tracks_word(count)));
@@ -5323,6 +5394,55 @@ impl App {
         let actions = actions.push(self.page_like(liked, Message::AlbumLike)).push(self.page_more());
         let links = artist_links(&album.artists, 16.0, ui::font(), ui::MUTED);
         let header = self.page_header("Альбом", playlist.title.clone(), format!("{ALBUM_COVER}{}", album.id), false, Some(links), about.join(" · "), actions);
+        self.view_list(Section::Playlists, Some(header))
+    }
+
+    /// Подкаст или аудиокнига: «Продолжить» с начатого выпуска, сезоны и порядок выпусков.
+    fn view_book<'a>(&'a self, playlist: &'a Playlist, album: &'a Album) -> Element<'a, Message> {
+        let podcast = album.kind == AlbumKind::Podcast;
+        let count = if podcast { self.episodes.len() } else { self.playlist_tracks.len() };
+        let mut about: Vec<String> = album.year.map(|year| year.to_string()).into_iter().collect();
+        about.push(format!("{count} {}", if podcast { plural(count, ["выпуск", "выпуска", "выпусков"]) } else { plural(count, ["глава", "главы", "глав"]) }));
+        if podcast && album.volumes.len() > 1 {
+            about.push(format!("{} {}", album.volumes.len(), plural(album.volumes.len(), ["сезон", "сезона", "сезонов"])));
+        }
+        if album.explicit {
+            about.push("18+".to_string());
+        }
+        if album.finished {
+            about.push("прослушано".to_string());
+        }
+        let (label, start) = match self.resume_index() {
+            Some(index) => ("Продолжить", index),
+            None => ("Слушать", 0),
+        };
+        let play = shine(button(row![ui::icon(ui::PLAY, 22.0, ui::ON_ACCENT), text(label).font(ui::font_medium()).color(ui::ON_ACCENT)].spacing(6).align_y(Alignment::Center))
+            .padding([8, 18])
+            .style(ui::accent)
+            .on_press_maybe((!self.playlist_tracks.is_empty()).then_some(Message::Play(Section::Playlists, start))), 24.0);
+        let mut actions = row![play].spacing(8).align_y(Alignment::Center);
+        if let Some((label, url)) = &album.action {
+            actions = actions.push(shine(button(text(label).color(ui::TEXT)).padding([8, 18]).style(ui::secondary).on_press(Message::OpenUrl(url.clone())), 24.0));
+        }
+        let liked = self.liked_albums.iter().any(|c| c.id == album.id);
+        let actions = actions.push(self.page_like(liked, Message::AlbumLike)).push(self.page_more());
+        let links = artist_links(&album.artists, 16.0, ui::font(), ui::MUTED);
+        let kicker = if podcast { "Подкаст" } else { "Аудиокнига" };
+        let header = self.page_header(kicker, playlist.title.clone(), format!("{ALBUM_COVER}{}", album.id), false, Some(links), about.join(" · "), actions);
+        if !podcast || self.episodes.len() < 2 || self.filtering() {
+            return self.view_list(Section::Playlists, Some(header));
+        }
+        let chip = |label, old_first: bool| {
+            let chosen = old_first == self.episodes_old_first;
+            shine(button(text(label)).padding([7, 16]).style(if chosen { ui::accent } else { ui::secondary }).on_press(Message::EpisodesOrder(old_first)), 20.0)
+        };
+        let mut tools = row![chip("Сначала новые", false), chip("Сначала старые", true)].spacing(8).align_y(Alignment::Center);
+        if album.volumes.len() > 1 {
+            let seasons: Vec<Season> = std::iter::once(Season(None)).chain((0..album.volumes.len()).map(|season| Season(Some(season)))).collect();
+            let select = pick_list(seasons, Some(Season(self.season)), |season: Season| Message::SeasonPick(season.0)).padding([7, 14]).text_size(14).style(ui::select_faded(1.0)).menu_style(ui::select_menu);
+            tools = tools.push(select);
+        }
+        let header = column![header, container(tools).padding(Padding::new(8.0).top(4).bottom(12))].into();
         self.view_list(Section::Playlists, Some(header))
     }
 
@@ -5433,7 +5553,8 @@ impl App {
             // Альбом с дисками короткий: строки идут целиком, с заголовком перед каждым диском.
             for (index, track) in tracks.iter().enumerate() {
                 if let Some((disk, 1)) = self.album_place(section, index) {
-                    list = list.push(container(text(format!("Диск {disk}")).size(18).font(ui::font_medium()).color(ui::TEXT)).padding(Padding::new(8.0).top(if disk > 1 { 20.0 } else { 8.0 })));
+                    let part = if self.album.as_ref().is_some_and(|album| album.kind == AlbumKind::Audiobook) { "Часть" } else { "Диск" };
+                    list = list.push(container(text(format!("{part} {disk}")).size(18).font(ui::font_medium()).color(ui::TEXT)).padding(Padding::new(8.0).top(if disk > 1 { 20.0 } else { 8.0 })));
                 }
                 list = list.push(self.view_track(section, index, track));
             }
@@ -5452,11 +5573,18 @@ impl App {
             if let Some(released) = &album.released {
                 facts = facts.push(text(format!("Дата выхода: {released}")).size(13).color(ui::MUTED));
             }
+            let music = album.kind == AlbumKind::Music;
             if !album.labels.is_empty() {
-                facts = facts.push(text(format!("Лейбл: {}", album.labels.join(", "))).size(13).color(ui::MUTED));
+                facts = facts.push(text(format!("{}: {}", if music { "Лейбл" } else { "Издатель" }, album.labels.join(", "))).size(13).color(ui::MUTED));
+            }
+            if !music && !album.description.is_empty() {
+                let title = if album.kind == AlbumKind::Podcast { "О подкасте" } else { "О книге" };
+                list = list.push(Space::new().height(24)).push(text(title).size(24).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None)).push(Space::new().height(8));
+                list = list.push(container(text(&album.description).size(15).line_height(1.5).color(ui::TEXT)).max_width(760).padding([0, 8]));
             }
             list = list.push(container(facts).padding(Padding::new(8.0).top(16)));
-            for (title, cards) in [("Другие версии", &album.versions), ("Другие альбомы исполнителя", &self.album_others)] {
+            let others = if music { "Другие альбомы исполнителя" } else { "Ещё у автора" };
+            for (title, cards) in [("Другие версии", &album.versions), (others, &self.album_others)] {
                 if !cards.is_empty() {
                     list = list.push(Space::new().height(24)).push(text(title).size(24).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None)).push(Space::new().height(8)).push(self.view_cards(cards, ALBUM_COVER, false, open_album));
                 }
@@ -5485,7 +5613,7 @@ impl App {
 
     /// Открыт альбом без поиска внутри: у трека есть диск и номер на диске, с единицы.
     fn album_place(&self, section: Section, index: usize) -> Option<(usize, usize)> {
-        let album = self.album.as_ref().filter(|_| section == Section::Playlists && !self.filtering())?;
+        let album = self.album.as_ref().filter(|album| section == Section::Playlists && !self.filtering() && album.kind != AlbumKind::Podcast)?;
         let mut left = index;
         for (disk, &size) in album.volumes.iter().enumerate() {
             if left < size {
@@ -5513,7 +5641,9 @@ impl App {
             self.cover(track, COVER)
         };
         let (title_color, names_color) = if track.unavailable { (ui::MUTED, FAINT) } else { (ui::WHITE, ui::MUTED) };
-        let names: Element<'a, Message> = if track.artist_list.is_empty() {
+        let names: Element<'a, Message> = if let Some(published) = track.published.as_ref().filter(|_| track.remember) {
+            text(published).color(names_color).wrapping(Wrapping::None).into()
+        } else if track.artist_list.is_empty() {
             text(&track.artists).color(names_color).wrapping(Wrapping::None).into()
         } else {
             artist_links(&track.artist_list, 16.0, ui::font(), names_color).into()
@@ -5529,7 +5659,9 @@ impl App {
         // У недоступных треков Яндекс длительности не присылает: вместо «00:00» пустое место той же ширины.
         if self.main_width() >= TRACK_TIME_WIDTH {
             let time_color = if track.duration.is_zero() { iced::Color::TRANSPARENT } else { names_color };
-            line = line.push(text(self.track_time(track)).color(time_color));
+            // Колонка одной ширины: сердечки в строках стоят ровно.
+            let width = if track.remember && self.wide_times() { TIME_WIDTH_EPISODE } else { TIME_WIDTH };
+            line = line.push(container(text(self.track_time(track)).color(time_color)).width(width).align_x(Alignment::End));
         }
         let mut line = line.push(self.more_button(track, 18.0));
         if let Some(grip) = grip {
@@ -5541,12 +5673,58 @@ impl App {
     /// Длительность трека, а у начатого выпуска или главы — сколько осталось.
     fn track_time(&self, track: &Track) -> String {
         let end = track.duration.as_secs_f32();
-        let place = if track.remember { self.progress.get(&track.id).copied().or(track.progress) } else { None };
-        match place {
-            Some(place) if place >= end - PROGRESS_TAIL && end > 0.0 => "прослушано".to_string(),
+        match self.place(track) {
+            _ if self.listened(track) => "прослушано".to_string(),
             Some(place) if place > PROGRESS_MIN => format!("осталось {}", clock(Duration::from_secs_f32(end - place))),
             _ => clock(track.duration),
         }
+    }
+
+    /// В списке есть «осталось …» или «прослушано»: колонке времени нужна большая ширина.
+    fn wide_times(&self) -> bool {
+        self.list(self.section).iter().any(|track| self.listened(track) || self.place(track).is_some_and(|place| place > PROGRESS_MIN))
+    }
+
+    /// Где остановились в выпуске или главе: свежее место этого запуска или ответ сервера.
+    fn place(&self, track: &Track) -> Option<f32> {
+        if track.remember { self.progress.get(&track.id).copied().or(track.progress) } else { None }
+    }
+
+    /// Дослушан ли выпуск. Свежая отметка этого запуска главнее ответа сервера; там дослушанный
+    /// помечен `everFinished`, пока его не начали заново.
+    fn listened(&self, track: &Track) -> bool {
+        let end = track.duration.as_secs_f32();
+        let near_end = |place: f32| end > 0.0 && place >= end - PROGRESS_TAIL;
+        match self.progress.get(&track.id) {
+            Some(&place) => track.remember && near_end(place),
+            None => track.remember && (near_end(track.progress.unwrap_or(0.0)) || (track.finished && track.progress.unwrap_or(0.0) <= PROGRESS_MIN)),
+        }
+    }
+
+    /// Начатый и не дослушанный выпуск или глава на странице: с него «Продолжить».
+    fn resume_index(&self) -> Option<usize> {
+        self.playlist_tracks.iter().position(|track| !self.listened(track) && self.place(track).is_some_and(|place| place > PROGRESS_MIN))
+    }
+
+    /// Выпуски подкаста для страницы: выбранный сезон, сначала новые или старые.
+    fn episodes_arranged(&self) -> Vec<Track> {
+        let sizes = self.album.as_ref().map_or(&[][..], |album| album.volumes.as_slice());
+        let mut start = 0;
+        let mut chosen: Vec<Track> = Vec::new();
+        for (season, &size) in sizes.iter().enumerate() {
+            let end = (start + size).min(self.episodes.len());
+            if self.season.is_none_or(|wanted| wanted == season) {
+                chosen.extend_from_slice(&self.episodes[start.min(end)..end]);
+            }
+            start = end;
+        }
+        if sizes.is_empty() {
+            chosen = self.episodes.clone();
+        }
+        if !self.episodes_old_first {
+            chosen.reverse();
+        }
+        chosen
     }
 
     fn like_button<'a>(&self, track: &Track, size: f32) -> Element<'a, Message> {
@@ -6124,6 +6302,19 @@ fn eq_place((x, y): (f32, f32)) -> (f32, f32) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Preset(usize);
 
+/// Сезон подкаста в списке выбора; `None` — все сезоны.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Season(Option<usize>);
+
+impl std::fmt::Display for Season {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(season) => write!(f, "Сезон {}", season + 1),
+            None => f.write_str("Все сезоны"),
+        }
+    }
+}
+
 impl std::fmt::Display for Preset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(equalizer::PRESETS[self.0].0)
@@ -6163,9 +6354,23 @@ fn load_account(token: String) -> Task<Message> {
     )
 }
 
+/// «03:25», а у выпусков и глав длиннее часа — «1:47:20».
 fn clock(d: Duration) -> String {
     let s = d.as_secs();
+    if s >= 3600 {
+        return format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60);
+    }
     format!("{:02}:{:02}", s / 60, s % 60)
+}
+
+/// Слово в нужном числе: один выпуск, два выпуска, пять выпусков.
+fn plural(n: usize, forms: [&'static str; 3]) -> &'static str {
+    match (n % 10, n % 100) {
+        (_, 11..=14) => forms[2],
+        (1, _) => forms[0],
+        (2..=4, _) => forms[1],
+        _ => forms[2],
+    }
 }
 
 fn tracks_word(n: usize) -> &'static str {
@@ -6630,6 +6835,18 @@ mod lyrics_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_times_show_hours() {
+        assert_eq!(clock(Duration::from_secs(205)), "03:25");
+        assert_eq!(clock(Duration::from_secs(6440)), "1:47:20");
+    }
+
+    #[test]
+    fn words_agree_with_numbers() {
+        let forms = ["выпуск", "выпуска", "выпусков"];
+        assert_eq!([1, 2, 5, 11, 21, 22, 112].map(|n| plural(n, forms)), ["выпуск", "выпуска", "выпусков", "выпусков", "выпуск", "выпуска", "выпусков"]);
+    }
 
     #[test]
     fn drop_lands_where_the_line_is() {
