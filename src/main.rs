@@ -70,6 +70,8 @@ const COVER_FADE: f32 = 0.25;
 const MENU_WIDTH: f32 = 270.0;
 const MENU_ITEM: f32 = 40.0;
 const NOTICE_TIME: Duration = Duration::from_secs(4);
+/// Сколько держится уведомление об удалении с кнопкой отмены.
+const UNDO_TIME: Duration = Duration::from_secs(5);
 
 /// Где курсор и какого размера окно. Меняются постоянно, поэтому не идут через сообщения:
 /// иначе интерфейс перестраивался бы от каждого движения мыши.
@@ -135,8 +137,6 @@ const HISTORY_LIMIT: usize = 200;
 const MENU_LISTS: usize = 8;
 /// Плейлист «Мне нравится»: его нельзя ни менять, ни удалять как обычный.
 const FAVORITES_KIND: &str = "3";
-/// Плейлист загруженных файлов создаёт сам Яндекс: его нельзя переименовать или удалить.
-const UPLOADS_TITLE: &str = "Загруженное";
 /// Сколько исполнителей проверить, когда страницу ищем по имени.
 const ARTIST_SEARCH: u32 = 5;
 /// Длительность появления страницы и выезда очереди, в секундах.
@@ -317,6 +317,14 @@ enum DragList {
 /// Идёт перетаскивание: подписка ловит отпускание кнопки где угодно в окне.
 static DRAGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Удаление, которое ещё можно отменить: в окне элемента уже нет, на сервер оно уйдёт
+/// по истечении уведомления. Место нужно, чтобы вернуть элемент туда же.
+#[derive(Clone, Debug)]
+enum Pending {
+    Playlist(Playlist, usize),
+    Track(Playlist, Track, usize),
+}
+
 /// Окно поверх страницы.
 /// Откуда взята очередь: подпись на её странице и переход обратно.
 #[derive(Clone, Debug, Default)]
@@ -338,6 +346,8 @@ enum Dialog {
     Rename(Playlist),
     Describe(Playlist),
     Delete(Playlist),
+    /// Убрать трек из своего плейлиста.
+    RemoveTrack(Track),
     WaveTune,
     TrackInfo(Track),
     Logout,
@@ -428,6 +438,7 @@ enum Preview {
     /// Восстановленная очередь и плеер на всё окно.
     Full,
     EqBar,
+    PageMenu,
     Books,
     /// Восстановленная очередь на странице волны, без звука.
     WaveRestored,
@@ -474,6 +485,11 @@ struct App {
     home_page: Section,
     /// Последняя открытая вкладка главной и книг с подкастами.
     landing_tabs: [usize; 2],
+    /// Меню «…» страницы плейлиста, альбома или исполнителя открыто в этой точке.
+    page_menu: Option<(f32, f32)>,
+    page_menu_fade: Fade<(f32, f32)>,
+    /// Удаление, которое пока можно отменить, и номер его уведомления.
+    pending: Option<(u64, Pending)>,
     /// Окно приложения: к нему привязываются системные окна.
     hwnd: Option<isize>,
     /// Перетаскивание: список, откуда взят трек, и над какой строкой он сейчас (ниже ли середины).
@@ -520,7 +536,7 @@ struct App {
     liked_lists: Vec<Playlist>,
     /// Описание и приватность открытого плейлиста.
     list_meta: Option<(String, String, String)>,
-    notice: Option<(u64, String)>,
+    notice: Option<(u64, String, bool)>,
     liked: Vec<Track>,
     likes_loading: bool,
     pins: Vec<Pin>,
@@ -642,7 +658,7 @@ struct App {
     cover_tints: HashMap<String, iced::Color>,
     /// Цвет фона плеера на всё окно сейчас: догоняет цвет обложки играющего трека.
     full_tint: iced::Color,
-    notice_fade: Fade<String>,
+    notice_fade: Fade<(String, bool)>,
     /// От чего запущена волна; пусто у обычной Моей волны.
     wave_title: Option<String>,
     /// Выбранные настройки волны и зёрна, к которым они добавляются.
@@ -828,6 +844,12 @@ enum Message {
     /// Своя обложка плейлиста: выбрать картинку и загрузить; ответ — адрес новой обложки,
     /// `None` в нём — окно выбора закрыли.
     CoverPick(Playlist),
+    /// Меню «…» страницы: открыть и выбрать пункт (меню закрывается, пункт выполняется).
+    PageMenuOpen,
+    PageMenuPick(Box<Message>),
+    /// Отменить удаление; время на отмену вышло.
+    Undo,
+    UndoExpire(u64),
     CoverUploaded(Playlist, Result<Option<Option<String>>, String>),
     DragStart(DragList, usize),
     DragOver(usize, f32),
@@ -911,6 +933,9 @@ impl App {
             progress_at: None,
             drag: None,
             hwnd: None,
+            page_menu: None,
+            page_menu_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
+            pending: None,
             home_pages: HashMap::new(),
             home_block_tabs: HashMap::new(),
             found: Found::default(),
@@ -1058,7 +1083,7 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        self.pin_fade.busy() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.eq_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy()
+        self.pin_fade.busy() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.eq_fade.busy() || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy()
     }
 
     /// Сколько места занимает основная часть окна.
@@ -1295,6 +1320,8 @@ impl App {
         self.unshuffled = None;
         self.quality_menu = None;
         self.eq_menu = None;
+        self.page_menu = None;
+        self.pending = None;
         self.sound = None;
         self.uid = None;
         self.wave = None;
@@ -1464,6 +1491,85 @@ impl App {
         let Some(listen) = self.listen.take().filter(|listen| listen.started.is_some()) else { return };
         let position = if reason == "finish" { listen.length } else { self.player.as_ref().map_or(self.position, |p| p.position()).as_secs_f32() };
         self.send_plays(vec![listen.report(position, Some(reason), false)]);
+    }
+
+    /// Удаление с отменой: уведомление с кнопкой «Отменить», по истечении — запрос на сервер.
+    /// Прошлое отложенное удаление при этом выполняется сразу.
+    fn pending_start(&mut self, pending: Pending, text: String) -> Task<Message> {
+        let earlier = self.pending_commit();
+        let id = self.notice.as_ref().map_or(1, |(id, _, _)| id + 1);
+        self.notice = Some((id, text, true));
+        self.pending = Some((id, pending));
+        let expire = Task::perform(background(|| std::thread::sleep(UNDO_TIME)), move |()| Message::UndoExpire(id));
+        Task::batch([earlier, expire])
+    }
+
+    /// Отправляет отложенное удаление на сервер.
+    fn pending_commit(&mut self) -> Task<Message> {
+        let (Some((_, pending)), Some(uid), Some(token)) = (self.pending.take(), self.uid.clone(), self.token()) else { return Task::none() };
+        match pending {
+            Pending::Playlist(list, _) => {
+                let kind = list.kind;
+                let wanted = kind.clone();
+                Task::perform(background(move || api::delete_playlist(&uid, &kind, &token)), move |r| Message::PlaylistDeleted(wanted.clone(), r))
+            }
+            Pending::Track(list, track, _) => Task::perform(background(move || api::remove_from_playlist(&uid, &list.kind, &track, &token)), Message::TrackRemoved),
+        }
+    }
+
+    /// Пункты меню «…» открытой страницы: значок, подпись, что сделать и опасный ли пункт.
+    fn page_menu_items(&self) -> Vec<(&'static str, String, Message, bool)> {
+        let link_and_pin = |target: PinRef, link: String| {
+            let pinned = self.pins.iter().any(|pin| target.matches(pin));
+            vec![(ui::PIN, if pinned { "Открепить" } else { "Закрепить" }.to_string(), Message::Pin(target), false), (ui::LINK, "Скопировать ссылку".to_string(), Message::CopyText(link), false)]
+        };
+        match self.section {
+            Section::Artist => self.artist.as_ref().map_or_else(Vec::new, |artist| link_and_pin(PinRef::Artist(artist.id.clone()), format!("https://music.yandex.ru/artist/{}", artist.id))),
+            Section::Playlists => {
+                let Some(list) = &self.playlist else { return Vec::new() };
+                if list.source == Source::Album {
+                    return link_and_pin(PinRef::Album(list.kind.clone()), format!("https://music.yandex.ru/album/{}", list.kind));
+                }
+                let mut items = link_and_pin(PinRef::Playlist(list.owner.clone(), list.kind.clone()), format!("https://music.yandex.ru/users/{}/playlists/{}", list.owner, list.kind));
+                if self.is_own(list) {
+                    items.push((ui::EDIT, "Переименовать".to_string(), Message::DialogOpen(Dialog::Rename(list.clone())), false));
+                    items.push((ui::NOTES, "Изменить описание".to_string(), Message::DialogOpen(Dialog::Describe(list.clone())), false));
+                    items.push((ui::IMAGE, if list.cover.is_some() { "Изменить обложку" } else { "Добавить обложку" }.to_string(), Message::CoverPick(list.clone()), false));
+                    if let Some(meta) = &self.list_meta {
+                        let private = meta.2 == "private";
+                        items.push((if private { ui::GLOBE } else { ui::LOCK }, if private { "Сделать публичным" } else { "Сделать приватным" }.to_string(), Message::Visibility(list.clone()), false));
+                    }
+                    items.push((ui::DELETE, "Удалить плейлист".to_string(), Message::DialogOpen(Dialog::Delete(list.clone())), true));
+                }
+                items
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Кнопка «…» в шапке страницы.
+    fn page_more<'a>(&self) -> Element<'a, Message> {
+        shine(button(container(ui::icon(ui::MORE, 22.0, ui::TEXT)).center(22)).padding(9).style(ui::secondary).on_press(Message::PageMenuOpen), 24.0).into()
+    }
+
+    fn view_page_menu(&self, x: f32, y: f32) -> Element<'_, Message> {
+        let (alpha, live) = (self.page_menu_fade.shown(), self.page_menu_fade.live);
+        let items = self.page_menu_items();
+        let count = items.len();
+        let list = items.into_iter().fold(column![], |list, (icon, label, message, danger)| {
+            let tint = if danger { ui::DANGER } else { ui::TEXT };
+            let mark = if danger { ui::DANGER } else { ui::MUTED };
+            list.push(glow(
+                button(row![ui::icon(icon, 20.0, mark.scale_alpha(alpha)), text(label).color(tint.scale_alpha(alpha))].spacing(12).align_y(Alignment::Center))
+                    .width(Length::Fill)
+                    .height(MENU_ITEM)
+                    .padding([9, 10])
+                    .style(ui::menu_item)
+                    .on_press(Message::PageMenuPick(Box::new(message))),
+                6.0,
+            ))
+        });
+        popup(list.into(), x, y, MENU_WIDTH, count as f32 * MENU_ITEM, alpha, live)
     }
 
     /// Переставляет трек: в очереди только в окне, в своём плейлисте ещё и на сервере.
@@ -1864,8 +1970,8 @@ impl App {
 
     /// Показывает уведомление и убирает его через несколько секунд.
     fn notify(&mut self, text: String) -> Task<Message> {
-        let id = self.notice.as_ref().map_or(1, |(id, _)| id + 1);
-        self.notice = Some((id, text));
+        let id = self.notice.as_ref().map_or(1, |(id, _, _)| id + 1);
+        self.notice = Some((id, text, false));
         Task::perform(
             background(|| std::thread::sleep(NOTICE_TIME)),
             move |()| Message::NoticeClear(id),
@@ -1951,6 +2057,13 @@ impl App {
             }
         }
         if let Message::Quit = message {
+            // Удаление, которое ещё можно было отменить, при выходе всё же выполняется.
+            if let (Some((_, pending)), Some(uid), Some(token)) = (self.pending.take(), self.uid.clone(), self.token()) {
+                let _ = match pending {
+                    Pending::Playlist(list, _) => api::delete_playlist(&uid, &list.kind, &token),
+                    Pending::Track(list, track, _) => api::remove_from_playlist(&uid, &list.kind, &track, &token),
+                };
+            }
             self.session_store(true);
             return iced::exit();
         }
@@ -1972,6 +2085,7 @@ impl App {
             self.pin_fade.step(elapsed);
             self.quality_fade.step(elapsed);
             self.eq_fade.step(elapsed);
+            self.page_menu_fade.step(elapsed);
             self.dialog_fade.step(elapsed);
             self.full_fade.step(elapsed);
             if self.full_fade.item.is_some() {
@@ -2089,7 +2203,8 @@ impl App {
         self.pin_fade.sync(self.pin_menu);
         self.dialog_fade.sync(self.dialog.clone());
         self.full_fade.sync(self.player_full.then_some(()));
-        self.notice_fade.sync(self.notice.as_ref().map(|(_, text)| text.clone()));
+        self.notice_fade.sync(self.notice.as_ref().map(|(_, text, undo)| (text.clone(), *undo)));
+        self.page_menu_fade.sync(self.page_menu);
         let track = self.current_track().map(|track| track.id.clone());
         if track != self.shown_track {
             if self.player_full && self.shown_track.is_some() {
@@ -2187,7 +2302,7 @@ impl App {
                     Some(Preview::WaveSeeded) => self.wave_load(vec!["artist:3121".to_string()], Some(wave_label("artist:3121", "Metallica")), false),
                     Some(Preview::Likes | Preview::LikesEnd | Preview::Menu | Preview::Panels | Preview::TrackInfo | Preview::QueueJump) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
-                    Some(Preview::Playlists | Preview::Playlist | Preview::PlaylistHome) => self.update(Message::Open(Section::Playlists)),
+                    Some(Preview::Playlists | Preview::Playlist | Preview::PlaylistHome | Preview::PageMenu) => self.update(Message::Open(Section::Playlists)),
                     Some(Preview::Dislikes) => {
                         self.preview = None;
                         self.update(Message::Open(Section::Dislikes))
@@ -3053,6 +3168,10 @@ impl App {
                         if matches!(self.preview, Some(Preview::Playlists)) {
                             self.preview = None;
                         }
+                        if matches!(self.preview, Some(Preview::PageMenu)) {
+                            let at = self.playlists.iter().position(|p| p.title == "Загруженное").unwrap_or(0);
+                            return Task::batch([covers, self.update(Message::PlaylistOpen(at))]);
+                        }
                         if matches!(self.preview, Some(Preview::Playlist | Preview::PlaylistHome)) {
                             return Task::batch([covers, self.update(Message::PlaylistOpen(0))]);
                         }
@@ -3107,6 +3226,9 @@ impl App {
                             self.queue = self.playlist_tracks.clone();
                             self.current = Some(0).filter(|_| !self.queue.is_empty());
                         }
+                        if matches!(preview, Some(Preview::PageMenu)) {
+                            self.page_menu = Some((560.0, 175.0));
+                        }
                         if matches!(preview, Some(Preview::PlaylistHome)) {
                             self.queue_title = self.playlist.as_ref().map(|p| p.title.clone());
                             self.section = Section::Wave;
@@ -3123,13 +3245,14 @@ impl App {
             }
             Message::MenuClose => {
                 // Esc сначала закрывает меню и окна, потом плеер на всё окно.
-                if self.menu.is_none() && self.pin_menu.is_none() && self.quality_menu.is_none() && self.eq_menu.is_none() && self.dialog.is_none() {
+                if self.menu.is_none() && self.pin_menu.is_none() && self.quality_menu.is_none() && self.eq_menu.is_none() && self.page_menu.is_none() && self.dialog.is_none() {
                     self.player_full = false;
                 }
                 self.menu = None;
                 self.pin_menu = None;
                 self.quality_menu = None;
                 self.eq_menu = None;
+                self.page_menu = None;
                 self.dialog = None;
             }
             Message::MenuArtists => self.menu_artists = true,
@@ -3156,7 +3279,7 @@ impl App {
                         move || api::track_details(&id, &token)
                     }), move |r| Message::TrackInfoLoaded(id.clone(), r));
                 }
-                let focus = !matches!(dialog, Dialog::Delete(_) | Dialog::WaveTune | Dialog::Logout | Dialog::Account);
+                let focus = !matches!(dialog, Dialog::Delete(_) | Dialog::RemoveTrack(_) | Dialog::WaveTune | Dialog::Logout | Dialog::Account);
                 self.dialog = Some(dialog);
                 if focus {
                     return operation::focus(Id::new(DIALOG_INPUT));
@@ -3200,11 +3323,17 @@ impl App {
                         }
                         Task::perform(background(move || api::set_description(&uid, &list.kind, &title, &token)), Message::SimpleSaved)
                     }
+                    // Плейлист сразу пропадает из окна, а удаляется на сервере, когда выйдет время отмены.
                     Dialog::Delete(list) => {
-                        let kind = list.kind;
-                        let wanted = kind.clone();
-                        Task::perform(background(move || api::delete_playlist(&uid, &kind, &token)), move |r| Message::PlaylistDeleted(wanted.clone(), r))
+                        let at = self.playlists.iter().position(|p| p.kind == list.kind).unwrap_or(0);
+                        self.playlists.retain(|p| p.kind != list.kind);
+                        let leave = self.playlist.as_ref().is_some_and(|open| open.kind == list.kind) && self.section == Section::Playlists;
+                        let notice = self.pending_start(Pending::Playlist(list.clone(), at), format!("Плейлист «{}» удалён", list.title));
+                        let back = if leave { self.handle(Message::Back) } else { Task::none() };
+                        let _ = (uid, token);
+                        Task::batch([notice, back])
                     }
+                    Dialog::RemoveTrack(track) => self.handle(Message::TrackRemove(track)),
                 };
             }
             Message::PlaylistCreated(Ok(list)) => {
@@ -3244,12 +3373,13 @@ impl App {
             Message::TrackAdded(_, _, Err(e)) | Message::TrackRemoved(Err(e)) => return self.fail(e),
             Message::TrackRemove(track) => {
                 self.menu = None;
-                let (Some(uid), Some(token), Some(list)) = (self.uid.clone(), self.token(), self.playlist.as_mut()) else { return Task::none() };
-                let kind = list.kind.clone();
+                let Some(list) = self.playlist.as_mut() else { return Task::none() };
                 list.count = list.count.saturating_sub(1);
+                let list = list.clone();
+                let at = self.playlist_tracks.iter().position(|t| t.id == track.id).unwrap_or(0);
                 self.playlist_tracks.retain(|t| t.id != track.id);
                 self.filter_tracks.retain(|t| t.id != track.id);
-                return Task::perform(background(move || api::remove_from_playlist(&uid, &kind, &track, &token)), Message::TrackRemoved);
+                return self.pending_start(Pending::Track(list, track, at), "Трек удалён из плейлиста".to_string());
             }
             Message::TrackRemoved(Ok(())) => {
                 self.playlists_loading = false;
@@ -3508,6 +3638,38 @@ impl App {
                 return Task::batch([iced::clipboard::write(track.share_link()), notice]);
             }
             Message::Unavailable => return self.notify(UNAVAILABLE.to_string()),
+            Message::PageMenuOpen => self.page_menu = Some(*CURSOR.lock().unwrap()),
+            Message::PageMenuPick(message) => {
+                self.page_menu = None;
+                return self.update(*message);
+            }
+            Message::Undo => {
+                let Some((id, pending)) = self.pending.take() else { return Task::none() };
+                if self.notice.as_ref().is_some_and(|(current, _, _)| *current == id) {
+                    self.notice = None;
+                }
+                match pending {
+                    Pending::Playlist(list, at) => {
+                        let at = at.min(self.playlists.len());
+                        self.playlists.insert(at, list);
+                    }
+                    Pending::Track(list, track, at) => {
+                        if let Some(open) = self.playlist.as_mut().filter(|open| open.kind == list.kind && open.owner == list.owner) {
+                            open.count += 1;
+                            let at = at.min(self.playlist_tracks.len());
+                            self.playlist_tracks.insert(at, track);
+                        }
+                    }
+                }
+            }
+            Message::UndoExpire(id) => {
+                if self.notice.as_ref().is_some_and(|(current, _, _)| *current == id) {
+                    self.notice = None;
+                }
+                if self.pending.as_ref().is_some_and(|(current, _)| *current == id) {
+                    return self.pending_commit();
+                }
+            }
             Message::CoverPick(list) => {
                 let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
                 let owner = self.hwnd;
@@ -3605,7 +3767,7 @@ impl App {
             // Проверка не удалась: треки остаются как были.
             Message::Availability(Err(_)) => {}
             Message::NoticeClear(id) => {
-                if self.notice.as_ref().is_some_and(|(current, _)| *current == id) {
+                if self.notice.as_ref().is_some_and(|(current, _, _)| *current == id) {
                     self.notice = None;
                 }
             }
@@ -3931,7 +4093,7 @@ impl App {
         if let Some(full) = self.view_full() {
             layers = layers.push(full);
         }
-        if self.menu.is_some() || self.quality_menu.is_some() || self.eq_menu.is_some() || self.pin_menu.is_some() {
+        if self.menu.is_some() || self.quality_menu.is_some() || self.eq_menu.is_some() || self.page_menu.is_some() || self.pin_menu.is_some() {
             layers = layers.push(mouse_area(container(Space::new()).width(Length::Fill).height(Length::Fill)).on_press(Message::MenuClose).on_right_press(Message::MenuClose));
         }
         if let Some((track, x, y, artists, lists)) = &self.menu_fade.item {
@@ -3946,14 +4108,22 @@ impl App {
         if let Some((x, y)) = self.eq_fade.item {
             layers = layers.push(self.view_eq_popup(x, y));
         }
+        if let Some((x, y)) = self.page_menu_fade.item {
+            layers = layers.push(self.view_page_menu(x, y));
+        }
         if let Some(dialog) = &self.dialog_fade.item {
             layers = layers.push(self.view_dialog(dialog));
         }
-        if let Some(notice) = &self.notice_fade.item {
+        if let Some((notice, undo)) = &self.notice_fade.item {
             let alpha = self.notice_fade.shown();
-            let body = container(text(human_error(notice)).color(ui::TEXT.scale_alpha(alpha))).padding([12, 18]).style(ui::popover_faded(alpha));
+            let mut line = row![text(human_error(notice)).color(ui::TEXT.scale_alpha(alpha))].spacing(16).align_y(Alignment::Center);
+            if *undo {
+                line = line.push(shine(button(text("Отменить").font(ui::font_medium()).color(ui::ACCENT.scale_alpha(alpha))).padding([4, 10]).style(ui::button_faded(ui::ghost, alpha)).on_press(Message::Undo), 16.0));
+            }
+            let padding = if *undo { Padding::from([8, 18]).right(8) } else { Padding::from([12, 18]) };
+            let body = container(line).padding(padding).style(ui::popover_faded(alpha));
             layers = layers.push(
-                container(reveal(body).shift(0.0, -16.0 * (1.0 - alpha)).scale(0.97 + 0.03 * alpha, 0.5, 0.0).inert(true))
+                container(reveal(body).shift(0.0, -16.0 * (1.0 - alpha)).scale(0.97 + 0.03 * alpha, 0.5, 0.0).inert(!(*undo && self.notice_fade.live)))
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .align_x(Alignment::Center)
@@ -3975,6 +4145,7 @@ impl App {
             Dialog::Rename(_) => ("Название плейлиста".to_string(), "Сохранить", false),
             Dialog::Describe(_) => ("Описание плейлиста".to_string(), "Сохранить", false),
             Dialog::Delete(list) => (format!("Удалить плейлист «{}»?", list.title), "Удалить", true),
+            Dialog::RemoveTrack(track) => (format!("Удалить «{}» из плейлиста?", track.title), "Удалить", true),
         };
         let alpha = self.dialog_fade.shown();
         let mut body = column![text(title).size(20).font(ui::font_medium()).color(ui::TEXT.scale_alpha(alpha))].spacing(16);
@@ -4245,7 +4416,7 @@ impl App {
         ];
         let mut count = 6.0;
         if self.section == Section::Playlists && self.playlist.as_ref().is_some_and(|list| self.is_own(list)) {
-            items = items.push(item(ui::CLOSE, "Удалить из плейлиста", Message::TrackRemove(track.clone())));
+            items = items.push(item(ui::DELETE, "Удалить из плейлиста", Message::DialogOpen(Dialog::RemoveTrack(track.clone()))));
             count += 1.0;
         }
         if track.album.is_some() {
@@ -4915,20 +5086,12 @@ impl App {
                 if let Some(description) = meta.map(|m| m.1.as_str()).filter(|d| !d.is_empty()) {
                     head = head.push(text(description).color(ui::MUTED));
                 }
-                let tool = |label, message| shine(button(text(label).color(ui::TEXT)).padding([6, 14]).style(ui::secondary).on_press(message), 24.0);
                 let mut tools = self.page_actions(Section::Playlists, format!("playlist:{}_{}", playlist.owner, playlist.kind), &playlist.title);
-                if self.is_own(playlist) && playlist.title != UPLOADS_TITLE {
-                    let cover = if playlist.cover.is_some() { "Изменить обложку" } else { "Добавить обложку" };
-                    tools = tools.push(tool("Переименовать", Message::DialogOpen(Dialog::Rename(playlist.clone())))).push(tool("Описание", Message::DialogOpen(Dialog::Describe(playlist.clone())))).push(tool(cover, Message::CoverPick(playlist.clone())));
-                    if let Some(meta) = meta {
-                        tools = tools.push(tool(if meta.2 == "private" { "Сделать публичным" } else { "Сделать приватным" }, Message::Visibility(playlist.clone())));
-                    }
-                    tools = tools.push(tool("Удалить", Message::DialogOpen(Dialog::Delete(playlist.clone()))));
-                } else if !self.is_own(playlist) && playlist.kind != FAVORITES_KIND {
+                if !self.is_own(playlist) && playlist.kind != FAVORITES_KIND {
                     let liked = self.liked_lists.iter().any(|l| l.kind == playlist.kind && l.owner == playlist.owner);
                     tools = tools.push(self.page_like(liked, Message::ListLike(playlist.clone())));
                 }
-                tools = tools.push(self.page_tools(PinRef::Playlist(playlist.owner.clone(), playlist.kind.clone()), format!("https://music.yandex.ru/users/{}/playlists/{}", playlist.owner, playlist.kind)));
+                tools = tools.push(self.page_more());
                 head = head.push(tools.wrap().vertical_spacing(8));
             }
             let title = head;
@@ -5123,13 +5286,6 @@ impl App {
         row![play, wave].spacing(8).align_y(Alignment::Center)
     }
 
-    /// Закрепление и ссылка: круглые кнопки рядом с лайком.
-    fn page_tools<'a>(&self, target: PinRef, link: String) -> iced::widget::Row<'a, Message> {
-        let pinned = self.pins.iter().any(|pin| target.matches(pin));
-        let round = |icon, tint, message| shine(button(container(ui::icon(icon, 22.0, tint)).center(22)).padding(9).style(ui::secondary).on_press(message), 24.0);
-        row![round(ui::PIN, if pinned { ui::ACCENT } else { ui::TEXT }, Message::Pin(target)), round(ui::LINK, ui::TEXT, Message::CopyText(link))].spacing(8)
-    }
-
     fn page_like<'a>(&self, liked: bool, message: Message) -> Element<'a, Message> {
         let icon = if liked { ui::HEART } else { ui::HEART_OUTLINE };
         shine(button(container(ui::icon(icon, 22.0, ui::TEXT)).center(22)).padding(9).style(ui::secondary).on_press(message), 24.0).into()
@@ -5150,7 +5306,7 @@ impl App {
         }
         let actions = self.page_actions(Section::Playlists, format!("album:{}", album.id), &album.title);
         let liked = self.liked_albums.iter().any(|c| c.id == album.id);
-        let actions = actions.push(self.page_like(liked, Message::AlbumLike)).push(self.page_tools(PinRef::Album(album.id.clone()), format!("https://music.yandex.ru/album/{}", album.id)));
+        let actions = actions.push(self.page_like(liked, Message::AlbumLike)).push(self.page_more());
         let links = artist_links(&album.artists, 16.0, ui::font(), ui::MUTED);
         let header = self.page_header("Альбом", playlist.title.clone(), format!("{ALBUM_COVER}{}", album.id), false, Some(links), about.join(" · "), actions);
         self.view_list(Section::Playlists, Some(header))
@@ -5178,7 +5334,7 @@ impl App {
         let about = if artist.listeners > 0 { format!("Слушателей в месяц: {}", grouped(artist.listeners)) } else { String::new() };
         let actions = self.page_actions(Section::Artist, format!("artist:{}", artist.id), &artist.name).push(shine(button(text("Все треки").color(ui::TEXT)).padding([8, 18]).style(ui::secondary).on_press(Message::ArtistTracks), 24.0));
         let liked = self.liked_artists.iter().any(|c| c.id == artist.id);
-        let actions = actions.push(self.page_like(liked, Message::ArtistLike)).push(self.page_tools(PinRef::Artist(artist.id.clone()), format!("https://music.yandex.ru/artist/{}", artist.id)));
+        let actions = actions.push(self.page_like(liked, Message::ArtistLike)).push(self.page_more());
         let block = |title| text(title).size(24).font(ui::font_headline()).color(ui::TEXT);
         let mut page = column![self.page_header("Исполнитель", artist.name.clone(), format!("{ARTIST_COVER}{}", artist.id), true, None, about, actions)].spacing(12).padding(Padding::ZERO.right(SCROLLBAR));
         if !artist.popular.is_empty() {
@@ -6359,6 +6515,7 @@ fn main() -> iced::Result {
             "collection" => Preview::Collection,
             "playlists" => Preview::Playlists,
             "playlist" => Preview::Playlist,
+            "page-menu" => Preview::PageMenu,
             "playlist-home" => Preview::PlaylistHome,
             what if what.starts_with("filter:") => Preview::Filter(what[7..].to_string()),
             what if what.starts_with("similar-album:") => Preview::SimilarOf(Playlist::album(&what[14..], "")),
