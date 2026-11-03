@@ -56,6 +56,9 @@ const BAR_TITLE_ROOM: f32 = 150.0;
 /// Верхняя строка трекбара с названием: высота, размер текста и время выезда.
 const BAR_TOP_LINE: f32 = 24.0;
 const BAR_TOP_SIZE: f32 = 14.0;
+/// Громкость в верхней строке узкого трекбара: значок и ползунок.
+const BAR_TOP_VOLUME_ICON: f32 = 16.0;
+const BAR_TOP_SLIDER: f32 = 90.0;
 const BAR_TOP_FADE: f32 = 0.2;
 const BAR_TOOL: f32 = 30.0;
 const BAR_VOLUME_ICON: f32 = 32.0;
@@ -5827,14 +5830,14 @@ impl App {
         }
     }
 
-    /// Все кнопки есть всегда. Когда окно сужается, сжимается только громкость,
-    /// а название уезжает в тонкую строку сверху; не поместится и там — обрезается.
+    /// Все кнопки есть всегда. Когда окно сужается, сжимается громкость, а потом название
+    /// и громкость плавно переезжают в тонкую строку сверху; не поместится и там — многоточие.
     fn view_bar(&self) -> Option<Element<'_, Message>> {
         let track = self.current_track()?;
         let side = |icon, message| glow(button(ui::icon(icon, 26.0, ui::MUTED)).padding(6).style(ui::ghost).on_press(message), 20.0);
         let toggle = shine(button(container(ui::icon(if self.is_playing() { ui::PAUSE } else { ui::PLAY }, 26.0, ui::ON_ACCENT)).center(26)).padding(7).style(ui::round).on_press(Message::Toggle), 40.0);
         let mode = |icon, on: bool, message| glow(button(ui::icon(icon, 22.0, if on { ui::ACCENT } else { ui::MUTED })).padding(8).style(ui::ghost).on_press(message), 20.0);
-        let (zone, stacked) = self.bar_layout();
+        let (zone, _) = self.bar_layout();
 
         let names = |size: f32, alpha: f32| -> Element<'_, Message> {
             if self.starting {
@@ -5845,10 +5848,16 @@ impl App {
                 artist_links(&track.artist_list, size, ui::font(), ui::MUTED.scale_alpha(alpha)).into()
             }
         };
+        // Насколько название и громкость уже переехали в верхнюю строку: всё движется вместе с ней.
+        let shown = anim::ease_out(self.bar_top);
         let cover = button(self.cover(track, BAR_COVER)).padding(0).style(ui::ghost).on_press(Message::FullToggle);
         let mut about = row![cover].spacing(12).align_y(Alignment::Center);
-        if !stacked {
-            about = about.push(column![track_title(track, 16.0, ui::font_medium(), ui::WHITE, true), names(16.0, 1.0)].width(Length::Fill).clip(true));
+        if shown < 1.0 {
+            // Пока строка сверху выезжает, название внизу сужается и гаснет, а не исчезает разом.
+            let stay = 1.0 - shown;
+            let room = (zone - BAR_COVER - 12.0 - 2.0 * (LIKE + 12.0)).max(0.0);
+            let width = if shown > 0.0 { Length::Fixed(room * stay) } else { Length::Fill };
+            about = about.push(column![track_title(track, 16.0, ui::font_medium(), ui::WHITE.scale_alpha(stay), true), names(16.0, stay)].width(width).clip(true));
         }
         about = about.push(self.like_button(track, 22.0)).push(self.more_button(track, 20.0));
         let about = mouse_area(container(about).width(zone).clip(true)).on_right_press(Message::MenuOpen(track.clone()));
@@ -5876,20 +5885,26 @@ impl App {
         let lyrics = if track.lyrics { BAR_TOOL + 6.0 } else { 0.0 };
         let tools = lyrics + 3.0 * BAR_TOOL + 12.0;
         let slider_room = (zone - tools - BAR_VOLUME_ICON - 14.0).clamp(BAR_SLIDER_MIN, BAR_SLIDER_MAX);
-        let right = row![self.view_tools(22.0, true), self.view_volume(24.0, Some(slider_room))].spacing(8).align_y(Alignment::Center);
+        let mut right = row![self.view_tools(22.0, true)].spacing(8).align_y(Alignment::Center);
+        // В узком окне громкость уезжает наверх вместе с названием: внизу ей не хватает места.
+        if shown < 1.0 {
+            let volume = container(self.view_volume(24.0, Some(slider_room))).width((BAR_VOLUME_ICON + 6.0 + slider_room) * (1.0 - shown)).clip(true);
+            right = right.push(volume);
+        }
 
         let controls = row![about, container(buttons).center_x(Length::Fill), container(right).align_right(zone)].spacing(16).align_y(Alignment::Center);
 
-        // Строка сверху выезжает плавно и обрезается по краю окна.
-        let shown = anim::ease_out(self.bar_top);
+        // Строка сверху выезжает плавно и обрезается по краю окна: название слева, громкость справа.
         let top: Element<'_, Message> = if self.bar_top > 0.0 {
-            let line = row![
+            let about = row![
                 track_title(track, BAR_TOP_SIZE, ui::font_medium(), ui::WHITE.scale_alpha(shown), true),
                 text("·").size(BAR_TOP_SIZE).color(ui::MUTED.scale_alpha(shown)),
                 names(BAR_TOP_SIZE, shown),
             ]
             .spacing(6)
             .align_y(Alignment::Center);
+            let volume = container(self.view_volume(BAR_TOP_VOLUME_ICON, Some(BAR_TOP_SLIDER))).width((BAR_TOP_VOLUME_ICON + 14.0 + BAR_TOP_SLIDER) * shown).clip(true);
+            let line = row![container(about).width(Length::Fill).clip(true), volume].spacing(12).align_y(Alignment::Center);
             mouse_area(container(line).width(Length::Fill).height(BAR_TOP_LINE * shown).padding([0, 8]).clip(true).align_y(Alignment::Center)).on_right_press(Message::MenuOpen(track.clone())).into()
         } else {
             Space::new().height(0).into()
