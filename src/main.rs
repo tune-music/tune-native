@@ -297,6 +297,8 @@ enum Section {
     Wave,
     /// Книги и подкасты: такая же страница из блоков, как главная.
     Books,
+    /// Детский раздел, тоже страница из блоков.
+    Kids,
     Collection,
     Likes,
     Playlists,
@@ -448,6 +450,7 @@ enum Preview {
     EqBar,
     PageMenu,
     Books,
+    Kids,
     /// Восстановленная очередь на странице волны, без звука.
     WaveRestored,
     /// В лайках набирается фильтр по буквам: в stderr — остался ли фокус.
@@ -492,7 +495,7 @@ struct App {
     /// Чья страница из блоков сейчас загружена: главная или книги и подкасты.
     home_page: Section,
     /// Последняя открытая вкладка главной и книг с подкастами.
-    landing_tabs: [usize; 2],
+    landing_tabs: [usize; 3],
     /// Меню «…» страницы плейлиста, альбома или исполнителя открыто в этой точке.
     page_menu: Option<(f32, f32)>,
     page_menu_fade: Fade<(f32, f32)>,
@@ -590,6 +593,8 @@ struct App {
     eq: equalizer::EqSettings,
     /// Плавные переходы между треками.
     crossfade: bool,
+    /// Показывать пункт «Детям» в боковой панели.
+    kids: bool,
     /// Следующий запуск — переход: где затихает играющий трек.
     cross_out: Option<(f32, f32)>,
     /// Что играет: смена раздела и новый поиск не прерывают музыку.
@@ -877,6 +882,7 @@ enum Message {
     DragEnd,
     TrackMoved(Result<(), String>),
     CrossfadeToggle,
+    KidsToggle,
     EqToggle,
     EqPreset(usize),
     EqBand(usize, f32),
@@ -949,7 +955,7 @@ impl App {
             home_tab: 0,
             home_loading: false,
             home_page: Section::Home,
-            landing_tabs: [0; 2],
+            landing_tabs: [0; 3],
             progress: HashMap::new(),
             progress_at: None,
             drag: None,
@@ -1039,6 +1045,7 @@ impl App {
             quality: saved.quality,
             eq: saved.eq,
             crossfade: saved.crossfade,
+            kids: saved.kids,
             cross_out: None,
             sound: None,
             restart: None,
@@ -1200,7 +1207,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, kids: self.kids });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -1906,7 +1913,7 @@ impl App {
         self.home_block_tabs.clear();
         self.home.blocks.clear();
         self.error = None;
-        let skeleton = if page == Section::Books { "non_music" } else { "main" };
+        let skeleton = landing_skeleton(page);
         Task::perform(background(move || api::landing(skeleton, tab, &token)), move |r| Message::HomeLoaded(page, tab, r))
     }
 
@@ -2065,7 +2072,7 @@ impl App {
             Section::Likes | Section::Collection => &self.liked,
             Section::Playlists => &self.playlist_tracks,
             Section::Artist => self.artist.as_ref().map_or(&[], |a| a.popular.as_slice()),
-            Section::Albums | Section::Artists | Section::Home | Section::Books | Section::Discography | Section::Tag => &[],
+            Section::Albums | Section::Artists | Section::Home | Section::Books | Section::Kids | Section::Discography | Section::Tag => &[],
             // На странице очереди список — то, что будет после играющего трека.
             Section::History => &self.history_tracks,
             Section::Dislikes => &self.disliked_list,
@@ -2158,7 +2165,7 @@ impl App {
             // Открыли исполнителя, альбом или другую страницу из плеера на всё окно — он уезжает.
             self.player_full = false;
             let here = self.list_place();
-            let section_root = matches!(here.0, Section::Home | Section::Books | Section::Likes | Section::Collection | Section::Albums | Section::Artists | Section::History | Section::Dislikes | Section::Search | Section::Settings)
+            let section_root = matches!(here.0, Section::Home | Section::Books | Section::Kids | Section::Likes | Section::Collection | Section::Albums | Section::Artists | Section::History | Section::Dislikes | Section::Search | Section::Settings)
                 || (here.0 == Section::Playlists && here.1.is_none());
             let restore = self.scroll_places.get(&here).copied().filter(|_| remembers_scroll(here.0) && (section_root || travel));
             self.scroll_wait = restore.filter(|_| !self.page_ready());
@@ -2186,7 +2193,7 @@ impl App {
             }
         }
         if place == self.list_place() {
-            let tabbed = matches!(self.section, Section::Search | Section::Home | Section::Books);
+            let tabbed = matches!(self.section, Section::Search | Section::Home | Section::Books | Section::Kids);
             if tabbed && (self.search_tab, self.home_tab) != tab {
                 // Другая вкладка проявляется на месте, без сдвига: шапка и кнопки не трогаются.
                 self.area_veil = 1.0;
@@ -2248,7 +2255,7 @@ impl App {
     fn area_loading(&self) -> bool {
         match self.section {
             Section::Search => self.searching,
-            Section::Home | Section::Books => self.home_loading,
+            Section::Home | Section::Books | Section::Kids => self.home_loading,
             _ => false,
         }
     }
@@ -2262,7 +2269,7 @@ impl App {
     fn page_ready(&self) -> bool {
         match self.section {
             Section::Likes | Section::Playlists if self.filtering() => true,
-            Section::Home | Section::Books => self.home_page == self.section && !self.home.blocks.is_empty(),
+            Section::Home | Section::Books | Section::Kids => self.home_page == self.section && !self.home.blocks.is_empty(),
             Section::Wave => self.current_track().is_some(),
             Section::Collection | Section::Settings => true,
             Section::Lyrics => self.lyrics.as_ref().is_some_and(|(id, _)| self.current_track().is_some_and(|track| track.id == *id)),
@@ -2418,6 +2425,11 @@ impl App {
                         self.preview = None;
                         self.section = Section::Books;
                         self.home_load(Section::Books, 1)
+                    }
+                    Some(Preview::Kids) => {
+                        self.preview = None;
+                        self.section = Section::Kids;
+                        self.home_load(Section::Kids, 0)
                     }
                     Some(Preview::EqBar) => {
                         self.preview = None;
@@ -2668,7 +2680,7 @@ impl App {
                     self.playlist = None;
                 }
                 return match section {
-                    Section::Home | Section::Books if self.home_page != section || (self.home.blocks.is_empty() && !self.home_loading) => {
+                    Section::Home | Section::Books | Section::Kids if self.home_page != section || (self.home.blocks.is_empty() && !self.home_loading) => {
                         let tab = self.landing_tabs[landing_index(section)];
                         self.home_load(section, tab)
                     }
@@ -3792,6 +3804,10 @@ impl App {
                 self.crossfade = !self.crossfade;
                 self.save_settings();
             }
+            Message::KidsToggle => {
+                self.kids = !self.kids;
+                self.save_settings();
+            }
             Message::EqOpen => self.eq_menu = Some(eq_place(*CURSOR.lock().unwrap())),
             Message::EqToggle => {
                 self.eq.enabled = !self.eq.enabled;
@@ -4124,7 +4140,7 @@ impl App {
 
     fn view_main(&self) -> Element<'_, Message> {
         let page: Element<'_, Message> = match self.section {
-            Section::Home | Section::Books => self.view_home(),
+            Section::Home | Section::Books | Section::Kids => self.view_home(),
             Section::Queue => self.view_queue(),
             Section::Lyrics => self.view_lyrics(),
             Section::Settings => self.view_settings(),
@@ -4732,8 +4748,9 @@ impl App {
                     item(ui::SEARCH, "Поиск", Section::Search),
                     item(ui::WAVE, "Моя волна", Section::Wave),
                     item(ui::HEADPHONES, "Книги и подкасты", Section::Books),
-                    item(ui::HEART_OUTLINE, "Коллекция", Section::Collection),
                 ]
+                .extend(self.kids.then(|| item(ui::KIDS, "Детям", Section::Kids)))
+                .push(item(ui::HEART_OUTLINE, "Коллекция", Section::Collection))
                 .spacing(4),
                 Space::new().height(16),
                 self.view_pins(),
@@ -4967,12 +4984,20 @@ impl App {
         .align_y(Alignment::Center);
         let cross = glow(button(cross).width(Length::Fill).padding(8).style(ui::row).on_press(Message::CrossfadeToggle), 8.0);
 
+        let kids = row![
+            column![text("Детский раздел").color(ui::TEXT), text("Пункт «Детям» в боковой панели: сказки, песни и аудиокниги для детей").size(13).color(ui::MUTED)].spacing(2).width(Length::Fill),
+            view_switch(Some(self.kids)),
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center);
+        let kids = glow(button(kids).width(Length::Fill).padding(8).style(ui::row).on_press(Message::KidsToggle), 8.0);
+
         let page = column![
             text("Настройки").size(36).font(ui::font_headline()).color(ui::TEXT),
             sound,
             self.view_equalizer(),
             cross,
-            column![title("Рекомендации"), ai].spacing(8),
+            column![title("Рекомендации"), ai, kids].spacing(8),
             view_hotkeys(),
             column![title("Аккаунт"), row![link("Управление аккаунтом", Message::DialogOpen(Dialog::Account)), link("Выйти", Message::DialogOpen(Dialog::Logout))].spacing(8)].spacing(12),
             column![
@@ -5265,8 +5290,12 @@ impl App {
         if self.home_loading && self.home.tabs.is_empty() {
             tabs = SKELETON_TABS.iter().fold(tabs, |tabs, &width| tabs.push(container(Space::new()).width(width).height(SKELETON_TAB).style(skeleton_round(SKELETON_TAB / 2.0))));
         }
-        let title = if self.section == Section::Books { "Книги и подкасты" } else { "Главная" };
-        let page = column![text(title).size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None), tabs].spacing(16).height(Length::Fill);
+        let title = landing_title(self.section);
+        let mut page = column![text(title).size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None)].spacing(16).height(Length::Fill);
+        // Одна вкладка («Детям») только повторила бы заголовок.
+        if self.home.tabs.len() != 1 {
+            page = page.push(tabs);
+        }
         if self.home_loading || self.home.blocks.is_empty() {
             return page.push(self.area(if self.home_loading { skeleton_home(self.cards_in_row()) } else { placeholder("Пока здесь пусто", None) })).into();
         }
@@ -5899,12 +5928,34 @@ fn drop_index(from: usize, at: usize, below: bool) -> Option<usize> {
 
 /// Страница из блоков: главная и книги с подкастами устроены одинаково.
 fn is_landing(section: Section) -> bool {
-    matches!(section, Section::Home | Section::Books)
+    matches!(section, Section::Home | Section::Books | Section::Kids)
 }
 
 /// Номер страницы из блоков для запоминания её вкладки.
 fn landing_index(section: Section) -> usize {
-    usize::from(section == Section::Books)
+    match section {
+        Section::Books => 1,
+        Section::Kids => 2,
+        _ => 0,
+    }
+}
+
+/// Скелет страницы из блоков у Яндекса.
+fn landing_skeleton(section: Section) -> &'static str {
+    match section {
+        Section::Books => "non_music",
+        Section::Kids => "kids",
+        _ => "main",
+    }
+}
+
+/// Заголовок страницы из блоков.
+fn landing_title(section: Section) -> &'static str {
+    match section {
+        Section::Books => "Книги и подкасты",
+        Section::Kids => "Детям",
+        _ => "Главная",
+    }
 }
 
 /// Ошибка словами для человека. Внутренний текст с кодами и сообщениями системы
@@ -6453,7 +6504,7 @@ fn smoke_settings() -> Result<(), String> {
 /// Печатает блоки обеих вкладок главной: что из ответа Яндекса дошло до экрана.
 fn smoke_home() -> Result<(), String> {
     let token = api::load_token().ok_or("нет токена")?;
-    for (skeleton, tab) in [("main", 0), ("main", 1), ("non_music", 0), ("non_music", 1)] {
+    for (skeleton, tab) in [("main", 0), ("main", 1), ("non_music", 0), ("non_music", 1), ("kids", 0)] {
         let home = api::landing(skeleton, tab, &token)?;
         println!("=== {}", home.tabs.get(tab).cloned().unwrap_or_default());
         for block in &home.blocks {
@@ -6790,6 +6841,7 @@ fn main() -> iced::Result {
             "full" => Preview::Full,
             "eq-bar" => Preview::EqBar,
             "books" => Preview::Books,
+            "kids" => Preview::Kids,
             "wave-restored" => Preview::WaveRestored,
             "filter-focus" => Preview::FilterFocus,
             query => Preview::Search(query.to_string()),
