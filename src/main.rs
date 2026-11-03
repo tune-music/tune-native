@@ -10,6 +10,8 @@ mod player;
 mod seek;
 mod session;
 mod crossfade;
+mod fit;
+use fit::{fit, fit_row};
 mod pick;
 mod equalizer;
 mod settings;
@@ -194,6 +196,10 @@ const CARD_SLOT: f32 = CARD + 20.0;
 /// Ширина содержимого, на которой нижний плеер отказывается от лишнего.
 /// Уже этой ширины в строке трека нет места для длительности.
 const TRACK_TIME_WIDTH: f32 = 520.0;
+/// Место под значок «E» после названия: сам значок и отступ.
+const EXPLICIT_RESERVE: f32 = 22.0;
+/// Место под «123 трека» после названия плейлиста.
+const PLAYLIST_COUNT_RESERVE: f32 = 110.0;
 /// Ширина колонки времени: у музыки «03:25», у выпусков «осталось 1:47:20».
 const TIME_WIDTH: f32 = 72.0;
 const TIME_WIDTH_EPISODE: f32 = 150.0;
@@ -4267,10 +4273,10 @@ impl App {
         let tint = |color: iced::Color| color.scale_alpha(alpha);
         let close = glow(button(ui::icon(ui::CLOSE, 20.0, tint(ui::MUTED))).padding(4).style(ui::ghost).on_press(Message::MenuClose), 16.0);
         let head = row![text("Аккаунт").size(20).font(ui::font_medium()).color(tint(ui::TEXT)), Space::new().width(Length::Fill), close].align_y(Alignment::Center);
-        let mut who = column![text(&profile.name).size(18).font(ui::font_medium()).color(tint(ui::TEXT)).wrapping(Wrapping::None)].spacing(2).width(Length::Fill).clip(true);
+        let mut who = column![fit(&profile.name).size(18).font(ui::font_medium()).color(tint(ui::TEXT)).no_tip()].spacing(2).width(Length::Fill).clip(true);
         for line in [profile.login.as_str(), profile.email.as_str()] {
             if !line.is_empty() {
-                who = who.push(text(line).size(14).color(tint(ui::MUTED)).wrapping(Wrapping::None));
+                who = who.push(fit(line).size(14).color(tint(ui::MUTED)).no_tip());
             }
         }
         let plus = match (profile.plus, &profile.plus_until, profile.family) {
@@ -4340,8 +4346,8 @@ impl App {
                     let line = row![
                         ui::icon(ui::PLAY, 18.0, ui::MUTED.scale_alpha(alpha)),
                         column![
-                            text(&similar.title).color(ui::TEXT.scale_alpha(alpha)).wrapping(Wrapping::None),
-                            text(&similar.artists).size(13).color(ui::MUTED.scale_alpha(alpha)).wrapping(Wrapping::None),
+                            fit(&similar.title).color(ui::TEXT.scale_alpha(alpha)).no_tip(),
+                            fit(&similar.artists).size(13).color(ui::MUTED.scale_alpha(alpha)).no_tip(),
                         ]
                         .width(Length::Fill)
                         .clip(true),
@@ -4389,7 +4395,7 @@ impl App {
         let Some(track) = self.current_track() else {
             return column![back, placeholder("Сейчас ничего не играет", None)].spacing(16).height(Length::Fill).into();
         };
-        let about = column![text(&track.title).size(24).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None), text(&track.artists).color(ui::MUTED).wrapping(Wrapping::None)];
+        let about = column![fit(&track.title).size(24).font(ui::font_headline()).color(ui::TEXT), fit(&track.artists).color(ui::MUTED)];
         let about = about.align_x(Alignment::Center);
         // Пустое место справа равно кнопке слева, чтобы название стояло точно посередине.
         let header = row![back, container(about).center_x(Length::Fill).clip(true), Space::new().width(36)].spacing(12).align_y(Alignment::Center);
@@ -4633,15 +4639,15 @@ impl App {
             (false, false) => (ui::WHITE, ui::MUTED),
         };
         let names: Element<'a, Message> = if let Some(published) = track.published.as_ref().filter(|_| track.remember) {
-            text(published).color(names_color).wrapping(Wrapping::None).into()
+            fit(published).color(names_color).into()
         } else if track.artist_list.is_empty() {
-            text(&track.artists).color(names_color).wrapping(Wrapping::None).into()
+            fit(&track.artists).color(names_color).into()
         } else {
             artist_links(&track.artist_list, 16.0, ui::font(), names_color).into()
         };
         let mut line = row![
             cover,
-            column![track_title(track, 16.0, ui::font_medium(), title_color), names].width(Length::Fill).clip(true),
+            column![track_title(track, 16.0, ui::font_medium(), title_color, false), names].width(Length::Fill).clip(true),
             self.like_button(track, 20.0),
         ]
         .spacing(12)
@@ -4732,7 +4738,7 @@ impl App {
                 24.0,
             )
         };
-        let mut account = column![text(self.profile.as_ref().map_or("", |p| p.name.as_str())).size(14).font(ui::font_medium()).color(ui::TEXT).wrapping(Wrapping::None)].clip(true).width(Length::Fill);
+        let mut account = column![fit(self.profile.as_ref().map_or("", |p| p.name.as_str())).size(14).font(ui::font_medium()).color(ui::TEXT)].clip(true).width(Length::Fill);
         if self.profile.as_ref().is_some_and(|p| p.plus) {
             account = account.push(container(text("Плюс").size(12).font(ui::font_medium())).padding([1, 8]).style(ui::plus));
         }
@@ -4785,8 +4791,8 @@ impl App {
                 let mut line = row![
                     cover,
                     column![
-                        text(&pin.title).size(13).font(ui::font_medium()).color(if self.pin_active(pin) { ui::ACCENT } else { ui::TEXT }).wrapping(Wrapping::None),
-                        text(&pin.subtitle).size(12).color(ui::MUTED).wrapping(Wrapping::None),
+                        fit(&pin.title).size(13).font(ui::font_medium()).color(if self.pin_active(pin) { ui::ACCENT } else { ui::TEXT }),
+                        fit(&pin.subtitle).size(12).color(ui::MUTED),
                     ]
                     .width(Length::Fill)
                     .clip(true),
@@ -4870,11 +4876,11 @@ impl App {
         let side = |icon, message| glow(button(ui::icon(icon, 32.0, ui::TEXT)).padding(8).style(ui::ghost).on_press(message), 20.0);
         let name_size = (line / (track.title.chars().count().max(1) as f32 * 0.62)).clamp(20.0, 34.0);
         let names: Element<'_, Message> = if track.artist_list.is_empty() {
-            text(&track.artists).size(18).color(ui::MUTED).wrapping(Wrapping::None).into()
+            fit(&track.artists).size(18).color(ui::MUTED).marquee().into()
         } else {
-            artist_links(&track.artist_list, 18.0, ui::font(), ui::MUTED).into()
+            artist_links(&track.artist_list, 18.0, ui::font(), ui::MUTED)
         };
-        let about = column![track_title(track, name_size, ui::font_headline(), ui::WHITE), names].spacing(4).align_x(Alignment::Center);
+        let about = column![track_title(track, name_size, ui::font_headline(), ui::WHITE, true), names].spacing(4).align_x(Alignment::Center);
         let info = row![self.like_button(track, 24.0), container(about).center_x(Length::Fill).clip(true), self.more_button(track, 22.0)].spacing(12).align_y(Alignment::Center).width(line);
         let mode = |icon, on: bool, message| glow(button(ui::icon(icon, 24.0, if on { ui::ACCENT } else { ui::MUTED })).padding(8).style(ui::ghost).on_press(message), 20.0);
         let mut transport = row![].spacing(20).align_y(Alignment::Center);
@@ -5103,7 +5109,7 @@ impl App {
             };
             let card = column![
                 cover,
-                text(&playlist.title).font(ui::font_medium()).color(ui::TEXT).wrapping(Wrapping::None),
+                fit(&playlist.title).font(ui::font_medium()).color(ui::TEXT).lines(2),
                 text(format!("{} {}", playlist.count, tracks_word(playlist.count as usize))).size(13).color(ui::MUTED),
             ]
             .spacing(6)
@@ -5150,7 +5156,7 @@ impl App {
             0 => String::new(),
             n => format!("{n} {}", tracks_word(n)),
         };
-        let name = row![text("Мне нравится").size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None), text(count).color(ui::MUTED).wrapping(Wrapping::None)].spacing(12).align_y(Alignment::Center);
+        let name = row![fit("Мне нравится").size(36).font(ui::font_headline()).color(ui::TEXT).reserve(PLAYLIST_COUNT_RESERVE).no_tip(), text(count).color(ui::MUTED).wrapping(Wrapping::None)].spacing(12).align_y(Alignment::Center);
         let title = row![
             glow(button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0),
             container(name).width(Length::Fill).clip(true),
@@ -5178,7 +5184,7 @@ impl App {
                 return self.view_album(playlist);
             }
             let name = row![
-                text(&playlist.title).size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None),
+                fit(&playlist.title).size(36).font(ui::font_headline()).color(ui::TEXT).reserve(PLAYLIST_COUNT_RESERVE),
                 text(if self.playlist_tracks.is_empty() { String::new() } else { format!("{} {}", playlist.count, tracks_word(playlist.count as usize)) }).color(ui::MUTED).wrapping(Wrapping::None),
             ]
             .spacing(12)
@@ -5241,7 +5247,7 @@ impl App {
             let clear = shine(button(text("Очистить историю").size(14)).padding([6, 14]).style(ui::secondary).on_press(Message::SearchHistoryClear), 18.0);
             let head = row![text("Недавние запросы").size(24).font(ui::font_headline()).color(ui::TEXT), Space::new().width(Length::Fill), clear].align_y(Alignment::Center);
             let rows = self.searches.iter().fold(column![].spacing(2), |rows, query| {
-                let line = row![ui::icon(ui::SEARCH, 20.0, ui::MUTED), text(query).color(ui::TEXT).wrapping(Wrapping::None)].spacing(12).align_y(Alignment::Center);
+                let line = row![ui::icon(ui::SEARCH, 20.0, ui::MUTED), fit(query).color(ui::TEXT)].spacing(12).align_y(Alignment::Center);
                 rows.push(glow(button(line).width(Length::Fill).padding([10, 12]).style(ui::row).on_press(Message::SearchAgain(query.clone())), 8.0))
             });
             let history = column![container(head).padding(Padding::ZERO.right(SCROLLBAR)), ui::scroll(container(rows).padding(Padding::ZERO.right(SCROLLBAR))).width(Length::Fill).height(Length::Fill)].spacing(12);
@@ -5352,7 +5358,7 @@ impl App {
             }
             None => container(Space::new()).width(CARD).height(CARD).style(if round { ui::avatar } else { ui::tile }).into(),
         };
-        let body = column![cover, text(title).font(ui::font_medium()).color(ui::TEXT).wrapping(Wrapping::None), text(subtitle).size(13).color(ui::MUTED).wrapping(Wrapping::None)].spacing(6).width(CARD).clip(true);
+        let body = column![cover, fit(title).font(ui::font_medium()).color(ui::TEXT).lines(2), fit(subtitle).size(13).color(ui::MUTED)].spacing(6).width(CARD).clip(true);
         glow(button(body).padding(8).style(ui::card).on_press(Message::HomeOpen(item.clone())), 12.0)
     }
 
@@ -5367,7 +5373,7 @@ impl App {
     }
 
     /// Шапка альбома и исполнителя: обложка, название, подписи и кнопки.
-    fn page_header<'a>(&self, kicker: &'a str, title: String, cover_key: String, round: bool, links: Option<iced::widget::Row<'a, Message>>, about: String, actions: iced::widget::Row<'a, Message>) -> Element<'a, Message> {
+    fn page_header<'a>(&self, kicker: &'a str, title: String, cover_key: String, round: bool, links: Option<Element<'a, Message>>, about: String, actions: iced::widget::Row<'a, Message>) -> Element<'a, Message> {
         let side = if self.main_width() < PAGE_COVER_WIDTH { PAGE_COVER_SMALL } else { PAGE_COVER };
         let radius = if round { side / 2.0 } else { 8.0 };
         let cover: Element<'a, Message> = match self.covers.get(&cover_key) {
@@ -5375,11 +5381,11 @@ impl App {
             None => container(Space::new()).width(side).height(side).style(if round { ui::avatar } else { ui::tile }).into(),
         };
         let back = glow(button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0);
-        let mut info = column![text(kicker).size(14).color(ui::MUTED), text(title).size(40).font(ui::font_headline()).color(ui::WHITE).wrapping(Wrapping::None)].spacing(6).width(Length::Fill).clip(true);
+        let mut info = column![text(kicker).size(14).color(ui::MUTED), fit(title).size(40).font(ui::font_headline()).color(ui::WHITE)].spacing(6).width(Length::Fill).clip(true);
         if let Some(links) = links {
-            info = info.push(links.wrap());
+            info = info.push(links);
         }
-        let info = info.push(text(about).color(ui::MUTED).wrapping(Wrapping::None)).push(Space::new().height(8)).push(actions.wrap().vertical_spacing(8));
+        let info = info.push(fit(about).color(ui::MUTED)).push(Space::new().height(8)).push(actions.wrap().vertical_spacing(8));
         container(row![container(back).height(PAGE_COVER), cover, container(info).center_y(PAGE_HEADER - 8.0)].spacing(16)).height(PAGE_HEADER).width(Length::Fill).into()
     }
 
@@ -5483,7 +5489,7 @@ impl App {
                     Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle)).width(CARD).height(CARD).border_radius(if round { CARD / 2.0 } else { 8.0 }).into(),
                     None => container(Space::new()).width(CARD).height(CARD).style(if round { ui::avatar } else { ui::tile }).into(),
                 };
-                let body = column![cover, text(&card.title).font(ui::font_medium()).color(ui::TEXT).wrapping(Wrapping::None), text(&card.subtitle).size(13).color(ui::MUTED)].spacing(6).width(CARD).clip(true);
+                let body = column![cover, fit(&card.title).font(ui::font_medium()).color(ui::TEXT).lines(2), fit(&card.subtitle).size(13).color(ui::MUTED)].spacing(6).width(CARD).clip(true);
                 line.push(glow(button(body).padding(8).style(ui::card).on_press(open(card)), 12.0))
             })
             .wrap()
@@ -5671,16 +5677,16 @@ impl App {
         };
         let (title_color, names_color) = if track.unavailable { (ui::MUTED, FAINT) } else { (ui::WHITE, ui::MUTED) };
         let names: Element<'a, Message> = if let Some(published) = track.published.as_ref().filter(|_| track.remember) {
-            text(published).color(names_color).wrapping(Wrapping::None).into()
+            fit(published).color(names_color).into()
         } else if track.artist_list.is_empty() {
-            text(&track.artists).color(names_color).wrapping(Wrapping::None).into()
+            fit(&track.artists).color(names_color).into()
         } else {
             artist_links(&track.artist_list, 16.0, ui::font(), names_color).into()
         };
         let play = if track.unavailable { Message::Unavailable } else { play };
         let mut line = row![
             cover,
-            column![track_title(track, 16.0, ui::font_medium(), title_color), names].width(Length::Fill).clip(true),
+            column![track_title(track, 16.0, ui::font_medium(), title_color, false), names].width(Length::Fill).clip(true),
             self.like_button(track, 20.0),
         ]
         .spacing(12)
@@ -5834,7 +5840,7 @@ impl App {
             if self.starting {
                 text("Загрузка…").size(size).color(ui::MUTED.scale_alpha(alpha)).wrapping(Wrapping::None).into()
             } else if track.artist_list.is_empty() {
-                text(&track.artists).size(size).color(ui::MUTED.scale_alpha(alpha)).wrapping(Wrapping::None).into()
+                fit(&track.artists).size(size).color(ui::MUTED.scale_alpha(alpha)).marquee().into()
             } else {
                 artist_links(&track.artist_list, size, ui::font(), ui::MUTED.scale_alpha(alpha)).into()
             }
@@ -5842,7 +5848,7 @@ impl App {
         let cover = button(self.cover(track, BAR_COVER)).padding(0).style(ui::ghost).on_press(Message::FullToggle);
         let mut about = row![cover].spacing(12).align_y(Alignment::Center);
         if !stacked {
-            about = about.push(column![track_title(track, 16.0, ui::font_medium(), ui::WHITE), names(16.0, 1.0)].width(Length::Fill).clip(true));
+            about = about.push(column![track_title(track, 16.0, ui::font_medium(), ui::WHITE, true), names(16.0, 1.0)].width(Length::Fill).clip(true));
         }
         about = about.push(self.like_button(track, 22.0)).push(self.more_button(track, 20.0));
         let about = mouse_area(container(about).width(zone).clip(true)).on_right_press(Message::MenuOpen(track.clone()));
@@ -5878,7 +5884,7 @@ impl App {
         let shown = anim::ease_out(self.bar_top);
         let top: Element<'_, Message> = if self.bar_top > 0.0 {
             let line = row![
-                track_title(track, BAR_TOP_SIZE, ui::font_medium(), ui::WHITE.scale_alpha(shown)),
+                track_title(track, BAR_TOP_SIZE, ui::font_medium(), ui::WHITE.scale_alpha(shown), true),
                 text("·").size(BAR_TOP_SIZE).color(ui::MUTED.scale_alpha(shown)),
                 names(BAR_TOP_SIZE, shown),
             ]
@@ -6003,8 +6009,11 @@ fn queue_key(tracks: &[Track], title: &str) -> u64 {
 }
 
 /// Название трека. Есть альбом — ведёт к нему.
-fn track_title<'a>(track: &'a Track, size: f32, font: iced::Font, color: iced::Color) -> Element<'a, Message> {
-    let label = text(&track.title).size(size).font(font).wrapping(Wrapping::None);
+/// Название трека: не влезет — многоточие и полный текст в подсказке, а у играющего
+/// (`marquee`) бегущая строка при наведении.
+fn track_title<'a>(track: &'a Track, size: f32, font: iced::Font, color: iced::Color, marquee: bool) -> Element<'a, Message> {
+    let label = fit(&track.title).size(size).font(font).reserve(if track.explicit { EXPLICIT_RESERVE } else { 0.0 });
+    let label = if marquee { label.marquee() } else { label };
     let title: Element<'a, Message> = if track.album.is_some() {
         hover_line(label, color, if color == ui::ACCENT { ui::WHITE } else { ui::ACCENT }, Message::OpenAlbum(track.clone())).into()
     } else {
@@ -6104,16 +6113,18 @@ fn pick_artist(artists: &[Card], name: &str) -> Option<String> {
 }
 
 /// Все исполнители через запятую, каждый ведёт на свою страницу.
-fn artist_links<'a>(artists: &[(String, String)], size: f32, font: iced::Font, comma: iced::Color) -> iced::widget::Row<'a, Message> {
-    artists.iter().enumerate().fold(row![], |line, (index, (name, id))| {
-        let label = if index + 1 < artists.len() { format!("{name},") } else { name.clone() };
-        let line = line.push(hover_line(text(label).size(size).font(font).wrapping(Wrapping::None), comma, ui::WHITE, artist_message(name, id)));
-        if index + 1 < artists.len() {
-            line.push(text(" ").size(size).color(comma))
-        } else {
-            line
-        }
-    })
+/// Исполнители ссылками через запятую. Кто не влез, не показывается: в конце многоточие.
+fn artist_links<'a>(artists: &[(String, String)], size: f32, font: iced::Font, comma: iced::Color) -> Element<'a, Message> {
+    let items = artists
+        .iter()
+        .enumerate()
+        .map(|(index, (name, id))| {
+            // Пробел после запятой — часть ссылки: так ряд режется только целыми именами.
+            let label = if index + 1 < artists.len() { format!("{name}, ") } else { name.clone() };
+            hover_line(text(label).size(size).font(font).wrapping(Wrapping::None), comma, ui::WHITE, artist_message(name, id)).into()
+        })
+        .collect();
+    fit_row(items, size, font, comma).into()
 }
 
 /// Заглушка строки, пока трек не загружен.

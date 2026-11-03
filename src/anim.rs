@@ -386,7 +386,9 @@ impl Widget<Message, Theme, Renderer> for HoverLine<'_> {
         self.content.as_widget_mut().layout(&mut tree.children[0], renderer, limits)
     }
 
-    fn update(&mut self, tree: &mut Tree, event: &Event, layout: Layout<'_>, cursor: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+    fn update(&mut self, tree: &mut Tree, event: &Event, layout: Layout<'_>, cursor: mouse::Cursor, renderer: &Renderer, clipboard: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, viewport: &Rectangle) {
+        // Внутри может быть подсказка или бегущая строка: им тоже нужно знать о курсоре.
+        self.content.as_widget_mut().update(&mut tree.children[0], event, layout, cursor, renderer, clipboard, shell, viewport);
         let state = tree.state.downcast_mut::<LineState>();
         let hovered = cursor.is_over(layout.bounds());
         match event {
@@ -434,6 +436,10 @@ impl Widget<Message, Theme, Renderer> for HoverLine<'_> {
         let mix = |from: f32, to: f32| from + (to - from) * level;
         let color = Color { r: mix(self.rest.r, self.hover.r), g: mix(self.rest.g, self.hover.g), b: mix(self.rest.b, self.hover.b), a: mix(self.rest.a, self.hover.a) };
         self.content.as_widget().draw(&tree.children[0], renderer, theme, &renderer::Style { text_color: color }, layout, cursor, viewport);
+    }
+
+    fn overlay<'b>(&'b mut self, tree: &'b mut Tree, layout: Layout<'b>, renderer: &Renderer, viewport: &Rectangle, translation: Vector) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(&mut tree.children[0], layout, renderer, viewport, translation)
     }
 }
 
