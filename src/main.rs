@@ -3995,7 +3995,8 @@ impl App {
                 }
             }
             Message::SeekBy(step) => {
-                let Some(end) = self.current_track().map(|track| track.duration.as_secs_f32()).filter(|_| self.active) else { return Task::none() };
+                let Some(end) = self.current_track().map(|track| track.duration.as_secs_f32()).filter(|_| self.active || self.resume.is_some()) else { return Task::none() };
+                // До первого запуска после перезапуска перемотка запоминает место: см. SeekDone.
                 let from = self.seeking.unwrap_or(self.position.as_secs_f32());
                 self.seeking = Some((from + step).clamp(0.0, (end - 1.0).max(0.0)));
                 return self.update(Message::SeekDone);
@@ -6388,6 +6389,28 @@ fn smoke_crossfade(query: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Проверка без окна: перемотка на паузе сдвигает место и не снимает паузу.
+fn smoke_pause_seek(query: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let track = api::search(query, &token)?.into_iter().next().ok_or("Ничего не нашлось")?;
+    let player = Player::new()?;
+    player.set_volume(0.0);
+    let generation = player.stop();
+    player.play(generation, &api::file_info(&track.id, Quality::Normal.code(), &token)?)?;
+    std::thread::sleep(Duration::from_secs(2));
+    player.toggle();
+    println!("Пауза: {}, место {:?}", player.is_paused(), player.position());
+    for step in [15.0, 30.0, 10.0] {
+        player.seek(Duration::from_secs_f32(step))?;
+        std::thread::sleep(Duration::from_millis(500));
+        println!("Перемотка на {step} с: место {:?}, пауза {}", player.position(), player.is_paused());
+    }
+    player.toggle();
+    std::thread::sleep(Duration::from_secs(1));
+    println!("После снятия паузы: место {:?}", player.position());
+    Ok(())
+}
+
 /// Проверка без окна: лайки, волна и её обратная связь. Лайк ставится и сразу снимается,
 /// список «Мне нравится» остаётся прежним; из обратной связи волне уходит только запуск.
 fn smoke_library(query: &str) -> Result<(), String> {
@@ -6491,7 +6514,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -6503,6 +6526,7 @@ fn main() -> iced::Result {
             "--smoke-crossfade" => smoke_crossfade(query),
             "--smoke-move" => smoke_move(query),
             "--smoke-cover" => smoke_cover(),
+            "--smoke-pause-seek" => smoke_pause_seek(query),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
