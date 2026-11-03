@@ -41,6 +41,7 @@ pub fn track_value(track: &Track) -> Value {
         "progress": track.progress,
         "published": track.published,
         "finished": track.finished,
+        "plusOnly": track.plus_only,
         "fade": track.fade.map(|fade| json!({ "inStart": fade.in_start, "inStop": fade.in_stop, "outStart": fade.out_start, "outStop": fade.out_stop })),
     })
 }
@@ -64,6 +65,7 @@ pub fn track_from(v: &Value) -> Option<Track> {
         progress: v["progress"].as_f64().map(|x| x as f32),
         published: v["published"].as_str().map(str::to_string),
         finished: v["finished"].as_bool().unwrap_or(false),
+        plus_only: v["plusOnly"].as_bool().unwrap_or(false),
     })
 }
 
@@ -165,6 +167,7 @@ mod tests {
             progress: None,
             published: None,
             finished: false,
+            plus_only: true,
         }
     }
 

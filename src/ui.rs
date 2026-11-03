@@ -113,6 +113,8 @@ pub fn c() -> &'static Colors {
 
 /// Загружены ли шрифты Яндекса; если нет, используется системный.
 pub static YANDEX_FONTS: AtomicBool = AtomicBool::new(false);
+/// У аккаунта есть Плюс: тогда значки «целиком с Плюсом» у треков не нужны. До ответа сервера считается, что есть.
+pub static HAS_PLUS: AtomicBool = AtomicBool::new(true);
 
 fn text_family() -> &'static str {
     if YANDEX_FONTS.load(Ordering::Relaxed) { "YS Text" } else { "Segoe UI" }

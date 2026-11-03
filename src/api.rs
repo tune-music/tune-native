@@ -53,6 +53,8 @@ pub struct Track {
     pub published: Option<String>,
     /// Выпуск или глава дослушаны или отмечены прослушанными: место тогда сброшено в начало.
     pub finished: bool,
+    /// Без подписки играет только отрывок: в оригинале у таких треков значок Плюса.
+    pub plus_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -403,6 +405,7 @@ fn parse_track(v: &Value) -> Option<Track> {
         lyrics: v["lyricsInfo"]["hasAvailableSyncLyrics"].as_bool() == Some(true) || v["lyricsInfo"]["hasAvailableTextLyrics"].as_bool() == Some(true),
         batch: None,
         unavailable: v["available"].as_bool() == Some(false),
+        plus_only: v["availableFullWithoutPermission"].as_bool() == Some(false),
         // Как в оригинале: переход только между музыкальными треками, не подкастами и книгами.
         fade: Fade::parse(&v["fade"]).filter(|_| v["type"].as_str() == Some("music")),
         remember: v["rememberPosition"].as_bool() == Some(true),

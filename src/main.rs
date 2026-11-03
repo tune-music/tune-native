@@ -219,6 +219,8 @@ const CARD_SLOT: f32 = CARD + CARD_PAD * 2.0 + CARD_GAP;
 const TRACK_TIME_WIDTH: f32 = 520.0;
 /// Место под значок «E» после названия: сам значок и отступ.
 const EXPLICIT_RESERVE: f32 = 22.0;
+/// Место под значок Плюса после названия.
+const PLUS_RESERVE: f32 = 46.0;
 /// Как часто без сети проверять, не вернулась ли она.
 const ONLINE_CHECK: Duration = Duration::from_secs(10);
 /// Место под «123 трека» после названия плейлиста.
@@ -2706,6 +2708,7 @@ impl App {
                 }
                 self.disliked = disliked.into_iter().collect();
                 self.uid = Some(profile.uid.clone());
+                ui::HAS_PLUS.store(profile.plus, Ordering::Relaxed);
                 self.profile = Some(profile);
                 self.liked_set = ids.iter().cloned().collect();
                 self.liked_ids = ids;
@@ -6939,18 +6942,26 @@ fn queue_key(tracks: &[Track], title: &str) -> u64 {
 /// Название трека: не влезет — многоточие и полный текст в подсказке, а у играющего
 /// (`marquee`) бегущая строка при наведении.
 fn track_title<'a>(track: &'a Track, size: f32, font: iced::Font, color: iced::Color, marquee: bool) -> Element<'a, Message> {
-    let label = fit(&track.title).size(size).font(font).reserve(if track.explicit { EXPLICIT_RESERVE } else { 0.0 });
+    let plus = if track.plus_only && !ui::HAS_PLUS.load(Ordering::Relaxed) { PLUS_RESERVE } else { 0.0 };
+    let label = fit(&track.title).size(size).font(font).reserve(if track.explicit { EXPLICIT_RESERVE } else { 0.0 } + plus);
     let label = if marquee { label.marquee() } else { label };
     let title: Element<'a, Message> = if track.album.is_some() {
         hover_line(label, color, if color == ui::c().accent { ui::c().strong } else { ui::c().accent }, Message::OpenAlbum(track.clone())).into()
     } else {
         label.color(color).into()
     };
-    if !track.explicit {
+    let plus = track.plus_only && !ui::HAS_PLUS.load(Ordering::Relaxed);
+    if !track.explicit && !plus {
         return title;
     }
-    let badge = container(text("E").size(11).font(ui::font_medium()).color(ui::c().strong)).center(16).style(ui::explicit);
-    row![title, badge].spacing(6).align_y(Alignment::Center).into()
+    let mut line = row![title].spacing(6).align_y(Alignment::Center);
+    if track.explicit {
+        line = line.push(container(text("E").size(11).font(ui::font_medium()).color(ui::c().strong)).center(16).style(ui::explicit));
+    }
+    if plus {
+        line = line.push(hint(container(text("Плюс").size(11).font(ui::font_medium())).padding([1, 6]).style(ui::plus), "Целиком — с Плюсом"));
+    }
+    line.into()
 }
 
 /// Страницы, которые возвращаются на прежнее место. У текста песни, очереди и волны своя прокрутка.
