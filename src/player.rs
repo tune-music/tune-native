@@ -14,6 +14,7 @@ use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink};
 use crate::api::FileInfo;
 use crate::crossfade::{FadeOut, Faded};
 use crate::equalizer::{EqSettings, Equalized, Shared};
+use crate::stretch::{Clock, Speed, Stretched};
 
 type Ctr128 = ctr::Ctr128BE<aes::Aes128>;
 type Ctr256 = ctr::Ctr128BE<aes::Aes256>;
@@ -201,6 +202,9 @@ pub struct Player {
     hold: Arc<AtomicBool>,
     /// Эквалайзер, через который идёт каждый трек.
     eq: Shared,
+    /// Скорость и место играющего трека: при ускорении счётчик вывода отстаёт от трека.
+    speed: Speed,
+    clock: Arc<Mutex<Option<Clock>>>,
     _device: Arc<SendDevice>,
 }
 
@@ -226,6 +230,8 @@ impl Player {
             generation: Arc::default(),
             hold: Arc::default(),
             eq: Shared::default(),
+            speed: Speed::default(),
+            clock: Arc::default(),
             _device: Arc::new(SendDevice(device)),
         })
     }
@@ -348,7 +354,9 @@ impl Player {
         let fade_out = FadeOut::default();
         *self.fade_out.lock().unwrap() = Some(fade_out.clone());
         let output = self.output();
-        output.append(Faded::new(Equalized::new(decoder, self.eq.clone()), fade_in, fade_out));
+        let clock = Clock::default();
+        *self.clock.lock().unwrap() = Some(clock.clone());
+        output.append(Stretched::new(Faded::new(Equalized::new(decoder, self.eq.clone()), fade_in, fade_out), self.speed.clone(), clock));
         // Если переход начинается не с нуля, новый трек сразу встаёт на свою точку.
         if let Some((start, _)) = fade_in.filter(|(start, _)| *start > 0.05) {
             let _ = output.try_seek(Duration::from_secs_f32(start));
@@ -391,7 +399,15 @@ impl Player {
     }
 
     pub fn position(&self) -> Duration {
-        self.output().get_pos()
+        match self.clock.lock().unwrap().as_ref() {
+            Some(clock) if !self.output().empty() => clock.get(),
+            _ => self.output().get_pos(),
+        }
+    }
+
+    /// Скорость слышна сразу, в том числе в играющем треке; высота голоса не меняется.
+    pub fn set_speed(&self, speed: f32) {
+        self.speed.set(speed);
     }
 
     /// Новые настройки эквалайзера слышны сразу, в том числе в играющем треке.

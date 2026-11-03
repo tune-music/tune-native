@@ -12,6 +12,7 @@ mod session;
 mod crossfade;
 mod fit;
 mod offline;
+mod stretch;
 use fit::{fit, fit_row};
 mod pick;
 mod equalizer;
@@ -62,6 +63,8 @@ const BAR_TOP_VOLUME_ICON: f32 = 16.0;
 const BAR_TOP_SLIDER: f32 = 90.0;
 const BAR_TOP_FADE: f32 = 0.2;
 const BAR_TOOL: f32 = 30.0;
+/// Кнопка скорости шире значков: в ней «1,75×».
+const SPEED_TOOL: f32 = 52.0;
 const BAR_VOLUME_ICON: f32 = 32.0;
 const BAR_SLIDER_MIN: f32 = 30.0;
 const BAR_SLIDER_MAX: f32 = 110.0;
@@ -490,6 +493,8 @@ enum Preview {
     SearchTabs(usize),
     /// Поиск сразу во вкладке: подкасты, книги, волны.
     SearchIn(SearchTab, &'static str),
+    /// Выпуск подкаста в трекбаре на скорости 1,5×.
+    Speed,
     /// Поиск набирает запрос по буквам и пишет в stderr, где фокус.
     SearchFocus,
     /// Лайки прокручиваются, открывается главная и снова лайки: в stderr — где прокрутка.
@@ -659,6 +664,8 @@ struct App {
     crossfade: bool,
     /// Показывать пункт «Детям» в боковой панели.
     kids: bool,
+    /// Скорость подкастов и книг.
+    speed: f32,
     /// Следующий запуск — переход: где затихает играющий трек.
     cross_out: Option<(f32, f32)>,
     /// Что играет: смена раздела и новый поиск не прерывают музыку.
@@ -960,6 +967,8 @@ enum Message {
     DownloadLikes,
     LikesForDownload(Result<Vec<Track>, String>),
     KidsToggle,
+    /// Следующая скорость подкаста или книги по кругу.
+    SpeedNext,
     EqToggle,
     EqPreset(usize),
     EqBand(usize, f32),
@@ -1134,6 +1143,7 @@ impl App {
             eq: saved.eq,
             crossfade: saved.crossfade,
             kids: saved.kids,
+            speed: saved.speed,
             cross_out: None,
             sound: None,
             restart: None,
@@ -1288,6 +1298,13 @@ impl App {
         }
     }
 
+    /// Ускоряются только выпуски и книги: музыка всегда звучит как есть.
+    fn apply_speed(&self) {
+        if let Some(p) = &self.player {
+            p.set_speed(if self.current_track().is_some_and(|track| track.remember) { self.speed } else { 1.0 });
+        }
+    }
+
     fn apply_volume(&self) {
         if let Some(p) = &self.player {
             p.set_volume(if self.muted { 0.0 } else { self.volume });
@@ -1295,7 +1312,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, kids: self.kids });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, kids: self.kids, speed: self.speed });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -1973,6 +1990,7 @@ impl App {
             (Some(out), Some(fade)) if restart.is_none() && resume.is_none() => player.crossfade(out, (fade.in_start, fade.in_stop)),
             _ => player.stop(),
         };
+        player.set_speed(if track.remember { self.speed } else { 1.0 });
         self.play_id = generation;
         self.current = Some(index);
         self.active = false;
@@ -2564,6 +2582,13 @@ impl App {
                         self.query = "Queen".to_string();
                         self.update(Message::Search)
                     }
+                    Some(Preview::Speed) => {
+                        self.section = Section::Search;
+                        self.search_tab = SearchTab::Podcasts;
+                        self.speed = 1.5;
+                        self.query = "гарри поттер".to_string();
+                        self.update(Message::Search)
+                    }
                     Some(Preview::SearchIn(tab, query)) => {
                         self.preview = None;
                         self.section = Section::Search;
@@ -3130,7 +3155,7 @@ impl App {
                         self.search_cache.insert((text, tab), found.clone());
                         let covers = self.search_show(found);
                         match self.preview.take() {
-                            Some(Preview::Search(_)) => {
+                            Some(Preview::Search(_) | Preview::Speed) => {
                                 self.queue = self.results.clone();
                                 self.current = Some(0).filter(|_| !self.queue.is_empty());
                             }
@@ -4124,6 +4149,12 @@ impl App {
                 self.kids = !self.kids;
                 self.save_settings();
             }
+            Message::SpeedNext => {
+                let at = settings::SPEEDS.iter().position(|&speed| speed == self.speed).unwrap_or(0);
+                self.speed = settings::SPEEDS[(at + 1) % settings::SPEEDS.len()];
+                self.apply_speed();
+                self.save_settings();
+            }
             Message::EqOpen => self.eq_menu = Some(eq_place(*CURSOR.lock().unwrap())),
             Message::EqToggle => {
                 self.eq.enabled = !self.eq.enabled;
@@ -5055,6 +5086,11 @@ impl App {
         if quality {
             tools = tools.push(tool(ui::EQUALIZER, self.eq.enabled, Message::EqOpen));
             tools = tools.push(tool(ui::TUNE, self.quality == Quality::Lossless, Message::QualityOpen));
+        }
+        if quality && self.current_track().is_some_and(|track| track.remember) {
+            let label = format!("{}×", speed_label(self.speed));
+            let face = container(text(label).size(14).font(ui::font_medium()).color(if self.speed == 1.0 { ui::MUTED } else { ui::ACCENT })).center_y(size).width(SPEED_TOOL - 8.0).align_x(Alignment::Center);
+            tools = tools.push(glow(button(face).padding(4).style(ui::ghost).on_press(Message::SpeedNext), 20.0));
         }
         if self.current_track().is_some_and(|track| track.lyrics) {
             tools = tools.push(tool(ui::LYRICS, self.section == Section::Lyrics, Message::LyricsToggle));
@@ -6269,7 +6305,8 @@ impl App {
         }
 
         let lyrics = if track.lyrics { BAR_TOOL + 6.0 } else { 0.0 };
-        let tools = lyrics + 3.0 * BAR_TOOL + 12.0;
+        let speed = if track.remember { SPEED_TOOL + 6.0 } else { 0.0 };
+        let tools = lyrics + speed + 3.0 * BAR_TOOL + 12.0;
         let slider_room = (zone - tools - BAR_VOLUME_ICON - 14.0).clamp(BAR_SLIDER_MIN, BAR_SLIDER_MAX);
         let mut right = row![self.view_tools(22.0, true)].spacing(8).align_y(Alignment::Center);
         // В узком окне громкость уезжает наверх вместе с названием: внизу ей не хватает места.
@@ -6429,6 +6466,11 @@ fn track_title<'a>(track: &'a Track, size: f32, font: iced::Font, color: iced::C
 /// Страницы, которые возвращаются на прежнее место. У текста песни, очереди и волны своя прокрутка.
 fn remembers_scroll(section: Section) -> bool {
     !matches!(section, Section::Lyrics | Section::Queue | Section::Wave)
+}
+
+/// «1», «1,25», «1,5»: как пишет оригинал, с запятой.
+fn speed_label(speed: f32) -> String {
+    format!("{speed}").replace('.', ",")
 }
 
 fn home_item_key(item: &HomeItem) -> String {
@@ -7148,6 +7190,36 @@ fn smoke_pause_seek(query: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Скорость выпуска: за секунду на 1,5× трек должен уходить на полторы секунды вперёд,
+/// и после перемотки тоже.
+fn smoke_speed(query: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let found = api::search_mixed(query, SearchTab::Podcasts.types(), SearchTab::Podcasts.filter(), SEARCH_TAB, &token)?;
+    let track = found.tracks.into_iter().next().ok_or("Выпусков не нашлось")?;
+    println!("Выпуск: {}", track.title);
+    let player = Player::new()?;
+    player.set_volume(0.0);
+    let generation = player.stop();
+    player.set_speed(1.5);
+    player.play(generation, &api::file_info(&track.id, Quality::Normal.code(), &token)?)?;
+    std::thread::sleep(Duration::from_secs(1));
+    let (from, clock) = (player.position(), Instant::now());
+    std::thread::sleep(Duration::from_secs(4));
+    println!("1,5×: за {:.1} с трека прошло {:.2} с", clock.elapsed().as_secs_f32(), (player.position() - from).as_secs_f32());
+    player.seek(Duration::from_secs(60))?;
+    std::thread::sleep(Duration::from_secs(2));
+    println!("После перемотки на 60 с через 2 с: место {:.2} с", player.position().as_secs_f32());
+    player.set_speed(1.0);
+    let (from, clock) = (player.position(), Instant::now());
+    std::thread::sleep(Duration::from_secs(3));
+    println!("1×: за {:.1} с трека прошло {:.2} с", clock.elapsed().as_secs_f32(), (player.position() - from).as_secs_f32());
+    player.set_speed(2.0);
+    let (from, clock) = (player.position(), Instant::now());
+    std::thread::sleep(Duration::from_secs(3));
+    println!("2×: за {:.1} с трека прошло {:.2} с", clock.elapsed().as_secs_f32(), (player.position() - from).as_secs_f32());
+    Ok(())
+}
+
 /// Проверка без окна: лайки, волна и её обратная связь. Лайк ставится и сразу снимается,
 /// список «Мне нравится» остаётся прежним; из обратной связи волне уходит только запуск.
 fn smoke_library(query: &str) -> Result<(), String> {
@@ -7251,7 +7323,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-download" || flag == "--smoke-offline" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-download" || flag == "--smoke-offline" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -7264,6 +7336,7 @@ fn main() -> iced::Result {
             "--smoke-move" => smoke_move(query),
             "--smoke-cover" => smoke_cover(),
             "--smoke-pause-seek" => smoke_pause_seek(query),
+            "--smoke-speed" => smoke_speed(query),
             "--smoke-download" => smoke_download(query),
             "--smoke-offline" => smoke_offline(query),
                 _ => smoke_quality(query),
@@ -7322,6 +7395,7 @@ fn main() -> iced::Result {
             "search-podcasts" => Preview::SearchIn(SearchTab::Podcasts, "история"),
             "search-books" => Preview::SearchIn(SearchTab::Books, "гарри поттер"),
             "search-waves" => Preview::SearchIn(SearchTab::Waves, "рок"),
+            "speed" => Preview::Speed,
             "search-focus" => Preview::SearchFocus,
             "scroll-return" => Preview::ScrollReturn,
             "full" => Preview::Full,
