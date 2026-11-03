@@ -485,6 +485,10 @@ enum Preview {
     Artist(String),
     /// Исполнитель, прокрученный до описания.
     ArtistAbout(String),
+    /// Страница исполнителя с открытым меню «…».
+    ArtistMenu(String),
+    /// Страница дизлайков на вкладке исполнителей.
+    DislikedArtists,
     /// Микс по тегу.
     Tag(String),
     /// Пустой поиск с недавними запросами; в файл они не пишутся.
@@ -576,6 +580,9 @@ struct App {
     search_cache: HashMap<(String, SearchTab), Found>,
     liked_albums: Vec<Card>,
     liked_artists: Vec<Card>,
+    /// Исполнители с дизлайком и открыта ли их вкладка на странице дизлайков.
+    disliked_artists: Vec<Card>,
+    dislikes_artists: bool,
     searching: bool,
     search_id: u64,
     uid: Option<String>,
@@ -826,7 +833,12 @@ enum Message {
     HomeBlockTab(usize, usize),
     HomePlay(usize, usize),
     HomeOpen(HomeItem),
-    LikedPages(Result<(Vec<Card>, Vec<Card>), String>),
+    LikedPages(Result<(Vec<Card>, Vec<Card>, Vec<Card>), String>),
+    /// Дизлайк исполнителя на открытой странице или его снятие.
+    ArtistDislike,
+    ArtistDisliked(bool, Result<(), String>),
+    /// Вкладка страницы дизлайков: треки или исполнители.
+    DislikesTab(bool),
     AlbumLike,
     /// Порядок выпусков (сначала старые) и выбор сезона на странице подкаста.
     EpisodesOrder(bool),
@@ -1058,6 +1070,8 @@ impl App {
             search_cache: HashMap::new(),
             liked_albums: Vec::new(),
             liked_artists: Vec::new(),
+            disliked_artists: Vec::new(),
+            dislikes_artists: false,
             searching: false,
             search_id: 0,
             uid: None,
@@ -1601,7 +1615,7 @@ impl App {
         let mut cards: HashSet<String> = HashSet::new();
         let page = self.artist.as_ref();
         cards.extend(self.liked_albums.iter().chain(&self.found.albums).chain(page.into_iter().flat_map(|a| a.albums.iter().chain(&a.also))).map(|c| format!("{ALBUM_COVER}{}", c.id)));
-        cards.extend(self.liked_artists.iter().chain(&self.found.artists).chain(page.into_iter().flat_map(|a| &a.similar)).map(|c| format!("{ARTIST_COVER}{}", c.id)));
+        cards.extend(self.liked_artists.iter().chain(&self.disliked_artists).chain(&self.found.artists).chain(page.into_iter().flat_map(|a| &a.similar)).map(|c| format!("{ARTIST_COVER}{}", c.id)));
         cards.extend(self.home.blocks.iter().enumerate().flat_map(|(index, block)| block.items[self.home_shown(index, block)].iter()).map(home_item_key));
         cards.extend(self.album.iter().map(|a| format!("{ALBUM_COVER}{}", a.id)));
         let album_cards = self.album.iter().flat_map(|a| &a.versions).chain(&self.album_others).chain(&self.discography);
@@ -1693,7 +1707,13 @@ impl App {
             vec![(ui::PIN, if pinned { "Открепить" } else { "Закрепить" }.to_string(), Message::Pin(target), false), (ui::LINK, "Скопировать ссылку".to_string(), Message::CopyText(link), false)]
         };
         match self.section {
-            Section::Artist => self.artist.as_ref().map_or_else(Vec::new, |artist| link_and_pin(PinRef::Artist(artist.id.clone()), format!("https://music.yandex.ru/artist/{}", artist.id))),
+            Section::Artist => {
+                let Some(artist) = &self.artist else { return Vec::new() };
+                let mut items = link_and_pin(PinRef::Artist(artist.id.clone()), format!("https://music.yandex.ru/artist/{}", artist.id));
+                let disliked = self.disliked_artists.iter().any(|c| c.id == artist.id);
+                items.push((ui::DISLIKE, if disliked { "Убрать дизлайк" } else { "Не нравится" }.to_string(), Message::ArtistDislike, false));
+                items
+            }
             Section::Playlists => {
                 let Some(list) = &self.playlist else { return Vec::new() };
                 if list.source == Source::Album {
@@ -2625,7 +2645,12 @@ impl App {
                         self.update(Message::ArtistOpen(id))
                     }
                     // Подсказка снимается, когда исполнитель загрузится.
-                    Some(Preview::ArtistAbout(id) | Preview::Discography(id)) => self.update(Message::ArtistOpen(id)),
+                    Some(Preview::ArtistAbout(id) | Preview::Discography(id) | Preview::ArtistMenu(id)) => self.update(Message::ArtistOpen(id)),
+                    Some(Preview::DislikedArtists) => {
+                        self.preview = None;
+                        self.dislikes_artists = true;
+                        self.update(Message::Open(Section::Dislikes))
+                    }
                     Some(Preview::Filter(query)) => {
                         self.preview = None;
                         let page = self.update(Message::Open(Section::Likes));
@@ -3084,10 +3109,33 @@ impl App {
                 }
                 HomeItem::History { .. } => return self.update(Message::Open(Section::History)),
             },
-            Message::LikedPages(Ok((albums, artists))) => {
+            Message::LikedPages(Ok((albums, artists, disliked))) => {
                 self.liked_albums = albums;
                 self.liked_artists = artists;
-                return self.fetch_card_covers(self.liked_albums.iter(), self.liked_artists.iter(), &[]);
+                self.disliked_artists = disliked;
+                return self.fetch_card_covers(self.liked_albums.iter(), self.liked_artists.iter().chain(&self.disliked_artists), &[]);
+            }
+            Message::ArtistDislike => {
+                let (Some(uid), Some(token), Some(artist)) = (self.uid.clone(), self.token(), self.artist.clone()) else { return Task::none() };
+                let disliked = !self.disliked_artists.iter().any(|c| c.id == artist.id);
+                if disliked {
+                    self.disliked_artists.insert(0, Card { id: artist.id.clone(), title: artist.name.clone(), subtitle: "Исполнитель".to_string(), cover: artist.cover.clone() });
+                    self.liked_artists.retain(|c| c.id != artist.id);
+                } else {
+                    self.disliked_artists.retain(|c| c.id != artist.id);
+                }
+                return Task::perform(background(move || api::set_artist_disliked(&uid, &artist.id, disliked, &token)), move |r| Message::ArtistDisliked(disliked, r));
+            }
+            Message::ArtistDisliked(disliked, Ok(())) => {
+                let text = if disliked { "Исполнитель больше не появится в ваших рекомендациях" } else { "Теперь исполнитель будет появляться в ваших рекомендациях" };
+                return self.notify(text.to_string());
+            }
+            Message::ArtistDisliked(_, Err(e)) => return Task::batch([self.liked_pages_load(), self.fail(e)]),
+            Message::DislikesTab(artists) => {
+                self.dislikes_artists = artists;
+                if artists {
+                    return self.fetch_card_covers(std::iter::empty(), self.disliked_artists.iter(), &[]);
+                }
             }
             // Коллекция покажется без этих блоков; музыке это не мешает.
             Message::LikedPages(Err(_)) => {}
@@ -3133,6 +3181,7 @@ impl App {
                 let (Some(uid), Some(token), Some(artist)) = (self.uid.clone(), self.token(), self.artist.clone()) else { return Task::none() };
                 let liked = !self.liked_artists.iter().any(|c| c.id == artist.id);
                 if liked {
+                    self.disliked_artists.retain(|c| c.id != artist.id);
                     self.liked_artists.insert(0, Card { id: artist.id.clone(), title: artist.name.clone(), subtitle: "Исполнитель".to_string(), cover: artist.cover.clone() });
                 } else {
                     self.liked_artists.retain(|c| c.id != artist.id);
@@ -3265,6 +3314,11 @@ impl App {
                             Some(Preview::Discography(_)) => {
                                 self.preview = None;
                                 Task::batch([covers, self.handle(Message::DiscographyOpen(false))])
+                            }
+                            Some(Preview::ArtistMenu(_)) => {
+                                self.preview = None;
+                                self.page_menu = Some((640.0, 330.0));
+                                covers
                             }
                             Some(Preview::ArtistAbout(_)) => {
                                 self.preview = None;
@@ -4497,7 +4551,7 @@ impl App {
             Section::Discography => self.view_discography(),
             Section::Tag => self.view_tag(),
             Section::History => self.view_track_page("История", &self.history_tracks, "Здесь появятся треки, которые вы слушали", Section::History),
-            Section::Dislikes => self.view_track_page("Дизлайки", &self.disliked_list, "Здесь появятся треки, которые вам не понравились", Section::Dislikes),
+            Section::Dislikes => self.view_dislikes(),
             Section::Downloads => self.view_track_page("Скачанное", &self.download_tracks, "Скачайте треки через меню «…» — они будут играть и без интернета", Section::Downloads),
             Section::Wave => self.view_wave(),
             Section::Collection => self.view_collection(),
@@ -5326,6 +5380,29 @@ impl App {
             line = line.push(canvas(seek::Seek { value: shown, total: 1.0, on_change: Message::Volume, on_done: None }).width(width).height(SEEK_HEIGHT));
         }
         line.into()
+    }
+
+    /// Дизлайки: треки и исполнители на двух вкладках.
+    fn view_dislikes(&self) -> Element<'_, Message> {
+        let back = glow(button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0);
+        let title = row![back, text("Дизлайки").size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None)].spacing(12).align_y(Alignment::Center);
+        let chip = |label, artists: bool| shine(button(text(label)).padding([7, 16]).style(ui::chip(artists == self.dislikes_artists)).on_press(Message::DislikesTab(artists)), 18.0);
+        let tabs = row![chip("Треки", false), chip("Исполнители", true)].spacing(8);
+        let center: Element<'_, Message> = if self.dislikes_artists {
+            if self.disliked_artists.is_empty() {
+                placeholder("Пока пусто", Some("Здесь появятся исполнители, которые вам не нравятся"))
+            } else {
+                let cards = container(self.view_cards(&self.disliked_artists, ARTIST_COVER, true, open_artist)).padding(Padding::ZERO.right(SCROLLBAR));
+                ui::scroll(cards).width(Length::Fill).height(Length::Fill).into()
+            }
+        } else if !self.disliked_list.is_empty() {
+            self.view_list(Section::Dislikes, None)
+        } else if self.history_loading {
+            skeleton_list()
+        } else {
+            placeholder("Пока пусто", Some("Здесь появятся треки, которые вам не понравились"))
+        };
+        column![title, tabs, self.area(center)].spacing(16).height(Length::Fill).into()
     }
 
     fn view_track_page<'a>(&'a self, name: &'a str, tracks: &'a [Track], empty: &'a str, section: Section) -> Element<'a, Message> {
@@ -7190,6 +7267,23 @@ fn smoke_pause_seek(query: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Дизлайк исполнителя ставится и сразу снимается: список дизлайков остаётся прежним.
+fn smoke_artist_dislike(query: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let uid = api::profile(&token)?.uid;
+    let (_, liked, before) = api::liked_pages(&uid, &token)?;
+    let found = api::search_mixed(query, SearchTab::Artists.types(), None, ARTIST_SEARCH, &token)?;
+    let artist = found.artists.into_iter().find(|c| !liked.iter().chain(&before).any(|a| a.id == c.id)).ok_or("Нет исполнителя без лайка и дизлайка")?;
+    api::set_artist_disliked(&uid, &artist.id, true, &token)?;
+    let during = api::liked_pages(&uid, &token)?.2;
+    let card = during.iter().find(|a| a.id == artist.id);
+    println!("Дизлайк {}: в списке {}, имя «{}», обложка {}", artist.title, card.is_some(), card.map_or("", |c| c.title.as_str()), card.is_some_and(|c| c.cover.is_some()));
+    api::set_artist_disliked(&uid, &artist.id, false, &token)?;
+    let after = api::liked_pages(&uid, &token)?.2;
+    println!("Снялся: {}, список как был: {}", !after.iter().any(|a| a.id == artist.id), after.iter().map(|a| &a.id).eq(before.iter().map(|a| &a.id)));
+    Ok(())
+}
+
 /// Скорость выпуска: за секунду на 1,5× трек должен уходить на полторы секунды вперёд,
 /// и после перемотки тоже.
 fn smoke_speed(query: &str) -> Result<(), String> {
@@ -7240,7 +7334,7 @@ fn smoke_library(query: &str) -> Result<(), String> {
     api::set_liked(&uid, &track.id, false, &token)?;
     let after = api::liked_ids(&uid, &token)?;
     println!("Лайк появился: {added}, снялся: {}, список как был: {}", !after.contains(&track.id), after == ids);
-    let (albums, artists) = api::liked_pages(&uid, &token)?;
+    let (albums, artists, _) = api::liked_pages(&uid, &token)?;
     println!("Альбомов в коллекции: {}, исполнителей: {}", albums.len(), artists.len());
     let found = api::search_mixed(query, SearchTab::All.types(), None, SEARCH_ALL, &token)?;
     println!("Смешанный поиск: треков {}, альбомов {}, исполнителей {}, плейлистов {}", found.tracks.len(), found.albums.len(), found.artists.len(), found.playlists.len());
@@ -7323,7 +7417,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-download" || flag == "--smoke-offline" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -7337,6 +7431,7 @@ fn main() -> iced::Result {
             "--smoke-cover" => smoke_cover(),
             "--smoke-pause-seek" => smoke_pause_seek(query),
             "--smoke-speed" => smoke_speed(query),
+            "--smoke-artist-dislike" => smoke_artist_dislike(query),
             "--smoke-download" => smoke_download(query),
             "--smoke-offline" => smoke_offline(query),
                 _ => smoke_quality(query),
@@ -7387,6 +7482,8 @@ fn main() -> iced::Result {
             }
             what if what.starts_with("album:") => Preview::Album(what[6..].to_string()),
             what if what.starts_with("artist:") => Preview::Artist(what[7..].to_string()),
+            what if what.starts_with("artist-menu:") => Preview::ArtistMenu(what[12..].to_string()),
+            "disliked-artists" => Preview::DislikedArtists,
             what if what.starts_with("artist-about:") => Preview::ArtistAbout(what[13..].to_string()),
             what if what.starts_with("discography:") => Preview::Discography(what[12..].to_string()),
             what if what.starts_with("tag:") => Preview::Tag(what[4..].to_string()),

@@ -1036,11 +1036,20 @@ pub fn search_mixed(text: &str, types: &str, filter: Option<&str>, page_size: u3
     Ok(parse_found(result(&v)))
 }
 
-/// Альбомы и исполнители, которые нравятся пользователю.
-pub fn liked_pages(uid: &str, token: &str) -> Result<(Vec<Card>, Vec<Card>), String> {
+/// Альбомы и исполнители, которые нравятся пользователю, и исполнители с дизлайком.
+pub fn liked_pages(uid: &str, token: &str) -> Result<(Vec<Card>, Vec<Card>, Vec<Card>), String> {
     let albums = get(&format!("users/{uid}/likes/albums"), &[("rich", "true")], token)?;
     let artists = get(&format!("users/{uid}/likes/artists"), &[("with-timestamps", "false")], token)?;
-    Ok((parse_cards(result(&albums), |item| album_card(&item["album"])), parse_cards(result(&artists), artist_card)))
+    let disliked = get(&format!("users/{uid}/dislikes/artists"), &[], token)?;
+    // Исполнитель приходит то сам по себе, то внутри artist.
+    let artist = |item: &Value| artist_card(item).or_else(|| artist_card(&item["artist"]));
+    Ok((parse_cards(result(&albums), |item| album_card(&item["album"])), parse_cards(result(&artists), artist_card), parse_cards(result(&disliked), artist)))
+}
+
+/// Дизлайк исполнителя: он больше не появится в рекомендациях. Лайк с него Яндекс снимает сам.
+pub fn set_artist_disliked(uid: &str, id: &str, disliked: bool, token: &str) -> Result<(), String> {
+    let path = if disliked { format!("users/{uid}/dislikes/artists/add?artist-id={id}") } else { format!("users/{uid}/dislikes/artists/{id}/remove") };
+    post(&path, "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
 }
 
 /// `kind` — albums или artists, `param` — album-id или artist-id.
