@@ -1565,6 +1565,19 @@ pub fn move_in_playlist(uid: &str, kind: &str, track: &Track, from: usize, to: u
     change_playlist(uid, kind, &diff, state["revision"].as_u64().unwrap_or(0), token)
 }
 
+/// Переносит плейлист в коллекции, как оригинал (`change-position`). Место считается по списку
+/// с сервера: в окне могут быть не все плейлисты, а сдвиг тот же.
+pub fn move_playlist(uid: &str, kind: &str, from: usize, to: usize, token: &str) -> Result<(), String> {
+    let v = get(&format!("users/{uid}/playlists/list"), &[], token)?;
+    let kinds: Vec<String> = v["result"].as_array().into_iter().flatten().filter_map(|p| id_text(&p["kind"])).collect();
+    let at = kinds.iter().position(|k| k == kind).ok_or("Плейлиста уже нет")?;
+    let target = (at as isize + to as isize - from as isize).clamp(0, kinds.len() as isize - 1) as usize;
+    if target == at {
+        return Ok(());
+    }
+    post(&format!("users/{uid}/playlists/{kind}/change-position?from={at}&to={target}"), "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
+}
+
 pub fn remove_from_playlist(uid: &str, kind: &str, track: &Track, token: &str) -> Result<(), String> {
     let state = playlist_state(uid, kind, token)?;
     let position = state["tracks"].as_array().into_iter().flatten().position(|item| id_text(&item["track"]["id"]).or_else(|| id_text(&item["id"])).as_deref() == Some(track.id.as_str())).ok_or("Трека уже нет в плейлисте")?;

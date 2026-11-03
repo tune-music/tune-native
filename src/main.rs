@@ -119,6 +119,11 @@ const WAVE_HISTORY: usize = 50;
 const MAX_FAILURES: u32 = 3;
 /// Высота строки трека. Одинаковая у всех: по ней считается, какие строки видны.
 const ROW: f32 = 58.0;
+/// Полоса у края списка, где перетаскивание само прокручивает его, и скорость у самого края.
+const DRAG_EDGE: f32 = 64.0;
+/// Сверху списки начинаются под заголовком страницы.
+const DRAG_EDGE_TOP: f32 = 180.0;
+const DRAG_SCROLL_SPEED: f32 = 900.0;
 /// Как часто сверяется тема Windows, когда выбрано «Как в системе».
 const SYSTEM_LOOK_CHECK: Duration = Duration::from_secs(2);
 /// Сколько треков «Знакомо вам» видно на странице исполнителя; играют все.
@@ -368,6 +373,8 @@ const HOME_SHELF: &str = "home:";
 enum DragList {
     Queue,
     Playlist,
+    /// Свои плейлисты на странице «Плейлисты».
+    Lists,
 }
 
 /// Идёт перетаскивание: подписка ловит отпускание кнопки где угодно в окне.
@@ -1011,7 +1018,9 @@ enum Message {
     UndoExpire(u64),
     CoverUploaded(Playlist, Result<Option<Option<String>>, String>),
     DragStart(DragList, usize),
+    /// Курсор над строкой или карточкой: номер и место внутри неё по высоте или ширине.
     DragOver(usize, f32),
+    ListsMoved(Result<(), String>),
     DragEnd,
     TrackMoved(Result<(), String>),
     CrossfadeToggle,
@@ -1291,7 +1300,7 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        self.pin_fade.busy() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.eq_fade.busy() || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy()
+        self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.eq_fade.busy() || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy()
     }
 
     /// Сколько места занимает основная часть окна.
@@ -1984,7 +1993,31 @@ impl App {
                 self.playlist_tracks.insert(to, track.clone());
                 Task::perform(background(move || api::move_in_playlist(&uid, &playlist.kind, &track, from, to, &token)), Message::TrackMoved)
             }
+            DragList::Lists => {
+                let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
+                if from >= self.playlists.len() || to >= self.playlists.len() {
+                    return Task::none();
+                }
+                let list = self.playlists.remove(from);
+                self.playlists.insert(to, list.clone());
+                Task::perform(background(move || api::move_playlist(&uid, &list.kind, from, to, &token)), Message::ListsMoved)
+            }
         }
+    }
+
+    /// Карточка своего плейлиста: ручка в углу обложки, взятая карточка бледнеет,
+    /// место, куда она встанет, отмечено чертой сбоку.
+    fn drag_card<'a>(&self, card: Element<'a, Message>, index: usize) -> Element<'a, Message> {
+        let grip = mouse_area(container(ui::icon(ui::GRIP, 18.0, iced::Color::WHITE)).padding(4).style(ui::overlay)).on_press(Message::DragStart(DragList::Lists, index)).interaction(mouse::Interaction::Grab);
+        let grip = container(hint(grip, "Перетащить")).padding(CARD_PAD + 8.0);
+        let Some((_, from, over)) = self.drag.filter(|(dragged, _, _)| *dragged == DragList::Lists) else { return stack![card, grip].into() };
+        let card: Element<'a, Message> = if index == from { reveal(card).veil(ui::c().content.scale_alpha(0.6)).into() } else { card };
+        let mut layers = stack![mouse_area(card).on_move(move |point| Message::DragOver(index, point.x)), grip];
+        if let Some((_, after)) = over.filter(|(at, after)| *at == index && drop_index(from, *at, *after).is_some()) {
+            let line = container(Space::new()).width(3).height(Length::Fill).style(|_| container::Style::default().background(ui::c().accent));
+            layers = layers.push(container(line).width(Length::Fill).height(Length::Fill).align_x(if after { Alignment::End } else { Alignment::Start }));
+        }
+        layers.into()
     }
 
     /// За эту ручку строку перетаскивают.
@@ -2003,6 +2036,20 @@ impl App {
             layers = layers.push(container(line).height(ROW).align_y(if below { Alignment::End } else { Alignment::Start }));
         }
         layers.into()
+    }
+
+    /// Пока строку или карточку тащат у верхнего или нижнего края списка, он сам едет туда,
+    /// тем быстрее, чем ближе курсор к краю.
+    fn drag_scroll(&self, elapsed: f32) -> Task<Message> {
+        if self.drag.is_none() {
+            return Task::none();
+        }
+        let (_, y) = *CURSOR.lock().unwrap();
+        let (_, height) = *WINDOW.lock().unwrap();
+        let bottom = height - BAR_HEIGHT - 24.0;
+        let push = if y < DRAG_EDGE_TOP { -(DRAG_EDGE_TOP - y) } else if y > bottom - DRAG_EDGE { y - (bottom - DRAG_EDGE) } else { return Task::none() };
+        let step = (push / DRAG_EDGE).clamp(-1.0, 1.0) * DRAG_SCROLL_SPEED * elapsed;
+        operation::scroll_by(Id::new(LIST), scrollable::AbsoluteOffset { x: 0.0, y: step })
     }
 
     /// Отдаёт Яндексу место в играющем выпуске или книге и запоминает его до конца запуска.
@@ -2526,8 +2573,9 @@ impl App {
                 Task::none()
             };
             let queue = self.queue_scroll_step(elapsed);
+            let edge = self.drag_scroll(elapsed);
             self.last_frame = Some(now).filter(|_| self.animating());
-            return Task::batch([lyrics, queue, self.visible_covers()]);
+            return Task::batch([lyrics, queue, edge, self.visible_covers()]);
         }
         let place = self.list_place();
         let offset = self.list_offset;
@@ -4317,9 +4365,11 @@ impl App {
                 self.drag = Some((list, index, None));
                 DRAGGING.store(true, Ordering::Release);
             }
-            Message::DragOver(index, y) => {
+            Message::DragOver(index, at) => {
+                // Строки делятся пополам по высоте, карточки — по ширине.
+                let half = if matches!(self.drag, Some((DragList::Lists, _, _))) { self.card_side() / 2.0 + CARD_PAD } else { ROW / 2.0 };
                 if let Some((_, _, over)) = self.drag.as_mut() {
-                    *over = Some((index, y > ROW / 2.0));
+                    *over = Some((index, at > half));
                 }
             }
             Message::DragEnd => {
@@ -4327,6 +4377,11 @@ impl App {
                 let Some((list, from, Some((at, below)))) = self.drag.take() else { return Task::none() };
                 let Some(to) = drop_index(from, at, below) else { return Task::none() };
                 return self.move_track(list, from, to);
+            }
+            Message::ListsMoved(Ok(())) => {}
+            Message::ListsMoved(Err(e)) => {
+                self.playlists_loading = false;
+                return Task::batch([self.fail(e), self.playlists_load()]);
             }
             Message::TrackMoved(Ok(())) => {}
             Message::TrackMoved(Err(e)) => {
@@ -5879,10 +5934,6 @@ impl App {
         column![head, center].spacing(16).height(Length::Fill).into()
     }
 
-    fn view_playlist_cards<'a>(&self, playlists: &'a [Playlist]) -> Element<'a, Message> {
-        grid(self.playlist_cards(playlists))
-    }
-
     fn playlist_cards<'a>(&self, playlists: &[Playlist]) -> Vec<Element<'a, Message>> {
         playlists.iter().map(|playlist| self.playlist_card(playlist)).collect()
     }
@@ -6092,7 +6143,8 @@ impl App {
         let create = shine(button(row![ui::icon(ui::PLUS, 20.0, ui::c().text), text("Новый плейлист").color(ui::c().text)].spacing(6).align_y(Alignment::Center)).padding([6, 14]).style(ui::secondary).on_press(Message::DialogOpen(Dialog::Create)), 24.0);
         let title = row![back, text("Плейлисты").size(36).font(ui::font_headline()).color(ui::c().text), Space::new().width(Length::Fill), create].spacing(12).align_y(Alignment::Center);
         let center: Element<'_, Message> = if !self.playlists.is_empty() {
-            ui::scroll(container(self.view_playlist_cards(&self.playlists)).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
+            let cards = self.playlists.iter().enumerate().map(|(index, list)| self.drag_card(self.playlist_card(list), index)).collect();
+            ui::scroll(container(grid(cards)).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
         } else if self.playlists_loading || self.uid.is_none() {
             skeleton_cards(self.card_side())
         } else {
