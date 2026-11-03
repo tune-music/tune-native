@@ -202,6 +202,8 @@ const CARD_SLOT: f32 = CARD + 20.0;
 const TRACK_TIME_WIDTH: f32 = 520.0;
 /// Место под значок «E» после названия: сам значок и отступ.
 const EXPLICIT_RESERVE: f32 = 22.0;
+/// Как часто без сети проверять, не вернулась ли она.
+const ONLINE_CHECK: Duration = Duration::from_secs(10);
 /// Место под «123 трека» после названия плейлиста.
 const PLAYLIST_COUNT_RESERVE: f32 = 110.0;
 /// Ширина колонки времени: у музыки «03:25», у выпусков «осталось 1:47:20».
@@ -561,6 +563,9 @@ struct App {
     download_now: Option<String>,
     download_done: usize,
     download_failed: usize,
+    /// Нет сети: вместо ошибок спокойная плашка, играет только скачанное, связь проверяется сама.
+    offline: bool,
+    online_checking: bool,
     /// Сведения о треке для окна: номер трека и строки. Пока идёт загрузка, строк нет.
     track_info: Option<(String, api::TrackDetails)>,
     /// Поиск внутри открытого плейлиста или лайков.
@@ -907,6 +912,9 @@ enum Message {
     DragEnd,
     TrackMoved(Result<(), String>),
     CrossfadeToggle,
+    /// Проверка связи без сети и её итог.
+    OnlineCheck,
+    OnlineChecked(Result<(), String>),
     /// Скачать треки, итог одного трека, убрать скачанные по номерам, убрать всё.
     Download(Vec<Track>),
     Downloaded(String, Result<offline::Saved, String>),
@@ -1022,6 +1030,8 @@ impl App {
             download_now: None,
             download_done: 0,
             download_failed: 0,
+            offline: false,
+            online_checking: false,
             track_info: None,
             filter: String::new(),
             filter_tracks: Vec::new(),
@@ -1325,7 +1335,8 @@ impl App {
 
     fn fail_retry(&mut self, error: String, retry: Message) -> Task<Message> {
         let task = self.fail(error);
-        if self.error.is_some() {
+        // Без сети повтор запомнен и сработает сам, когда связь вернётся.
+        if self.error.is_some() || self.offline {
             self.retry = Some(retry);
         }
         task
@@ -1338,6 +1349,11 @@ impl App {
             self.reset();
             self.error = Some("Вход устарел, войдите ещё раз".into());
             return Task::done(Message::LoginOpen);
+        }
+        if api::network_error(&error) {
+            self.offline = true;
+            self.error = None;
+            return Task::none();
         }
         self.error = Some(error);
         Task::none()
@@ -1536,10 +1552,19 @@ impl App {
     }
 
     /// Отчёт о прослушивании уходит в фоне; ошибка на музыку не влияет.
+    /// Без сети отчёты откладываются на диск и уходят, когда связь вернётся.
     fn send_plays(&self, reports: Vec<serde_json::Value>) {
+        if self.offline {
+            offline::keep_plays(reports);
+            return;
+        }
         let Some(token) = self.token() else { return };
         std::thread::spawn(move || {
-            let _ = api::plays(reports, &token);
+            if let Err(e) = api::plays(reports.clone(), &token) {
+                if api::network_error(&e) {
+                    offline::keep_plays(reports);
+                }
+            }
         });
     }
 
@@ -1841,6 +1866,17 @@ impl App {
             return match (index + 1..self.queue.len()).find(|&i| !self.queue[i].unavailable) {
                 Some(next) => self.play(next),
                 None => self.notify(UNAVAILABLE.to_string()),
+            };
+        }
+        // Без сети звучит только скачанное: остальное в очереди пропускается.
+        if self.offline && self.queue.get(index).is_some_and(|track| !self.download_ids.contains(&track.id)) {
+            let saved = (index + 1..self.queue.len()).chain(0..index).find(|&i| self.download_ids.contains(&self.queue[i].id));
+            return match saved {
+                Some(next) => {
+                    let note = self.notify("Без интернета играет только скачанное".to_string());
+                    Task::batch([note, self.play(next)])
+                }
+                None => self.notify("Нет подключения к интернету, а в очереди нет скачанных треков".to_string()),
             };
         }
         let (Some(player), Some(token), Some(track)) = (self.player.clone(), self.token(), self.queue.get(index).cloned()) else {
@@ -2408,6 +2444,10 @@ impl App {
                 return Task::done(Message::LoginOpen);
             }
             Message::Account(Ok((profile, ids, disliked))) => {
+                offline::save_account(&profile, &ids, &disliked);
+                if let Some(token) = self.token().filter(|_| !self.offline) {
+                    offline::flush_plays(token);
+                }
                 self.disliked = disliked.into_iter().collect();
                 self.uid = Some(profile.uid.clone());
                 self.profile = Some(profile);
@@ -2744,7 +2784,42 @@ impl App {
                     return self.fail(format!("Не удалось открыть браузер: {e}"));
                 }
             }
+            // Без сети приложение открывается с аккаунтом прошлого запуска и сразу на скачанном.
+            Message::Account(Err(e)) if api::network_error(&e) && self.profile.is_none() => {
+                let Some(account) = offline::load_account() else { return self.fail_retry(e, Message::AccountRetry) };
+                self.offline = true;
+                let opened = self.update(Message::Account(Ok(account)));
+                self.offline = true;
+                self.retry = None;
+                let downloads = if self.downloads.is_empty() { Task::none() } else { self.update(Message::Open(Section::Downloads)) };
+                return Task::batch([opened, downloads]);
+            }
             Message::Account(Err(e)) => return self.fail_retry(e, Message::AccountRetry),
+            Message::OnlineCheck => {
+                let Some(token) = self.token().filter(|_| self.offline && !self.online_checking) else { return Task::none() };
+                self.online_checking = true;
+                return Task::perform(background(move || api::profile(&token).map(|_| ())), Message::OnlineChecked);
+            }
+            Message::OnlineChecked(result) => {
+                self.online_checking = false;
+                if result.is_err() || !self.offline {
+                    return Task::none();
+                }
+                self.offline = false;
+                if let Some(token) = self.token() {
+                    offline::flush_plays(token);
+                }
+                // Обложки, которые не загрузились без сети, можно просить снова.
+                let covers = &self.covers;
+                self.requested.borrow_mut().retain(|key| covers.contains_key(key));
+                let back = self.notify("Снова в сети".to_string());
+                let reload = match self.retry.take() {
+                    Some(retry) => self.update(retry),
+                    None if self.profile.is_none() => self.update(Message::AccountRetry),
+                    None => Task::none(),
+                };
+                return Task::batch([back, reload]);
+            }
             Message::AccountRetry => {
                 if let Some(token) = self.token() {
                     return load_account(token);
@@ -4265,7 +4340,8 @@ impl App {
             _ => Subscription::none(),
         };
         let frames = if self.animating() { window::frames().map(Message::Frame) } else { Subscription::none() };
-        Subscription::batch([ticks, frames]).pipe_media()
+        let online = if self.offline { time::every(ONLINE_CHECK).map(|_| Message::OnlineCheck) } else { Subscription::none() };
+        Subscription::batch([ticks, frames, online]).pipe_media()
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -4315,6 +4391,13 @@ impl App {
         let back = ui::CONTENT;
         let page: Element<'_, Message> = reveal(page).shift(self.page_shift.0 * rest, self.page_shift.1 * rest).veil(back.scale_alpha(rest)).into();
         let mut page = column![page].spacing(12).height(Length::Fill);
+        if self.offline {
+            let mut line = row![ui::icon(ui::OFFLINE, 20.0, ui::MUTED), text("Нет подключения к интернету. Скачанное слушать можно, остальное загрузится, когда связь вернётся").color(ui::TEXT).width(Length::Fill)].spacing(12).align_y(Alignment::Center);
+            if !self.downloads.is_empty() && self.section != Section::Downloads {
+                line = line.push(shine(button(text("Скачанное").color(ui::TEXT)).padding([6, 14]).style(ui::secondary).on_press(Message::Open(Section::Downloads)), 24.0));
+            }
+            page = page.push(container(line).width(Length::Fill).padding([10, 16]).style(ui::tile));
+        }
         if let Some(error) = &self.error {
             // Плашка с понятным текстом: подробности ошибки нужны только в журнале.
             let mut line = row![ui::icon(ui::INFO, 20.0, ui::DANGER), text(human_error(error)).color(ui::TEXT).width(Length::Fill)].spacing(12).align_y(Alignment::Center);
@@ -6157,8 +6240,7 @@ fn landing_title(section: Section) -> &'static str {
 /// остаётся в журнале, а на экране — что случилось и что делать.
 fn human_error(error: &str) -> String {
     const OFFLINE: &str = "Нет связи с Яндексом. Проверьте подключение к интернету";
-    let network = ["Не удалось связаться с Яндексом", "Не удалось получить файл трека", "Не удалось загрузить текст"];
-    if network.iter().any(|prefix| error.starts_with(prefix)) {
+    if api::network_error(error) {
         return OFFLINE.to_string();
     }
     match error.strip_prefix("Яндекс ответил ") {
@@ -6890,6 +6972,31 @@ fn smoke_download(query: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Проверка отложенных отчётов: `keep` — без сети отчёт о скачанном треке ложится на диск,
+/// `flush` — с сетью уходит.
+fn smoke_offline(step: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    if step == "flush" {
+        println!("Ждут отправки: {}", offline::plays_waiting());
+        offline::flush_plays(token);
+        std::thread::sleep(Duration::from_secs(4));
+        println!("После отправки ждут: {}", offline::plays_waiting());
+        return Ok(());
+    }
+    let saved = offline::load().into_iter().next().ok_or("Сначала скачайте трек")?;
+    let mut listen = api::Listen::new(&saved.track, "desktop-downloads_screen-default".into(), "other", None);
+    listen.started = Some(api::now_stamp());
+    let report = listen.report(0.0, None, true);
+    match api::plays(vec![report.clone()], &token) {
+        Err(e) if api::network_error(&e) => {
+            offline::keep_plays(vec![report]);
+            println!("Сети нет, отчёт отложен. Ждут отправки: {}", offline::plays_waiting());
+        }
+        other => println!("Отчёт ушёл сразу: {other:?}"),
+    }
+    Ok(())
+}
+
 /// Проверка без окна: перемотка на паузе сдвигает место и не снимает паузу.
 fn smoke_pause_seek(query: &str) -> Result<(), String> {
     let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
@@ -7015,7 +7122,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-download" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-download" || flag == "--smoke-offline" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -7029,6 +7136,7 @@ fn main() -> iced::Result {
             "--smoke-cover" => smoke_cover(),
             "--smoke-pause-seek" => smoke_pause_seek(query),
             "--smoke-download" => smoke_download(query),
+            "--smoke-offline" => smoke_offline(query),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {

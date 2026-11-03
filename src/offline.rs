@@ -3,13 +3,21 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
-use crate::api::{self, FileInfo, Sound, Track};
+use crate::api::{self, FileInfo, Profile, Sound, Track};
 use crate::session;
 
 const INDEX: &str = "index.json";
+/// Отчёты о прослушивании, которые не ушли без сети. Старые выкидываются сверх предела.
+const PLAYS: &str = "plays.json";
+const PLAYS_LIMIT: usize = 500;
+/// Аккаунт и лайки с прошлого запуска: без сети приложение открывается с ними.
+const ACCOUNT: &str = "account.json";
+/// Файл отчётов меняют сразу несколько потоков.
+static PLAYS_LOCK: Mutex<()> = Mutex::new(());
 /// Обложка скачанного трека: того же размера, что в строках списков.
 const COVER_SIZE: &str = "200x200";
 
@@ -110,6 +118,87 @@ pub fn cover(id: &str) -> Option<Vec<u8>> {
         return None;
     }
     fs::read(cover_path(id)).ok()
+}
+
+fn read_json(name: &str) -> Option<Value> {
+    serde_json::from_slice(&fs::read(api::data_dir().join(name)).ok()?).ok()
+}
+
+fn write_json(name: &str, value: &Value) {
+    let dir = api::data_dir();
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let draft = dir.join(format!("{name}.tmp"));
+    if fs::write(&draft, value.to_string()).is_ok() {
+        let _ = fs::rename(&draft, dir.join(name));
+    }
+}
+
+/// Откладывает отчёты, которые не ушли без сети.
+pub fn keep_plays(reports: Vec<Value>) {
+    let _guard = PLAYS_LOCK.lock().unwrap();
+    let mut list = read_json(PLAYS).and_then(|v| v.as_array().cloned()).unwrap_or_default();
+    list.extend(reports);
+    let extra = list.len().saturating_sub(PLAYS_LIMIT);
+    list.drain(..extra);
+    write_json(PLAYS, &Value::Array(list));
+}
+
+/// Отправляет отложенные отчёты в фоне. Не дошли из-за сети — останутся до следующего раза;
+/// Яндекс отказал — выкидываются, иначе застрянут навсегда.
+pub fn flush_plays(token: String) {
+    std::thread::spawn(move || {
+        let list = {
+            let _guard = PLAYS_LOCK.lock().unwrap();
+            let list = read_json(PLAYS).and_then(|v| v.as_array().cloned()).unwrap_or_default();
+            if !list.is_empty() {
+                let _ = fs::remove_file(api::data_dir().join(PLAYS));
+            }
+            list
+        };
+        if list.is_empty() {
+            return;
+        }
+        if let Err(e) = api::plays(list.clone(), &token) {
+            if api::network_error(&e) {
+                keep_plays(list);
+            } else {
+                eprintln!("отложенные отчёты не приняты: {e}");
+            }
+        }
+    });
+}
+
+/// Сколько отчётов ждут отправки.
+pub fn plays_waiting() -> usize {
+    read_json(PLAYS).and_then(|v| v.as_array().map(Vec::len)).unwrap_or(0)
+}
+
+pub fn save_account(profile: &Profile, liked: &[String], disliked: &[String]) {
+    let value = json!({
+        "uid": profile.uid, "name": profile.name, "plus": profile.plus, "login": profile.login, "email": profile.email,
+        "avatar": profile.avatar, "plusUntil": profile.plus_until, "family": profile.family,
+        "liked": liked, "disliked": disliked,
+    });
+    write_json(ACCOUNT, &value);
+}
+
+pub fn load_account() -> Option<(Profile, Vec<String>, Vec<String>)> {
+    let v = read_json(ACCOUNT)?;
+    let text = |key: &str| v[key].as_str().unwrap_or_default().to_string();
+    let ids = |key: &str| v[key].as_array().into_iter().flatten().filter_map(|id| id.as_str().map(str::to_string)).collect::<Vec<_>>();
+    let profile = Profile {
+        uid: v["uid"].as_str()?.to_string(),
+        name: text("name"),
+        plus: v["plus"].as_bool().unwrap_or(false),
+        login: text("login"),
+        email: text("email"),
+        avatar: v["avatar"].as_str().map(str::to_string),
+        plus_until: v["plusUntil"].as_str().map(str::to_string),
+        family: v["family"].as_bool().unwrap_or(false),
+    };
+    Some((profile, ids("liked"), ids("disliked")))
 }
 
 /// Размер словами: «12,4 МБ», «1,2 ГБ».

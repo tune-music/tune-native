@@ -1829,6 +1829,11 @@ pub fn availability(ids: &[String], token: &str) -> Result<Vec<(String, bool)>, 
 }
 
 /// Отправляет отчёты о прослушивании.
+/// Ошибка из-за сети, а не из-за Яндекса: запрос просто не дошёл.
+pub fn network_error(error: &str) -> bool {
+    ["Не удалось связаться с Яндексом", "Не удалось получить файл трека", "Не удалось загрузить текст"].iter().any(|prefix| error.starts_with(prefix))
+}
+
 pub fn plays(reports: Vec<Value>, token: &str) -> Result<(), String> {
     let client_now = now().replace(':', "%3A");
     post(&format!("plays?clientNow={client_now}"), "application/json", json!({ "plays": reports }).to_string(), token).map(|_| ())
