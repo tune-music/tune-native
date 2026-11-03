@@ -1018,6 +1018,9 @@ enum Message {
     UndoExpire(u64),
     CoverUploaded(Playlist, Result<Option<Option<String>>, String>),
     DragStart(DragList, usize),
+    /// Tab и Shift+Tab: следующее или предыдущее поле ввода.
+    FocusMove(bool),
+    Enter,
     /// Курсор над строкой или карточкой: номер и место внутри неё по высоте или ширине.
     DragOver(usize, f32),
     ListsMoved(Result<(), String>),
@@ -3897,9 +3900,23 @@ impl App {
                 self.menu_artists = false;
                 self.menu_lists = false;
             }
+            Message::FocusMove(forward) => return if forward { operation::focus_next() } else { operation::focus_previous() },
+            Message::Enter => {
+                let confirmable = !matches!(self.dialog, None | Some(Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account));
+                if confirmable {
+                    return self.handle(Message::DialogConfirm);
+                }
+            }
             Message::MenuClose => {
-                // Esc сначала закрывает меню и окна, потом плеер на всё окно.
+                // Esc сначала закрывает меню и окна, потом плеер на всё окно, потом текст песни и очередь.
                 if self.menu.is_none() && self.pin_menu.is_none() && self.quality_menu.is_none() && self.eq_menu.is_none() && self.page_menu.is_none() && self.dialog.is_none() {
+                    if !self.player_full {
+                        match self.section {
+                            Section::Lyrics => return self.handle(Message::LyricsToggle),
+                            Section::Queue => return self.handle(Message::QueueToggle),
+                            _ => {}
+                        }
+                    }
                     self.player_full = false;
                 }
                 self.menu = None;
@@ -7355,6 +7372,10 @@ impl PipeMedia for Subscription<Message> {
             Event::Window(window::Event::Resized(size)) => Some(Message::WindowSize(size)),
             Event::Window(window::Event::CloseRequested) => Some(Message::Quit),
             Event::Keyboard(keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Escape), .. }) => Some(Message::MenuClose),
+            // Tab переходит между полями ввода: поиском, фильтром и полем окна.
+            Event::Keyboard(keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Tab), modifiers, .. }) => Some(Message::FocusMove(!modifiers.shift())),
+            // Enter вне поля подтверждает открытое окно.
+            Event::Keyboard(keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Enter), .. }) if status == event::Status::Ignored => Some(Message::Enter),
             Event::Keyboard(keyboard::Event::KeyPressed { key, physical_key, modifiers, .. }) if status == event::Status::Ignored => hotkey(&key, physical_key, modifiers),
             _ => None,
         });
@@ -7443,7 +7464,9 @@ const HOTKEYS: [(&str, &[(&str, &[&str])]); 4] = [
     ("Окна и страницы", &[
         ("Предыдущая страница", &["Мышь: боковая «назад»"]),
         ("Следующая страница", &["Мышь: боковая «вперёд»"]),
-        ("Закрыть меню или окно", &["Esc"]),
+        ("Закрыть меню, окно, текст песни или очередь", &["Esc"]),
+        ("Подтвердить в окне", &["Enter"]),
+        ("Следующее и предыдущее поле ввода", &["Tab", "Shift+Tab"]),
     ]),
 ];
 
