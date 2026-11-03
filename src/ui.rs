@@ -303,6 +303,11 @@ pub fn input_faded(alpha: f32) -> impl Fn(&Theme, text_input::Status) -> text_in
     }
 }
 
+/// Всплывающая подсказка: у кнопок и у обрезанного текста одна и та же.
+pub fn tip(_: &Theme) -> container::Style {
+    container::Style { border: border::rounded(6).color(c().control).width(1), ..fill(c().tooltip) }
+}
+
 pub fn avatar(_: &Theme) -> container::Style {
     container::Style { border: border::rounded(24), ..fill(c().tile) }
 }

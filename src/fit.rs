@@ -13,7 +13,7 @@ use iced::advanced::widget::{tree, Tree, Widget};
 use iced::advanced::{overlay, Clipboard, Renderer as _, Shell};
 use iced::alignment;
 use iced::widget::{container, text as label, tooltip};
-use iced::{border, mouse, window, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Renderer, Size, Theme, Vector};
+use iced::{mouse, window, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Renderer, Size, Theme, Vector};
 
 use crate::Message;
 
@@ -229,11 +229,7 @@ impl From<Fit> for Element<'_, Message> {
         }
         let cut = Rc::new(Cell::new(false));
         fit.cut = Some(cut.clone());
-        let full = container(label(fit.content.clone()).size(13).color(crate::ui::c().text)).max_width(TIP_WIDTH).padding([6, 10]).style(|_| container::Style {
-            background: Some(crate::ui::c().tooltip.into()),
-            border: border::rounded(6).color(crate::ui::c().control).width(1),
-            ..container::Style::default()
-        });
+        let full = container(label(fit.content.clone()).size(13).color(crate::ui::c().text)).max_width(TIP_WIDTH).padding([6, 10]).style(crate::ui::tip);
         tooltip(Element::new(fit), Element::new(Tip { cut, content: full.into() }), tooltip::Position::Bottom).gap(6).padding(0).delay(TIP_DELAY).into()
     }
 }
