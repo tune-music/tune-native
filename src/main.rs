@@ -111,6 +111,9 @@ const WAVE_HISTORY: usize = 50;
 const MAX_FAILURES: u32 = 3;
 /// Высота строки трека. Одинаковая у всех: по ней считается, какие строки видны.
 const ROW: f32 = 58.0;
+/// Заголовок дня и заголовок блока «откуда слушали» в истории.
+const HISTORY_DAY: f32 = 64.0;
+const HISTORY_HEAD: f32 = 40.0;
 /// Сколько строк держать готовыми за краем экрана.
 const ROW_MARGIN: usize = 6;
 const LIST: &str = "list";
@@ -461,6 +464,8 @@ struct Place {
 enum Preview {
     Dislikes,
     History,
+    /// История, прокрученная до доли высоты: середина или конец.
+    HistoryAt(f32),
     Dialog,
     Home,
     /// Вторая вкладка главной.
@@ -597,6 +602,8 @@ struct App {
     dialog: Option<Dialog>,
     dialog_text: String,
     history_tracks: Vec<Track>,
+    /// Дни и места, откуда слушали: строки `history_tracks` по порядку.
+    history_blocks: Vec<api::HistoryBlock>,
     history_loading: bool,
     /// Скачанные треки, их номера и сами треки для списка; новые первыми.
     downloads: Vec<offline::Saved>,
@@ -991,7 +998,7 @@ enum Message {
 
     /// Ответ, какие треки очереди сейчас можно слушать.
     Availability(Result<Vec<(String, bool)>, String>),
-    HistoryLoaded(Result<Vec<Track>, String>),
+    HistoryLoaded(Result<api::History, String>),
     DislikesLoaded(Result<Vec<Track>, String>),
     LikedLists(Result<Vec<Playlist>, String>),
     ListLike(Playlist),
@@ -1084,6 +1091,7 @@ impl App {
             dialog: None,
             dialog_text: String::new(),
             history_tracks: Vec::new(),
+            history_blocks: Vec::new(),
             history_loading: false,
             download_ids: downloads.iter().map(|saved| saved.track.id.clone()).collect(),
             download_tracks: downloads.iter().map(|saved| saved.track.clone()).collect(),
@@ -1353,6 +1361,16 @@ impl App {
         match self.section {
             Section::Wave => 0..0,
             Section::Collection => 0..self.liked.len().min(8),
+            Section::History => {
+                let rows = self.history_rows();
+                let (shown, _, _) = self.history_window(&rows);
+                let mut tracks = rows[shown].iter().filter_map(|(row, _)| match row {
+                    HistoryRow::Track(index) => Some(*index),
+                    _ => None,
+                });
+                let first = tracks.next();
+                first.map_or(0..0, |first| first..tracks.last().unwrap_or(first) + 1)
+            }
             Section::Artist => 0..self.list(Section::Artist).len(),
             Section::Queue => visible_rows(self.list_offset - QUEUE_HEADER, WINDOW.lock().unwrap().1, self.row_count(Section::Queue)),
             Section::Search if self.search_tab == SearchTab::All => 0..self.results.len().min(SEARCH_ALL_TRACKS),
@@ -1361,6 +1379,39 @@ impl App {
             }
             section => visible_rows(self.list_offset, WINDOW.lock().unwrap().1, self.row_count(section)),
         }
+    }
+
+    /// Строки истории по порядку и их высота: день, откуда слушали, треки.
+    fn history_rows(&self) -> Vec<(HistoryRow, f32)> {
+        let mut rows = Vec::new();
+        for (at, block) in self.history_blocks.iter().enumerate() {
+            if at == 0 || self.history_blocks[at - 1].date != block.date {
+                rows.push((HistoryRow::Day(at), HISTORY_DAY));
+            }
+            rows.push((HistoryRow::Head(at), HISTORY_HEAD));
+            rows.extend(block.tracks.clone().map(|index| (HistoryRow::Track(index), ROW)));
+        }
+        rows
+    }
+
+    /// Какие строки истории строятся сейчас, с запасом, и сколько места до них и после.
+    fn history_window(&self, rows: &[(HistoryRow, f32)]) -> (Range<usize>, f32, f32) {
+        let margin = ROW_MARGIN as f32 * ROW;
+        let (from, to) = (self.list_offset - margin, self.list_offset + WINDOW.lock().unwrap().1 + margin);
+        let (mut top, mut y, mut first, mut last) = (0.0, 0.0, rows.len(), 0);
+        for (index, (_, height)) in rows.iter().enumerate() {
+            if y + height > from && y < to {
+                if first == rows.len() {
+                    first = index;
+                    top = y;
+                }
+                last = index + 1;
+            }
+            y += height;
+        }
+        let first = first.min(last);
+        let shown: f32 = rows[first..last].iter().map(|(_, height)| height).sum();
+        (first..last, top, (y - top - shown).max(0.0))
     }
 
     /// Сколько карточек помещается в строку главной.
@@ -1443,6 +1494,7 @@ impl App {
         self.profile = None;
         self.results.clear();
         self.history_tracks.clear();
+        self.history_blocks.clear();
         self.disliked_list.clear();
         self.liked_lists.clear();
         self.list_meta = None;
@@ -2573,6 +2625,7 @@ impl App {
                         self.preview = None;
                         self.update(Message::Open(Section::History))
                     }
+                    Some(Preview::HistoryAt(_)) => self.update(Message::Open(Section::History)),
                     Some(Preview::Dialog) => {
                         self.preview = None;
                         let page = self.update(Message::Open(Section::Playlists));
@@ -3852,7 +3905,15 @@ impl App {
             Message::HistoryLoaded(result) => {
                 self.history_loading = false;
                 match result {
-                    Ok(tracks) => self.history_tracks = tracks,
+                    Ok(history) => {
+                        self.history_tracks = history.tracks;
+                        self.history_blocks = history.blocks;
+                        if let Some(Preview::HistoryAt(y)) = self.preview {
+                            self.preview = None;
+                            return Task::batch([self.visible_covers(), operation::snap_to(Id::new(LIST), scrollable::RelativeOffset { x: 0.0, y })]);
+                        }
+                        return self.visible_covers();
+                    }
                     Err(e) => return self.fail_retry(e, Message::Open(Section::History)),
                 }
             }
@@ -4550,7 +4611,7 @@ impl App {
             Section::Settings => self.view_settings(),
             Section::Discography => self.view_discography(),
             Section::Tag => self.view_tag(),
-            Section::History => self.view_track_page("История", &self.history_tracks, "Здесь появятся треки, которые вы слушали", Section::History),
+            Section::History => self.view_history(),
             Section::Dislikes => self.view_dislikes(),
             Section::Downloads => self.view_track_page("Скачанное", &self.download_tracks, "Скачайте треки через меню «…» — они будут играть и без интернета", Section::Downloads),
             Section::Wave => self.view_wave(),
@@ -5378,6 +5439,68 @@ impl App {
         let mut line = row![glow(button(ui::icon(if self.muted { ui::VOLUME_OFF } else { ui::VOLUME }, icon, ui::MUTED)).padding(4).style(ui::ghost).on_press(Message::ToggleMute), 20.0)].spacing(6).align_y(Alignment::Center);
         if let Some(width) = width {
             line = line.push(canvas(seek::Seek { value: shown, total: 1.0, on_change: Message::Volume, on_done: None }).width(width).height(SEEK_HEIGHT));
+        }
+        line.into()
+    }
+
+    /// История по дням, как в оригинале: в каждом дне — откуда слушали и что.
+    fn view_history(&self) -> Element<'_, Message> {
+        let back = glow(button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0);
+        let title = row![back, text("История").size(36).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None)].spacing(12).align_y(Alignment::Center);
+        if self.history_tracks.is_empty() {
+            let center = if self.history_loading { skeleton_list() } else { placeholder("Пока пусто", Some("Тут найдётся всё, что вы слушали в последнее время")) };
+            return column![title, self.area(center)].spacing(16).height(Length::Fill).into();
+        }
+        let rows = self.history_rows();
+        let (shown, top, bottom) = self.history_window(&rows);
+        let today = local_today();
+        let mut list = column![Space::new().height(top)].padding(Padding::ZERO.right(SCROLLBAR));
+        for (row, height) in &rows[shown] {
+            list = list.push(match row {
+                HistoryRow::Day(at) => {
+                    let day = text(history_day(&self.history_blocks[*at].date, today)).size(24).font(ui::font_headline()).color(ui::TEXT).wrapping(Wrapping::None);
+                    container(day).height(*height).padding(Padding::new(8.0).bottom(6)).align_y(Alignment::End).into()
+                }
+                HistoryRow::Head(at) => container(self.history_head(&self.history_blocks[*at])).height(*height).padding([0, 8]).center_y(*height).into(),
+                HistoryRow::Track(index) => self.view_track(Section::History, *index, &self.history_tracks[*index]),
+            });
+        }
+        list = list.push(Space::new().height(bottom));
+        let scroll = ui::scroll(list).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).height(Length::Fill);
+        column![title, self.area(scroll)].spacing(16).height(Length::Fill).into()
+    }
+
+    /// Откуда слушали: вид места и его название ссылкой, как в оригинале.
+    fn history_head<'a>(&self, block: &'a api::HistoryBlock) -> Element<'a, Message> {
+        let label = |words: &'static str| text(words).size(15).color(ui::MUTED).wrapping(Wrapping::None);
+        let link = |name: String, message: Message| hover_line(text(name).size(15).font(ui::font_medium()).wrapping(Wrapping::None), ui::TEXT, ui::WHITE, message);
+        let first = self.history_tracks.get(block.tracks.start);
+        let (kind, target): (&'static str, Option<(String, Message)>) = match &block.from {
+            api::HistoryFrom::Other => ("Слушали вперемешку", None),
+            api::HistoryFrom::Search => ("Результаты поиска", None),
+            api::HistoryFrom::Wave { title, seeds } => {
+                let open = Message::WaveStartSeeds(seeds.clone(), Some(title.clone()));
+                if title == "Моя волна" { ("", Some((title.clone(), open))) } else { ("Моя волна", Some((title.clone(), open))) }
+            }
+            api::HistoryFrom::Playlist(list) => ("Плейлист", Some((list.title.clone(), Message::HomeOpen(HomeItem::Playlist(list.clone()))))),
+            api::HistoryFrom::Album(id) => {
+                // Название альбома — у его трека: отдельно Яндекс его не присылает.
+                let name = first.filter(|track| track.album.as_deref() == Some(id)).map_or_else(String::new, |track| track.album_title.clone());
+                let card = Card { id: id.clone(), title: name.clone(), subtitle: String::new(), cover: None };
+                ("Альбом", Some((name, open_album(&card))))
+            }
+            api::HistoryFrom::Artist(id) => {
+                let name = first.and_then(|track| track.artist_list.iter().find(|(_, artist)| artist == id)).map_or_else(String::new, |(name, _)| name.clone());
+                let card = Card { id: id.clone(), title: name.clone(), subtitle: String::new(), cover: None };
+                ("Исполнитель", Some((name, open_artist(&card))))
+            }
+        };
+        let mut line = row![].spacing(8).align_y(Alignment::Center);
+        if !kind.is_empty() {
+            line = line.push(label(kind));
+        }
+        if let Some((name, message)) = target.filter(|(name, _)| !name.is_empty()) {
+            line = line.push(link(name, message));
         }
         line.into()
     }
@@ -6545,6 +6668,51 @@ fn remembers_scroll(section: Section) -> bool {
     !matches!(section, Section::Lyrics | Section::Queue | Section::Wave)
 }
 
+/// Строка истории.
+enum HistoryRow {
+    /// Заголовок дня и заголовок «откуда слушали» — номер блока.
+    Day(usize),
+    Head(usize),
+    /// Трек — номер в общем списке истории.
+    Track(usize),
+}
+
+/// Сегодняшняя дата на компьютере: год, месяц, день.
+fn local_today() -> (i32, u32, u32) {
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+    // SAFETY: функция только заполняет переданную структуру.
+    let now = unsafe {
+        let mut now = std::mem::zeroed();
+        GetLocalTime(&mut now);
+        now
+    };
+    (now.wYear as i32, now.wMonth as u32, now.wDay as u32)
+}
+
+/// Номер дня от начала эпохи: так считается разница в днях между датами.
+fn day_number(year: i32, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year } as i64;
+    let era = year.div_euclid(400);
+    let in_era = year - era * 400;
+    let month = month as i64;
+    let in_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day as i64 - 1;
+    era * 146097 + in_era * 365 + in_era / 4 - in_era / 100 + in_year
+}
+
+/// «Сегодня», «Вчера», «1 ноября», а для прошлых лет — «1 ноября 2025».
+fn history_day(date: &str, today: (i32, u32, u32)) -> String {
+    const MONTHS: [&str; 12] = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
+    let mut parts = date.split('-').map(|part| part.parse::<u32>().ok());
+    let (Some(Some(year)), Some(Some(month)), Some(Some(day))) = (parts.next(), parts.next(), parts.next()) else { return date.to_string() };
+    let Some(name) = month.checked_sub(1).and_then(|at| MONTHS.get(at as usize)) else { return date.to_string() };
+    match day_number(today.0, today.1, today.2) - day_number(year as i32, month, day) {
+        0 => "Сегодня".to_string(),
+        1 => "Вчера".to_string(),
+        _ if year as i32 == today.0 => format!("{day} {name}"),
+        _ => format!("{day} {name} {year}"),
+    }
+}
+
 /// «1», «1,25», «1,5»: как пишет оригинал, с запятой.
 fn speed_label(speed: f32) -> String {
     format!("{speed}").replace('.', ",")
@@ -7372,7 +7540,11 @@ fn smoke_library(query: &str) -> Result<(), String> {
     api::delete_playlist(&uid, &list.kind, &token)?;
     let gone = !api::playlists(&uid, &token)?.iter().any(|p| p.kind == list.kind);
     println!("Плейлист: название сменилось {checked}, трек добавился {added}, убрался {removed}, плейлист удалён {gone}");
-    println!("История: {} треков", api::history(HISTORY_LIMIT, &token)?.len());
+    let history = api::history(HISTORY_LIMIT, &token)?;
+    println!("История: {} треков, {} блоков, дней {}", history.tracks.len(), history.blocks.len(), history.blocks.iter().map(|block| &block.date).collect::<HashSet<_>>().len());
+    for block in history.blocks.iter().take(6) {
+        println!("  {} {:?}: {} треков", block.date, block.from, block.tracks.len());
+    }
     println!("Дизлайков показать: {}", api::disliked_tracks(&uid, HISTORY_LIMIT, &token)?.len());
     let liked_before = api::liked_playlists(&uid, &token)?;
     if let Some(other) = found.playlists.iter().find(|p| p.owner != uid && !liked_before.iter().any(|l| l.kind == p.kind && l.owner == p.owner)) {
@@ -7457,6 +7629,8 @@ fn main() -> iced::Result {
             "lyrics" => Preview::Lyrics,
             "likes" => Preview::Likes,
             "likes-end" => Preview::LikesEnd,
+            "history-mid" => Preview::HistoryAt(0.5),
+            "history-end" => Preview::HistoryAt(1.0),
             "panels" => Preview::Panels,
             "queue-jump" => Preview::QueueJump,
             "menu" => Preview::Menu,
@@ -7545,6 +7719,17 @@ mod lyrics_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_days_read_like_original() {
+        let today = (2026, 3, 1);
+        assert_eq!(history_day("2026-03-01", today), "Сегодня");
+        assert_eq!(history_day("2026-02-28", today), "Вчера");
+        assert_eq!(history_day("2026-02-27", today), "27 февраля");
+        assert_eq!(history_day("2025-12-31", today), "31 декабря 2025");
+        assert_eq!(history_day("2025-12-31", (2026, 1, 1)), "Вчера");
+        assert_eq!(history_day("что-то", today), "что-то");
+    }
 
     #[test]
     fn long_times_show_hours() {

@@ -1516,24 +1516,98 @@ pub fn remove_from_playlist(uid: &str, kind: &str, track: &Track, token: &str) -
 }
 
 /// Последние прослушанные треки, новые сначала и без повторов.
-fn parse_history(v: &Value) -> Vec<String> {
-    let mut seen = HashSet::new();
-    v["historyTabs"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|tab| tab["items"].as_array().into_iter().flatten())
-        .flat_map(|item| item["tracks"].as_array().into_iter().flatten())
-        .filter_map(|track| id_text(&track["data"]["itemId"]["trackId"]))
-        .filter(|id| seen.insert(id.clone()))
-        .collect()
+/// Откуда слушали треки в истории.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HistoryFrom {
+    /// «Слушали вперемешку».
+    Other,
+    Search,
+    Wave { title: String, seeds: Vec<String> },
+    Playlist(Playlist),
+    Album(String),
+    Artist(String),
 }
 
-pub fn history(limit: usize, token: &str) -> Result<Vec<Track>, String> {
-    let v = get("music-history", &[("fullModelsCount", "0")], token)?;
-    let mut ids = parse_history(result(&v));
-    ids.truncate(limit);
-    tracks_by_ids(&ids, token)
+/// Подряд прослушанное из одного места за один день. `tracks` — строки общего списка истории.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryBlock {
+    /// «2026-11-03».
+    pub date: String,
+    pub from: HistoryFrom,
+    pub tracks: std::ops::Range<usize>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct History {
+    pub tracks: Vec<Track>,
+    pub blocks: Vec<HistoryBlock>,
+}
+
+fn parse_history_from(v: &Value) -> HistoryFrom {
+    let (id, model) = (&v["data"]["itemId"], &v["data"]["fullModel"]);
+    match v["type"].as_str() {
+        Some("search") => HistoryFrom::Search,
+        Some("wave") => {
+            let seeds: Vec<String> = id["seeds"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_string)).collect();
+            let title = model["wave"]["title"].as_str().unwrap_or("Моя волна").to_string();
+            if seeds.is_empty() { HistoryFrom::Other } else { HistoryFrom::Wave { title, seeds } }
+        }
+        Some("playlist") => {
+            let (Some(owner), Some(kind)) = (id_text(&id["uid"]), id_text(&id["kind"])) else { return HistoryFrom::Other };
+            let list = &model["playlist"];
+            HistoryFrom::Playlist(Playlist {
+                source: Source::Playlist,
+                owner,
+                kind,
+                title: list["title"].as_str().unwrap_or("Плейлист").to_string(),
+                count: model["tracksCount"].as_u64().unwrap_or(0),
+                cover: cover_uri(list),
+            })
+        }
+        Some("album") => id_text(&id["id"]).map_or(HistoryFrom::Other, HistoryFrom::Album),
+        Some("artist") => id_text(&id["id"]).map_or(HistoryFrom::Other, HistoryFrom::Artist),
+        _ => HistoryFrom::Other,
+    }
+}
+
+/// Дни истории, новые первыми, и в каждом — откуда слушали и какие треки. Не больше `limit`
+/// треков всего: старое отрезается.
+fn parse_history(v: &Value, limit: usize) -> Vec<(String, HistoryFrom, Vec<String>)> {
+    let mut blocks = Vec::new();
+    let mut left = limit;
+    for tab in v["historyTabs"].as_array().into_iter().flatten() {
+        let date = tab["date"].as_str().unwrap_or_default().to_string();
+        for item in tab["items"].as_array().into_iter().flatten() {
+            let ids: Vec<String> = item["tracks"].as_array().into_iter().flatten().filter_map(|track| id_text(&track["data"]["itemId"]["trackId"])).take(left).collect();
+            if ids.is_empty() {
+                continue;
+            }
+            left -= ids.len();
+            blocks.push((date.clone(), parse_history_from(&item["context"]), ids));
+            if left == 0 {
+                return blocks;
+            }
+        }
+    }
+    blocks
+}
+
+pub fn history(limit: usize, token: &str) -> Result<History, String> {
+    let v = get("music-history", &[("fullModelsCount", "50")], token)?;
+    let parsed = parse_history(result(&v), limit);
+    // Сведения о каждом треке просятся один раз, даже если его слушали в разные дни.
+    let mut seen = HashSet::new();
+    let unique: Vec<String> = parsed.iter().flat_map(|(_, _, ids)| ids.iter()).filter(|id| seen.insert((*id).clone())).cloned().collect();
+    let found: HashMap<String, Track> = tracks_by_ids(&unique, token)?.into_iter().map(|track| (track.id.clone(), track)).collect();
+    let mut history = History::default();
+    for (date, from, ids) in parsed {
+        let start = history.tracks.len();
+        history.tracks.extend(ids.iter().filter_map(|id| found.get(id).cloned()));
+        if history.tracks.len() > start {
+            history.blocks.push(HistoryBlock { date, from, tracks: start..history.tracks.len() });
+        }
+    }
+    Ok(history)
 }
 
 /// Что можно закрепить в боковой панели.
@@ -2105,9 +2179,18 @@ mod tests {
     fn encodes_titles_and_reads_history() {
         assert_eq!(encode("а b&c"), "%D0%B0%20b%26c");
         let v = json!({"historyTabs":[
-            {"items":[{"tracks":[{"data":{"itemId":{"trackId":"1"}}},{"data":{"itemId":{"trackId":"2"}}}]}]},
-            {"items":[{"tracks":[{"data":{"itemId":{"trackId":"1"}}},{"data":{}},{"data":{"itemId":{"trackId":"3"}}}]}]}]});
-        assert_eq!(parse_history(&v), ["1", "2", "3"]);
+            {"date":"2026-11-03","items":[
+                {"context":{"type":"wave","data":{"itemId":{"seeds":["user:onyourwave"]}}},"tracks":[{"data":{"itemId":{"trackId":"1"}}},{"data":{"itemId":{"trackId":"2"}}}]},
+                {"context":{"type":"playlist","data":{"itemId":{"uid":7,"kind":3},"fullModel":{"playlist":{"title":"Мне нравится"},"tracksCount":5}}},"tracks":[{"data":{"itemId":{"trackId":"5"}}}]}]},
+            {"date":"2026-11-02","items":[{"context":{"type":"other"},"tracks":[{"data":{"itemId":{"trackId":"1"}}},{"data":{}},{"data":{"itemId":{"trackId":"3"}}}]}]}]});
+        let blocks = parse_history(&v, 10);
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(&blocks[0].1, HistoryFrom::Wave { title, seeds } if title == "Моя волна" && seeds == &["user:onyourwave"]));
+        assert!(matches!(&blocks[1].1, HistoryFrom::Playlist(list) if list.title == "Мне нравится" && list.owner == "7" && list.kind == "3"));
+        assert_eq!((blocks[2].0.as_str(), &blocks[2].1, blocks[2].2.as_slice()), ("2026-11-02", &HistoryFrom::Other, ["1".to_string(), "3".to_string()].as_slice()));
+        // Сверх предела старое отрезается.
+        let cut = parse_history(&v, 3);
+        assert_eq!(cut.iter().map(|(_, _, ids)| ids.len()).collect::<Vec<_>>(), [2, 1]);
     }
 
     #[test]
