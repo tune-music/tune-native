@@ -70,6 +70,8 @@ const BAR_VOLUME_ICON: f32 = 32.0;
 const BAR_SLIDER_MIN: f32 = 30.0;
 const BAR_SLIDER_MAX: f32 = 110.0;
 const CARD: f32 = 190.0;
+const CARD_PAD: f32 = 8.0;
+const CARD_GAP: f32 = 4.0;
 /// Волна: что занято по высоте кроме обложки, пределы обложки и ширина подписей под ней.
 const WAVE_COVER_MIN: f32 = 140.0;
 const WAVE_COLUMN: f32 = 560.0;
@@ -206,7 +208,7 @@ const WAVE_CARD: &str = "wave:";
 /// Сколько треков показать в блоке главной.
 const HOME_TRACKS: usize = 5;
 /// Сколько места занимает карточка вместе с отступами.
-const CARD_SLOT: f32 = CARD + 20.0;
+const CARD_SLOT: f32 = CARD + CARD_PAD * 2.0 + CARD_GAP;
 /// Ширина содержимого, на которой нижний плеер отказывается от лишнего.
 /// Уже этой ширины в строке трека нет места для длительности.
 const TRACK_TIME_WIDTH: f32 = 520.0;
@@ -228,12 +230,13 @@ const SEARCH_ALL: u32 = 30;
 const SEARCH_TAB: u32 = 100;
 /// Сколько треков показать на вкладке «Всё», а карточек — в блоках коллекции.
 const SEARCH_ALL_TRACKS: usize = 5;
-const COLLECTION_CARDS: usize = 5;
 /// Пауза после нажатия клавиши, прежде чем искать.
 const SEARCH_DELAY: Duration = Duration::from_millis(350);
 /// Высота шапки альбома и исполнителя: альбом считает видимые строки с её учётом.
 const PAGE_HEADER: f32 = 240.0;
-const PAGE_COVER: f32 = 200.0;
+/// Отступ внутри шапки: обложка не прилипает к краю цветного фона.
+const PAGE_HEADER_PAD: f32 = 20.0;
+const PAGE_COVER: f32 = PAGE_HEADER - PAGE_HEADER_PAD * 2.0;
 const ALBUM_COVER: &str = "album:";
 const ARTIST_COVER: &str = "artist:";
 /// За сколько до конца трека начать качать следующий.
@@ -339,7 +342,19 @@ enum Section {
     Discography,
     /// Плейлисты микса.
     Tag,
+    /// Все карточки блока, открытые из «Показать все».
+    Block,
 }
+
+/// Карусель, у которой есть «Показать все».
+#[derive(Clone, Copy, Debug)]
+enum Shelf {
+    Home(usize),
+    Similar,
+    LikedLists,
+}
+
+const HOME_SHELF: &str = "home:";
 
 /// Список, в котором перетаскивают трек.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -461,6 +476,7 @@ struct Place {
     section: Section,
     playlist: Option<Playlist>,
     artist: Option<Artist>,
+    block: Option<HomeBlock>,
 }
 
 /// Запуск с готовым разделом: первый трек показывается в плеере, но не играет.
@@ -579,8 +595,10 @@ struct App {
     progress: HashMap<String, f32>,
     /// Когда место в выпуске последний раз ушло Яндексу.
     progress_at: Option<Instant>,
-    /// С какой карточки показан блок главной.
-    home_pages: HashMap<usize, usize>,
+    /// С какой карточки показана карусель. Ключи главной начинаются с `HOME_SHELF`.
+    shelf_pages: HashMap<String, usize>,
+    /// Все карточки блока на отдельной странице.
+    block: Option<HomeBlock>,
     /// Выбранная вкладка в блоках главной, у которых они есть.
     home_block_tabs: HashMap<usize, usize>,
     found: Found,
@@ -844,7 +862,9 @@ enum Message {
     ListOpen(Playlist),
     HomeLoaded(Section, usize, Result<Home, String>),
     HomeTab(usize),
-    HomePage(usize, bool),
+    /// Карусель листается на ряд вперёд или назад; число — сколько в ней карточек.
+    ShelfPage(String, bool, usize),
+    ShowAll(Shelf),
     /// Вкладка внутри блока главной.
     HomeBlockTab(usize, usize),
     HomePlay(usize, usize),
@@ -1090,7 +1110,8 @@ impl App {
             page_menu: None,
             page_menu_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
             pending: None,
-            home_pages: HashMap::new(),
+            shelf_pages: HashMap::new(),
+            block: None,
             home_block_tabs: HashMap::new(),
             found: Found::default(),
             search_tab: SearchTab::All,
@@ -1461,9 +1482,22 @@ impl App {
         (((self.main_width() - 48.0 - SCROLLBAR) / CARD_SLOT) as usize).max(1)
     }
 
+    /// Сторона обложки: карточки ряда делят ширину поровну, как в сетке оригинала.
+    fn card_side(&self) -> f32 {
+        let columns = self.cards_in_row() as f32;
+        let room = self.main_width() - 48.0 - SCROLLBAR - CARD_GAP * (columns - 1.0);
+        (room / columns - CARD_PAD * 2.0).floor().clamp(CARD * 0.75, CARD * 1.5)
+    }
+
+    /// Какие карточки карусели видны: ряд с запомненного места.
+    fn shelf_shown(&self, key: &str, total: usize) -> Range<usize> {
+        let in_row = self.cards_in_row();
+        let from = self.shelf_pages.get(key).copied().unwrap_or(0).min(total.saturating_sub(in_row));
+        from..(from + in_row).min(total)
+    }
+
     fn home_shown(&self, index: usize, block: &HomeBlock) -> Range<usize> {
-        let from = self.home_pages.get(&index).copied().unwrap_or(0).min(block.items.len());
-        from..(from + self.cards_in_row()).min(block.items.len())
+        self.shelf_shown(&format!("{HOME_SHELF}{index}"), block.items.len())
     }
 
     /// Обложки главной: только показанных сейчас карточек.
@@ -1483,6 +1517,11 @@ impl App {
         let list = self.fetch_cover_jobs(jobs, "100x100");
         let similar = if self.section == Section::Playlists { self.similar.iter().filter_map(|item| Some((home_item_key(item), home_item_cover(item)?))).collect() } else { Vec::new() };
         let similar = self.fetch_cover_jobs(similar, "200x200");
+        let block = match (&self.block, self.section) {
+            (Some(block), Section::Block) => block.items.iter().filter_map(|item| Some((home_item_key(item), home_item_cover(item)?))).collect(),
+            _ => Vec::new(),
+        };
+        let similar = Task::batch([similar, self.fetch_cover_jobs(block, "200x200")]);
         let big = self.current_track().filter(|_| self.player_full).and_then(|t| Some((format!("{WAVE_BIG}{}", t.id), t.cover.clone()?)));
         let big = self.fetch_cover_jobs(big.into_iter().collect(), "600x600");
         // Играющий трек показан и в плеере, и крупно на главной.
@@ -1542,7 +1581,8 @@ impl App {
         self.list_meta = None;
         self.dialog = None;
         self.home = Home::default();
-        self.home_pages.clear();
+        self.shelf_pages.clear();
+        self.block = None;
         self.home_block_tabs.clear();
         self.found = Found::default();
         self.searched = false;
@@ -1714,7 +1754,7 @@ impl App {
         cards.extend(self.album.iter().map(|a| format!("{ALBUM_COVER}{}", a.id)));
         let album_cards = self.album.iter().flat_map(|a| &a.versions).chain(&self.album_others).chain(&self.discography);
         cards.extend(album_cards.map(|c| format!("{ALBUM_COVER}{}", c.id)));
-        cards.extend(self.similar.iter().chain(&self.tag_lists).chain(&self.found.waves).map(home_item_key));
+        cards.extend(self.similar.iter().chain(&self.tag_lists).chain(&self.found.waves).chain(self.block.iter().flat_map(|b| &b.items)).map(home_item_key));
         for found in self.search_cache.values() {
             cards.extend(found.albums.iter().map(|c| format!("{ALBUM_COVER}{}", c.id)));
             cards.extend(found.artists.iter().map(|c| format!("{ARTIST_COVER}{}", c.id)));
@@ -2224,7 +2264,7 @@ impl App {
         self.home_tab = tab;
         self.landing_tabs[landing_index(page)] = tab;
         self.home_loading = true;
-        self.home_pages.clear();
+        self.shelf_pages.retain(|key, _| !key.starts_with(HOME_SHELF));
         self.home_block_tabs.clear();
         self.home.blocks.clear();
         self.error = None;
@@ -2233,12 +2273,13 @@ impl App {
     }
 
     fn here(&self) -> Place {
-        Place { section: self.section, playlist: self.playlist.clone(), artist: self.artist.clone() }
+        Place { section: self.section, playlist: self.playlist.clone(), artist: self.artist.clone(), block: self.block.clone() }
     }
 
     fn remember(&mut self) {
         self.history.push(self.here());
         self.forward.clear();
+        self.shelf_pages.retain(|key, _| key.starts_with(HOME_SHELF));
     }
 
     fn discography_load(&mut self, page: u64) -> Task<Message> {
@@ -2256,6 +2297,8 @@ impl App {
     fn go(&mut self, place: Place) -> Task<Message> {
         self.section = place.section;
         self.artist = place.artist;
+        self.block = place.block;
+        self.shelf_pages.retain(|key, _| key.starts_with(HOME_SHELF));
         self.artist_loading = None;
         if place.section == Section::Playlists {
             if let Some(playlist) = place.playlist {
@@ -2299,6 +2342,8 @@ impl App {
             return Task::batch([similar, Task::perform(background(move || api::album(&playlist.kind, &token)), move |r| Message::AlbumLoaded(kind.clone(), r))]);
         }
         self.list_meta = None;
+        let cover = playlist.cover.clone().map(|cover| (playlist_cover_key(&playlist), cover));
+        let cover = self.fetch_cover_jobs(cover.into_iter().collect(), "300x300");
         let meta = if playlist.source == Source::Playlist {
             let (owner, list_kind, meta_token) = (playlist.owner.clone(), kind.clone(), token.clone());
             let wanted = kind.clone();
@@ -2306,7 +2351,7 @@ impl App {
         } else {
             Task::none()
         };
-        Task::batch([similar, meta, Task::perform(background(move || api::playlist_tracks(&playlist, &token)), move |r| Message::PlaylistLoaded(kind.clone(), r))])
+        Task::batch([similar, meta, cover, Task::perform(background(move || api::playlist_tracks(&playlist, &token)), move |r| Message::PlaylistLoaded(kind.clone(), r))])
     }
 
     fn wave_load(&mut self, seeds: Vec<String>, title: Option<String>, autoplay: bool) -> Task<Message> {
@@ -2387,7 +2432,7 @@ impl App {
             Section::Likes | Section::Collection => &self.liked,
             Section::Playlists => &self.playlist_tracks,
             Section::Artist => self.artist.as_ref().map_or(&[], |a| a.popular.as_slice()),
-            Section::Albums | Section::Artists | Section::Home | Section::Books | Section::Kids | Section::Discography | Section::Tag => &[],
+            Section::Albums | Section::Artists | Section::Home | Section::Books | Section::Kids | Section::Discography | Section::Tag | Section::Block => &[],
             // На странице очереди список — то, что будет после играющего трека.
             Section::History => &self.history_tracks,
             Section::Dislikes => &self.disliked_list,
@@ -2596,6 +2641,7 @@ impl App {
             Section::Artist => self.artist.is_some(),
             Section::Discography => self.discography_key.is_none(),
             Section::Tag => !self.tag_loading,
+            Section::Block => true,
             Section::Playlists if self.playlist.is_none() => !self.playlists.is_empty(),
             section => !self.list(section).is_empty(),
         }
@@ -3166,14 +3212,32 @@ impl App {
                 let Some((_, items)) = block.tabs.get(tab) else { return Task::none() };
                 block.items = items.clone();
                 self.home_block_tabs.insert(index, tab);
-                self.home_pages.remove(&index);
+                self.shelf_pages.remove(&format!("{HOME_SHELF}{index}"));
                 return self.home_covers();
             }
-            Message::HomePage(index, forward) => {
+            Message::ShelfPage(key, forward, total) => {
                 let step = self.cards_in_row();
-                let total = self.home.blocks.get(index).map_or(0, |b| b.items.len());
-                let from = self.home_pages.entry(index).or_insert(0);
+                let from = self.shelf_pages.entry(key).or_insert(0);
                 *from = if forward { (*from + step).min(total.saturating_sub(step)) } else { from.saturating_sub(step) };
+            }
+            Message::ShowAll(shelf) => {
+                let (title, items) = match shelf {
+                    Shelf::Home(index) => {
+                        let Some(block) = self.home.blocks.get(index) else { return Task::none() };
+                        (block.title.clone(), block.items.clone())
+                    }
+                    Shelf::Similar => {
+                        let Some(artist) = &self.artist else { return Task::none() };
+                        ("Похожие исполнители".to_string(), artist.similar.iter().cloned().map(HomeItem::Artist).collect())
+                    }
+                    Shelf::LikedLists => ("Понравившиеся плейлисты".to_string(), self.liked_lists.iter().cloned().map(HomeItem::Playlist).collect()),
+                };
+                self.player_full = false;
+                self.remember();
+                self.block = Some(HomeBlock { title, items, ..HomeBlock::default() });
+                self.section = Section::Block;
+                self.error = None;
+                self.retry = None;
             }
             Message::HomePlay(block, index) => {
                 if let Some(block) = self.home.blocks.get(block) {
@@ -4685,6 +4749,7 @@ impl App {
             Section::Settings => self.view_settings(),
             Section::Discography => self.view_discography(),
             Section::Tag => self.view_tag(),
+            Section::Block => self.view_block(),
             Section::History => self.view_history(),
             Section::Dislikes => self.view_dislikes(),
             Section::Downloads => self.view_track_page("Скачанное", &self.download_tracks, "Скачайте треки через меню «…» — они будут играть и без интернета", Section::Downloads),
@@ -5747,18 +5812,21 @@ impl App {
         .spacing(16)
         .padding(Padding::ZERO.right(SCROLLBAR));
         if !self.playlists.is_empty() {
-            page = page.push(Space::new().height(8)).push(self.block_title("Плейлисты", Section::Playlists)).push(self.view_playlist_cards(&self.playlists));
+            let lists = self.shelf("collection:lists", "Плейлисты", Some(Message::Open(Section::Playlists)), self.playlists.len(), |shown| self.playlist_cards(&self.playlists[shown]));
+            page = page.push(Space::new().height(8)).push(lists);
         }
         if !self.liked_lists.is_empty() {
-            page = page.push(Space::new().height(8)).push(text("Понравившиеся плейлисты").size(24).font(ui::font_headline()).color(ui::c().text)).push(self.view_playlist_cards(&self.liked_lists));
+            let all = self.more_than_row(self.liked_lists.len(), Message::ShowAll(Shelf::LikedLists));
+            let lists = self.shelf("collection:liked", "Понравившиеся плейлисты", all, self.liked_lists.len(), |shown| self.playlist_cards(&self.liked_lists[shown]));
+            page = page.push(Space::new().height(8)).push(lists);
         }
         if !self.liked_albums.is_empty() {
-            let shown = &self.liked_albums[..self.liked_albums.len().min(COLLECTION_CARDS)];
-            page = page.push(Space::new().height(8)).push(self.block_title("Альбомы", Section::Albums)).push(self.view_cards(shown, ALBUM_COVER, false, open_album));
+            let albums = self.shelf("collection:albums", "Альбомы", Some(Message::Open(Section::Albums)), self.liked_albums.len(), |shown| self.album_cards(&self.liked_albums[shown], ALBUM_COVER, false, open_album));
+            page = page.push(Space::new().height(8)).push(albums);
         }
         if !self.liked_artists.is_empty() {
-            let shown = &self.liked_artists[..self.liked_artists.len().min(COLLECTION_CARDS)];
-            page = page.push(Space::new().height(8)).push(self.block_title("Исполнители", Section::Artists)).push(self.view_cards(shown, ARTIST_COVER, true, open_artist));
+            let artists = self.shelf("collection:artists", "Исполнители", Some(Message::Open(Section::Artists)), self.liked_artists.len(), |shown| self.album_cards(&self.liked_artists[shown], ARTIST_COVER, true, open_artist));
+            page = page.push(Space::new().height(8)).push(artists);
         }
         ui::scroll(page).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
     }
@@ -5776,22 +5844,65 @@ impl App {
     }
 
     fn view_playlist_cards<'a>(&self, playlists: &'a [Playlist]) -> Element<'a, Message> {
-        let cards = playlists.iter().fold(row![].spacing(4), |cards, playlist| {
-            let cover: Element<'a, Message> = match self.covers.get(&playlist_cover_key(playlist)) {
-                Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle)).width(CARD).height(CARD).border_radius(8).into(),
-                None => container(ui::icon(ui::PLAY, 48.0, ui::c().muted)).center(CARD).style(ui::tile).into(),
+        grid(self.playlist_cards(playlists))
+    }
+
+    fn playlist_cards<'a>(&self, playlists: &[Playlist]) -> Vec<Element<'a, Message>> {
+        playlists.iter().map(|playlist| self.playlist_card(playlist)).collect()
+    }
+
+    fn playlist_card<'a>(&self, playlist: &Playlist) -> Element<'a, Message> {
+        let count = format!("{} {}", playlist.count, tracks_word(playlist.count as usize));
+        self.card(&playlist_cover_key(playlist), false, None, playlist.title.clone(), count, Message::ListOpen(playlist.clone()))
+    }
+
+    /// Карточка: обложка и две подписи. Одна и та же на главной, в поиске, коллекции и на страницах.
+    fn card<'a>(&self, key: &str, round: bool, tint: Option<iced::Color>, title: String, subtitle: String, press: Message) -> Element<'a, Message> {
+        let side = self.card_side();
+        let radius = if round { side / 2.0 } else { 8.0 };
+        let cover: Element<'a, Message> = match self.covers.get(key) {
+            Some(handle) => {
+                let picture = image(handle.clone()).opacity(self.cover_alpha(handle)).width(side).height(side).border_radius(radius);
+                match tint {
+                    Some(color) => container(picture).style(move |_| container::Style::default().background(color).border(iced::border::rounded(radius))).into(),
+                    None => picture.into(),
+                }
+            }
+            // У своего плейлиста без обложки вместо картинки значок.
+            None if key.starts_with(PLAYLIST_COVER) => container(ui::icon(ui::PLAY, 48.0, ui::c().muted)).center(side).style(ui::tile).into(),
+            None => container(Space::new()).width(side).height(side).style(if round { ui::avatar } else { ui::tile }).into(),
+        };
+        let body = column![cover, fit(title).font(ui::font_medium()).color(ui::c().text).lines(2), fit(subtitle).size(13).color(ui::c().muted)].spacing(6).width(side).clip(true);
+        glow(button(body).padding(CARD_PAD).style(ui::card).on_press(press), 12.0)
+    }
+
+    /// Заголовок карусели: ведёт на всё сразу, если есть куда, и стрелки, если карточки не влезают в ряд.
+    fn shelf_head<'a>(&self, key: &str, title: &'a str, all: Option<Message>, total: usize) -> Element<'a, Message> {
+        let name: Element<'a, Message> = match all {
+            Some(press) => more_title(title, press),
+            None => container(text(title).size(24).font(ui::font_headline()).color(ui::c().text).wrapping(Wrapping::None)).padding([4, 0]).into(),
+        };
+        let mut head = row![name, Space::new().width(Length::Fill)].spacing(4).align_y(Alignment::Center);
+        if total > self.cards_in_row() {
+            let shown = self.shelf_shown(key, total);
+            let arrow = |icon, active: bool, forward| {
+                let press = active.then(|| Message::ShelfPage(key.to_string(), forward, total));
+                glow(button(ui::icon(icon, 22.0, if active { ui::c().text } else { ui::c().control_hover })).padding(5).style(ui::ghost).on_press_maybe(press), 20.0)
             };
-            let card = column![
-                cover,
-                fit(&playlist.title).font(ui::font_medium()).color(ui::c().text).lines(2),
-                text(format!("{} {}", playlist.count, tracks_word(playlist.count as usize))).size(13).color(ui::c().muted),
-            ]
-            .spacing(6)
-            .width(CARD)
-            .clip(true);
-            cards.push(glow(button(card).padding(8).style(ui::card).on_press(Message::ListOpen(playlist.clone())), 12.0))
-        });
-        cards.wrap().into()
+            head = head.push(arrow(ui::LEFT, shown.start > 0, false)).push(arrow(ui::RIGHT, shown.end < total, true));
+        }
+        head.into()
+    }
+
+    /// Карусель: один ряд карточек, стрелки листают его по ряду.
+    fn shelf<'a>(&self, key: &str, title: &'a str, all: Option<Message>, total: usize, cards: impl FnOnce(Range<usize>) -> Vec<Element<'a, Message>>) -> Element<'a, Message> {
+        let line = cards(self.shelf_shown(key, total)).into_iter().fold(row![].spacing(CARD_GAP), |line, card| line.push(card));
+        column![self.shelf_head(key, title, all, total), line].spacing(8).into()
+    }
+
+    /// «Показать все» только там, где карточки не влезли в ряд.
+    fn more_than_row(&self, total: usize, press: Message) -> Option<Message> {
+        (total > self.cards_in_row()).then_some(press)
     }
 
     /// Крестик лежит внутри поля, чтобы при вводе оно не сдвигалось.
@@ -5861,11 +5972,44 @@ impl App {
         column![title, center].spacing(16).height(Length::Fill).into()
     }
 
+    fn view_playlist<'a>(&'a self, playlist: &'a Playlist) -> Element<'a, Message> {
+        let mut about = Vec::new();
+        if !self.playlist_tracks.is_empty() {
+            about.push(format!("{} {}", playlist.count, tracks_word(playlist.count as usize)));
+        }
+        if let Some(description) = self.list_meta.as_ref().map(|m| m.1.as_str()).filter(|d| !d.is_empty()) {
+            about.push(description.replace('\n', " "));
+        }
+        let mut tools = self.page_actions(Section::Playlists, format!("playlist:{}_{}", playlist.owner, playlist.kind), &playlist.title);
+        if !self.is_own(playlist) && playlist.kind != FAVORITES_KIND {
+            let liked = self.liked_lists.iter().any(|l| l.kind == playlist.kind && l.owner == playlist.owner);
+            tools = tools.push(self.page_like(liked, Message::ListLike(playlist.clone())));
+        }
+        tools = tools.push(self.page_more());
+        if !self.playlist_tracks.is_empty() {
+            tools = tools.push(self.view_filter());
+        }
+        let header = self.page_header("Плейлист", playlist.title.clone(), playlist_cover_key(playlist), false, None, about.join(" · "), tools);
+        let center: Element<'_, Message> = if self.filtering() {
+            self.view_filter_list(Section::Playlists)
+        } else if !self.playlist_tracks.is_empty() {
+            self.view_list(Section::Playlists, None)
+        } else if playlist.count == 0 {
+            placeholder("В этом плейлисте пока нет треков", None)
+        } else {
+            skeleton_list()
+        };
+        column![header, center].spacing(16).height(Length::Fill).into()
+    }
+
     fn view_playlists(&self) -> Element<'_, Message> {
         let back = glow(button(ui::icon(ui::BACK, 24.0, ui::c().text)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0);
         if let Some(playlist) = &self.playlist {
             if playlist.source == Source::Album {
                 return self.view_album(playlist);
+            }
+            if playlist.source == Source::Playlist {
+                return self.view_playlist(playlist);
             }
             let name = row![
                 fit(&playlist.title).size(36).font(ui::font_headline()).color(ui::c().text).reserve(PLAYLIST_COUNT_RESERVE),
@@ -5873,28 +6017,8 @@ impl App {
             ]
             .spacing(12)
             .align_y(Alignment::Center);
-            let mut title = row![back, container(name).width(Length::Fill).clip(true)].spacing(12).align_y(Alignment::Center);
-            if playlist.source == Source::Playlist && !self.playlist_tracks.is_empty() {
-                title = title.push(self.view_filter());
-            }
-            let mut head = column![title].spacing(10);
-            if playlist.source == Source::Playlist {
-                let meta = self.list_meta.as_ref();
-                if let Some(description) = meta.map(|m| m.1.as_str()).filter(|d| !d.is_empty()) {
-                    head = head.push(text(description).color(ui::c().muted));
-                }
-                let mut tools = self.page_actions(Section::Playlists, format!("playlist:{}_{}", playlist.owner, playlist.kind), &playlist.title);
-                if !self.is_own(playlist) && playlist.kind != FAVORITES_KIND {
-                    let liked = self.liked_lists.iter().any(|l| l.kind == playlist.kind && l.owner == playlist.owner);
-                    tools = tools.push(self.page_like(liked, Message::ListLike(playlist.clone())));
-                }
-                tools = tools.push(self.page_more());
-                head = head.push(tools.wrap().vertical_spacing(8));
-            }
-            let title = head;
-            let center: Element<'_, Message> = if self.filtering() {
-                self.view_filter_list(Section::Playlists)
-            } else if !self.playlist_tracks.is_empty() {
+            let title = row![back, container(name).width(Length::Fill).clip(true)].spacing(12).align_y(Alignment::Center);
+            let center: Element<'_, Message> = if !self.playlist_tracks.is_empty() {
                 self.view_list(Section::Playlists, None)
             } else if playlist.count == 0 {
                 placeholder("В этом плейлисте пока нет треков", None)
@@ -5908,7 +6032,7 @@ impl App {
         let center: Element<'_, Message> = if !self.playlists.is_empty() {
             ui::scroll(container(self.view_playlist_cards(&self.playlists)).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
         } else if self.playlists_loading || self.uid.is_none() {
-            skeleton_cards()
+            skeleton_cards(self.card_side())
         } else {
             placeholder("Плейлистов пока нет", Some("Созданные вами плейлисты появятся здесь"))
         };
@@ -5963,30 +6087,38 @@ impl App {
             let block = |title| text(title).size(24).font(ui::font_headline()).color(ui::c().text);
             let mut blocks = column![].spacing(12).padding(Padding::ZERO.right(SCROLLBAR));
             if !found.waves.is_empty() {
-                let waves = found.waves.iter().fold(row![].spacing(4), |line, item| line.push(self.view_home_item(item)));
-                blocks = blocks.push(block("Волны")).push(waves.wrap()).push(Space::new().height(8));
+                blocks = blocks.push(self.search_cards("search:waves", "Волны", SearchTab::Waves, found.waves.len(), |shown| self.home_cards(&found.waves[shown]))).push(Space::new().height(8));
             }
             if !found.artists.is_empty() {
-                blocks = blocks.push(block("Исполнители")).push(self.view_cards(&found.artists, ARTIST_COVER, true, open_artist)).push(Space::new().height(8));
+                blocks = blocks.push(self.search_cards("search:artists", "Исполнители", SearchTab::Artists, found.artists.len(), |shown| self.album_cards(&found.artists[shown], ARTIST_COVER, true, open_artist))).push(Space::new().height(8));
             }
+            let albums = || self.search_cards("search:albums", albums_title, SearchTab::Albums, found.albums.len(), |shown| self.album_cards(&found.albums[shown], ALBUM_COVER, false, open_album));
             // Во вкладках подкастов и книг сначала они сами, выпуски потом.
             let spoken_first = matches!(self.search_tab, SearchTab::Podcasts | SearchTab::Books);
             if spoken_first && !found.albums.is_empty() {
-                blocks = blocks.push(block(albums_title)).push(self.view_cards(&found.albums, ALBUM_COVER, false, open_album)).push(Space::new().height(8));
+                blocks = blocks.push(albums()).push(Space::new().height(8));
             }
             if !found.tracks.is_empty() {
                 let shown = found.tracks.iter().take(SEARCH_ALL_TRACKS).enumerate();
                 blocks = blocks.push(block(tracks_title)).push(shown.fold(column![], |list, (index, track)| list.push(self.view_track(Section::Search, index, track)))).push(Space::new().height(8));
             }
             if !spoken_first && !found.albums.is_empty() {
-                blocks = blocks.push(block(albums_title)).push(self.view_cards(&found.albums, ALBUM_COVER, false, open_album)).push(Space::new().height(8));
+                blocks = blocks.push(albums()).push(Space::new().height(8));
             }
             if !found.playlists.is_empty() {
-                blocks = blocks.push(block("Плейлисты")).push(self.view_playlist_cards(&found.playlists));
+                blocks = blocks.push(self.search_cards("search:lists", "Плейлисты", SearchTab::Playlists, found.playlists.len(), |shown| self.playlist_cards(&found.playlists[shown])));
             }
             ui::scroll(blocks).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
         };
         page.push(self.area(center)).into()
+    }
+
+    /// Во вкладке «Всё» карусель, ведущая на свою вкладку, в остальных — сетка целиком.
+    fn search_cards<'a>(&self, key: &str, title: &'a str, tab: SearchTab, total: usize, cards: impl FnOnce(Range<usize>) -> Vec<Element<'a, Message>>) -> Element<'a, Message> {
+        if self.search_tab == SearchTab::All {
+            return self.shelf(key, title, self.more_than_row(total, Message::SearchTabSet(tab)), total, cards);
+        }
+        column![text(title).size(24).font(ui::font_headline()).color(ui::c().text), grid(cards(0..total))].spacing(12).into()
     }
 
     fn view_home(&self) -> Element<'_, Message> {
@@ -6003,16 +6135,12 @@ impl App {
             page = page.push(tabs);
         }
         if self.home_loading || self.home.blocks.is_empty() {
-            return page.push(self.area(if self.home_loading { skeleton_home(self.cards_in_row()) } else { placeholder("Пока здесь пусто", None) })).into();
+            return page.push(self.area(if self.home_loading { skeleton_home(self.cards_in_row(), self.card_side()) } else { placeholder("Пока здесь пусто", None) })).into();
         }
-        let in_row = self.cards_in_row();
         let blocks = self.home.blocks.iter().enumerate().fold(column![].spacing(12).padding(Padding::ZERO.right(SCROLLBAR)), |blocks, (index, block)| {
-            let mut head = row![text(&block.title).size(24).font(ui::font_headline()).color(ui::c().text).wrapping(Wrapping::None), Space::new().width(Length::Fill)].spacing(4).align_y(Alignment::Center);
             let shown = self.home_shown(index, block);
-            if block.items.len() > in_row {
-                let arrow = |icon, active: bool, forward| glow(button(ui::icon(icon, 22.0, if active { ui::c().text } else { ui::c().control_hover })).padding(5).style(ui::ghost).on_press_maybe(active.then_some(Message::HomePage(index, forward))), 20.0);
-                head = head.push(arrow(ui::LEFT, shown.start > 0, false)).push(arrow(ui::RIGHT, shown.end < block.items.len(), true));
-            }
+            let all = self.more_than_row(block.items.len(), Message::ShowAll(Shelf::Home(index)));
+            let head = self.shelf_head(&format!("{HOME_SHELF}{index}"), &block.title, all, block.items.len());
             let mut body = if block.title.is_empty() { column![] } else { column![head] }.spacing(8);
             if !block.tabs.is_empty() {
                 let chosen = self.home_block_tabs.get(&index).copied().unwrap_or(0);
@@ -6022,7 +6150,7 @@ impl App {
                 body = body.push(chips.wrap());
             }
             if !shown.is_empty() {
-                body = body.push(block.items[shown].iter().fold(row![].spacing(4), |line, item| line.push(self.view_home_item(item))));
+                body = body.push(block.items[shown].iter().fold(row![].spacing(CARD_GAP), |line, item| line.push(self.view_home_item(item))));
             }
             if !block.tracks.is_empty() {
                 let rows = block.tracks.iter().take(HOME_TRACKS).enumerate();
@@ -6043,23 +6171,11 @@ impl App {
             HomeItem::Likes { count, .. } => ("Мне нравится", format!("{count} {}", tracks_word(*count as usize)), false),
             HomeItem::History { subtitle, .. } => ("История", if subtitle.is_empty() { "Недавно прослушанное".to_string() } else { subtitle.clone() }, false),
         };
-        let radius = if round { CARD / 2.0 } else { 8.0 };
         let color = match item {
             HomeItem::Wave { color, .. } => color.as_deref().and_then(ui::hex_color),
             _ => None,
         };
-        let cover: Element<'a, Message> = match self.covers.get(&home_item_key(item)) {
-            Some(handle) => {
-                let picture = image(handle.clone()).opacity(self.cover_alpha(handle)).width(CARD).height(CARD).border_radius(radius);
-                match color {
-                    Some(color) => container(picture).style(move |_| container::Style::default().background(color).border(iced::border::rounded(radius))).into(),
-                    None => picture.into(),
-                }
-            }
-            None => container(Space::new()).width(CARD).height(CARD).style(if round { ui::avatar } else { ui::tile }).into(),
-        };
-        let body = column![cover, fit(title).font(ui::font_medium()).color(ui::c().text).lines(2), fit(subtitle).size(13).color(ui::c().muted)].spacing(6).width(CARD).clip(true);
-        glow(button(body).padding(8).style(ui::card).on_press(Message::HomeOpen(item.clone())), 12.0)
+        self.card(&home_item_key(item), round, color, title.to_string(), subtitle, Message::HomeOpen(item.clone()))
     }
 
     /// Загружается альбом или исполнитель: шапка стоит там же, где будет настоящая.
@@ -6068,7 +6184,7 @@ impl App {
         let cover = container(Space::new()).width(side).height(side).style(skeleton_round(if round { side / 2.0 } else { 8.0 }));
         let back = glow(button(ui::icon(ui::BACK, 24.0, ui::c().text)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0);
         let info = column![skeleton_bar(70.0, 12.0), skeleton_bar(280.0, 34.0), skeleton_bar(160.0, 12.0)].spacing(14);
-        let head = container(row![container(back).height(PAGE_COVER), cover, container(info).center_y(PAGE_HEADER - 8.0)].spacing(16)).height(PAGE_HEADER).width(Length::Fill);
+        let head = container(row![container(back).height(PAGE_COVER), cover, container(info).center_y(PAGE_COVER)].spacing(16)).padding(PAGE_HEADER_PAD).height(PAGE_HEADER).width(Length::Fill);
         column![head, skeleton_list()].spacing(16).height(Length::Fill).into()
     }
 
@@ -6078,6 +6194,7 @@ impl App {
         let radius = if round { side / 2.0 } else { 8.0 };
         let cover: Element<'a, Message> = match self.covers.get(&cover_key) {
             Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle)).width(side).height(side).border_radius(radius).into(),
+            None if cover_key.starts_with(PLAYLIST_COVER) => container(ui::icon(ui::PLAY, side / 4.0, ui::c().muted)).center(side).style(ui::tile).into(),
             None => container(Space::new()).width(side).height(side).style(if round { ui::avatar } else { ui::tile }).into(),
         };
         let back = glow(button(ui::icon(ui::BACK, 24.0, ui::c().text)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0);
@@ -6086,7 +6203,21 @@ impl App {
             info = info.push(links);
         }
         let info = info.push(fit(about).color(ui::c().muted)).push(Space::new().height(8)).push(actions.wrap().vertical_spacing(8));
-        container(row![container(back).height(PAGE_COVER), cover, container(info).center_y(PAGE_HEADER - 8.0)].spacing(16)).height(PAGE_HEADER).width(Length::Fill).into()
+        // Фон шапки в цвет обложки, к низу он сходит на нет.
+        let tint = self.covers.get(&cover_key).and_then(average_color).map(|color| color.scale_alpha(if ui::is_light() { 0.35 } else { 0.5 }));
+        let body = row![container(back).height(PAGE_COVER), cover, container(info).center_y(PAGE_COVER)].spacing(16);
+        container(body)
+            .padding(PAGE_HEADER_PAD)
+            .height(PAGE_HEADER)
+            .width(Length::Fill)
+            .style(move |_| match tint {
+                Some(color) => {
+                    let fade = iced::gradient::Linear::new(iced::Degrees(180.0)).add_stop(0.0, color).add_stop(1.0, color.scale_alpha(0.0));
+                    container::Style::default().background(iced::Background::Gradient(fade.into())).border(iced::border::rounded(12))
+                }
+                None => container::Style::default(),
+            })
+            .into()
     }
 
     /// Кнопки шапки: запуск списка и волна по нему.
@@ -6182,18 +6313,25 @@ impl App {
     }
 
     fn view_cards<'a>(&self, cards: &'a [Card], prefix: &str, round: bool, open: fn(&Card) -> Message) -> Element<'a, Message> {
-        cards
-            .iter()
-            .fold(row![].spacing(4), |line, card| {
-                let cover: Element<'a, Message> = match self.covers.get(&format!("{prefix}{}", card.id)) {
-                    Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle)).width(CARD).height(CARD).border_radius(if round { CARD / 2.0 } else { 8.0 }).into(),
-                    None => container(Space::new()).width(CARD).height(CARD).style(if round { ui::avatar } else { ui::tile }).into(),
-                };
-                let body = column![cover, fit(&card.title).font(ui::font_medium()).color(ui::c().text).lines(2), fit(&card.subtitle).size(13).color(ui::c().muted)].spacing(6).width(CARD).clip(true);
-                line.push(glow(button(body).padding(8).style(ui::card).on_press(open(card)), 12.0))
-            })
-            .wrap()
-            .into()
+        grid(self.album_cards(cards, prefix, round, open))
+    }
+
+    fn album_cards<'a>(&self, cards: &[Card], prefix: &str, round: bool, open: fn(&Card) -> Message) -> Vec<Element<'a, Message>> {
+        cards.iter().map(|card| self.card(&format!("{prefix}{}", card.id), round, None, card.title.clone(), card.subtitle.clone(), open(card))).collect()
+    }
+
+    fn home_cards<'a>(&self, items: &'a [HomeItem]) -> Vec<Element<'a, Message>> {
+        items.iter().map(|item| self.view_home_item(item)).collect()
+    }
+
+    /// Все карточки блока, открытые из «Показать все».
+    fn view_block(&self) -> Element<'_, Message> {
+        let back = glow(button(ui::icon(ui::BACK, 24.0, ui::c().text)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0);
+        let Some(block) = &self.block else { return column![back].into() };
+        let head = row![back, fit(&block.title).size(36).font(ui::font_headline()).color(ui::c().text)].spacing(12).align_y(Alignment::Center);
+        let cards = container(grid(self.home_cards(&block.items))).padding(Padding::ZERO.right(SCROLLBAR));
+        let center = ui::scroll(cards).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill);
+        column![head, center].spacing(16).height(Length::Fill).into()
     }
 
     fn view_artist(&self) -> Element<'_, Message> {
@@ -6224,15 +6362,18 @@ impl App {
             page = page.push(Space::new().height(8)).push(block("Знакомо вам")).push(chips.wrap());
             page = page.push(rows.fold(column![], |list, (index, track)| list.push(self.view_track_row(Message::FamiliarPlay(index), track))));
         }
-        let albums = |cards: &'_ [Card]| !cards.is_empty();
-        if albums(&artist.albums) {
-            page = page.push(Space::new().height(8)).push(more_title("Альбомы", Message::DiscographyOpen(false))).push(self.view_cards(&artist.albums, ALBUM_COVER, false, open_album));
+        if !artist.albums.is_empty() {
+            let albums = self.shelf("artist:albums", "Альбомы", Some(Message::DiscographyOpen(false)), artist.albums.len(), |shown| self.album_cards(&artist.albums[shown], ALBUM_COVER, false, open_album));
+            page = page.push(Space::new().height(8)).push(albums);
         }
-        if albums(&artist.also) {
-            page = page.push(Space::new().height(8)).push(more_title("Сборники", Message::DiscographyOpen(true))).push(self.view_cards(&artist.also, ALBUM_COVER, false, open_album));
+        if !artist.also.is_empty() {
+            let also = self.shelf("artist:also", "Сборники", Some(Message::DiscographyOpen(true)), artist.also.len(), |shown| self.album_cards(&artist.also[shown], ALBUM_COVER, false, open_album));
+            page = page.push(Space::new().height(8)).push(also);
         }
-        if albums(&artist.similar) {
-            page = page.push(Space::new().height(8)).push(block("Похожие исполнители")).push(self.view_cards(&artist.similar, ARTIST_COVER, true, open_artist));
+        if !artist.similar.is_empty() {
+            let all = self.more_than_row(artist.similar.len(), Message::ShowAll(Shelf::Similar));
+            let similar = self.shelf("artist:similar", "Похожие исполнители", all, artist.similar.len(), |shown| self.album_cards(&artist.similar[shown], ARTIST_COVER, true, open_artist));
+            page = page.push(Space::new().height(8)).push(similar);
         }
         if !artist.about.is_empty() || !artist.links.is_empty() {
             page = page.push(Space::new().height(8)).push(block("Об исполнителе"));
@@ -6256,12 +6397,11 @@ impl App {
         let title = self.tag.as_ref().map_or(String::new(), |(_, title)| title.clone());
         let head = row![back, text(title).size(36).font(ui::font_headline()).color(ui::c().text)].spacing(12).align_y(Alignment::Center);
         let center: Element<'_, Message> = if self.tag_loading {
-            skeleton_home(self.cards_in_row())
+            skeleton_home(self.cards_in_row(), self.card_side())
         } else if self.tag_lists.is_empty() {
             placeholder("Пока пусто", Some("В этом миксе нет плейлистов"))
         } else {
-            let cards = self.tag_lists.iter().fold(row![].spacing(4), |cards, item| cards.push(self.view_home_item(item)));
-            ui::scroll(container(cards.wrap()).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
+            ui::scroll(container(grid(self.home_cards(&self.tag_lists))).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
         };
         column![head, center].spacing(16).height(Length::Fill).into()
     }
@@ -6333,15 +6473,15 @@ impl App {
             }
             list = list.push(container(facts).padding(Padding::new(8.0).top(16)));
             let others = if music { "Другие альбомы исполнителя" } else { "Ещё у автора" };
-            for (title, cards) in [("Другие версии", &album.versions), (others, &self.album_others)] {
+            for (key, title, cards) in [("album:versions", "Другие версии", &album.versions), ("album:others", others, &self.album_others)] {
                 if !cards.is_empty() {
-                    list = list.push(Space::new().height(24)).push(text(title).size(24).font(ui::font_headline()).color(ui::c().text).wrapping(Wrapping::None)).push(Space::new().height(8)).push(self.view_cards(cards, ALBUM_COVER, false, open_album));
+                    list = list.push(Space::new().height(24)).push(self.shelf(key, title, None, cards.len(), |shown| self.album_cards(&cards[shown], ALBUM_COVER, false, open_album)));
                 }
             }
         }
         if section == Section::Playlists && !self.filtering() && !self.similar.is_empty() {
-            let cards = self.similar.iter().fold(row![].spacing(4), |cards, item| cards.push(self.view_home_item(item)));
-            list = list.push(Space::new().height(24)).push(text("Похожее").size(24).font(ui::font_headline()).color(ui::c().text).wrapping(Wrapping::None)).push(Space::new().height(8)).push(cards.wrap()).push(Space::new().height(16));
+            let similar = self.shelf("list:similar", "Похожее", None, self.similar.len(), |shown| self.home_cards(&self.similar[shown]));
+            list = list.push(Space::new().height(24)).push(similar).push(Space::new().height(16));
         }
         ui::scroll(list).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).height(Length::Fill).into()
     }
@@ -6833,6 +6973,11 @@ fn open_album(card: &Card) -> Message {
 }
 
 /// Заголовок блока со стрелкой, ведущий на полный список.
+/// Сетка карточек: ширина карточки подобрана так, что ряд заполнен до края.
+fn grid<'a>(cards: Vec<Element<'a, Message>>) -> Element<'a, Message> {
+    iced::widget::Row::with_children(cards).spacing(CARD_GAP).wrap().into()
+}
+
 fn more_title<'a>(title: &'a str, press: Message) -> Element<'a, Message> {
     glow(button(row![text(title).size(24).font(ui::font_headline()).color(ui::c().text), ui::icon(ui::CHEVRON, 24.0, ui::c().muted)].spacing(6).align_y(Alignment::Center))
         .padding([4, 8])
@@ -6947,19 +7092,19 @@ fn skeleton_list<'a>() -> Element<'a, Message> {
 }
 
 /// Те же отступы и размеры, что у настоящей карточки: обложка и две строки текста.
-fn skeleton_card<'a>() -> Element<'a, Message> {
+fn skeleton_card<'a>(side: f32) -> Element<'a, Message> {
     let line = |width, height, room| container(skeleton_bar(width, height)).center_y(room);
-    container(column![skeleton_bar(CARD, CARD).style(skeleton_round(8.0)), line(130.0, 13.0, SKELETON_TITLE), line(90.0, 10.0, SKELETON_SUBTITLE)].spacing(6).width(CARD)).padding(8).into()
+    container(column![skeleton_bar(side, side).style(skeleton_round(8.0)), line(130.0, 13.0, SKELETON_TITLE), line(90.0, 10.0, SKELETON_SUBTITLE)].spacing(6).width(side)).padding(CARD_PAD).into()
 }
 
-fn skeleton_cards<'a>() -> Element<'a, Message> {
-    skeleton_frame((0..SKELETON_ROWS).fold(row![].spacing(4), |cards, _| cards.push(skeleton_card())).wrap())
+fn skeleton_cards<'a>(side: f32) -> Element<'a, Message> {
+    skeleton_frame((0..SKELETON_ROWS).fold(row![].spacing(CARD_GAP), |cards, _| cards.push(skeleton_card(side))).wrap())
 }
 
-fn skeleton_home<'a>(in_row: usize) -> Element<'a, Message> {
+fn skeleton_home<'a>(in_row: usize, side: f32) -> Element<'a, Message> {
     skeleton_frame((0..SKELETON_BLOCKS).fold(column![].spacing(12), |blocks, _| {
         let head = container(skeleton_bar(220.0, 20.0)).center_y(SKELETON_HEAD);
-        let cards = (0..in_row).fold(row![].spacing(4), |cards, _| cards.push(skeleton_card()));
+        let cards = (0..in_row).fold(row![].spacing(CARD_GAP), |cards, _| cards.push(skeleton_card(side)));
         blocks.push(column![head, cards].spacing(8)).push(Space::new().height(8))
     }))
 }
