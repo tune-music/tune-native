@@ -4,6 +4,7 @@ mod api;
 mod anim;
 mod dpi;
 mod fonts;
+mod icons;
 mod glow;
 mod login;
 mod media;
@@ -1837,7 +1838,7 @@ impl App {
     }
 
     /// Пункты меню «…» открытой страницы: значок, подпись, что сделать и опасный ли пункт.
-    fn page_menu_items(&self) -> Vec<(&'static str, String, Message, bool)> {
+    fn page_menu_items(&self) -> Vec<(ui::Glyph, String, Message, bool)> {
         let link_and_pin = |target: PinRef, link: String| {
             let pinned = self.pins.iter().any(|pin| target.matches(pin));
             vec![(ui::PIN, if pinned { "Открепить" } else { "Закрепить" }.to_string(), Message::Pin(target), false), (ui::LINK, "Скопировать ссылку".to_string(), Message::CopyText(link), false)]
@@ -1923,7 +1924,7 @@ impl App {
     }
 
     /// Пункт меню страницы: скачать её треки или убрать их, если скачаны все.
-    fn download_item(&self) -> Option<(&'static str, String, Message, bool)> {
+    fn download_item(&self) -> Option<(ui::Glyph, String, Message, bool)> {
         let tracks: Vec<&Track> = self.playlist_tracks.iter().filter(|track| !track.unavailable).collect();
         if tracks.is_empty() {
             return None;
@@ -5363,8 +5364,8 @@ impl App {
             Section::Likes | Section::Playlists | Section::Albums | Section::Artists | Section::History | Section::Dislikes | Section::Downloads => Section::Collection,
             section => section,
         };
-        let item = |icon, label, section| {
-            let tint = if opened == section { ui::c().text } else { ui::c().muted };
+        let item = |icon: ui::Glyph, label, section| {
+            let (icon, tint) = if opened == section { (icon.selected(), ui::c().text) } else { (icon, ui::c().muted) };
             glow(
                 // Подписи в одну строку: «Книги и подкасты» иначе переносится.
                 button(row![ui::icon(icon, 24.0, tint), text(label).color(tint).wrapping(Wrapping::None)].spacing(12).align_y(Alignment::Center))
@@ -5395,7 +5396,7 @@ impl App {
                     item(ui::HEADPHONES, "Книги и подкасты", Section::Books),
                 ]
                 .extend(self.kids.then(|| item(ui::KIDS, "Детям", Section::Kids)))
-                .push(item(ui::HEART_OUTLINE, "Коллекция", Section::Collection))
+                .push(item(ui::COLLECTION, "Коллекция", Section::Collection))
                 .spacing(4),
                 Space::new().height(16),
                 self.view_pins(),
@@ -7971,6 +7972,7 @@ fn main() -> iced::Result {
         _ => None,
     };
     let yandex_fonts = fonts::load();
+    ui::set_icons(icons::load());
     ui::YANDEX_FONTS.store(!yandex_fonts.is_empty(), Ordering::Relaxed);
     let mut app = iced::application(move || App::new(preview.clone()), App::update, App::view);
     for font in yandex_fonts {

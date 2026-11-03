@@ -12,13 +12,13 @@ use crate::api;
 
 const FILES: [&str; 4] = ["YSText-Regular", "YSText-Medium", "YSText-Bold", "YSMusic-HeadlineBold"];
 
-fn asar() -> Option<PathBuf> {
+pub fn asar() -> Option<PathBuf> {
     let root = PathBuf::from(std::env::var_os("APPDATA")?).join("dev.tune.music").join("client");
     fs::read_dir(root).ok()?.flatten().map(|dir| dir.path().join("app.asar")).find(|path| path.exists())
 }
 
-/// Читает файл из архива asar, не распаковывая остальное.
-fn read_from_asar(path: &Path, name: &str) -> Option<Vec<u8>> {
+/// Читает файл из папки архива asar, не распаковывая остальное.
+pub fn read_from_asar(path: &Path, folder: &[&str], name: &str) -> Option<Vec<u8>> {
     let mut file = File::open(path).ok()?;
     let mut head = [0u8; 16];
     file.read_exact(&mut head).ok()?;
@@ -27,7 +27,7 @@ fn read_from_asar(path: &Path, name: &str) -> Option<Vec<u8>> {
     let mut header = vec![0u8; size];
     file.read_exact(&mut header).ok()?;
     let header: Value = serde_json::from_slice(&header).ok()?;
-    let entry = &header["files"]["app"]["files"]["fonts"]["files"][name];
+    let entry = folder.iter().fold(&header, |node, part| &node["files"][part])["files"].get(name)?;
     let offset: u64 = entry["offset"].as_str()?.parse().ok()?;
     file.seek(SeekFrom::Start(8 + pickle + offset)).ok()?;
     let mut data = vec![0u8; entry["size"].as_u64()? as usize];
@@ -96,7 +96,7 @@ pub fn load() -> Vec<Vec<u8>> {
         return fonts;
     }
     let Some(path) = asar() else { return Vec::new() };
-    let fonts: Option<Vec<Vec<u8>>> = FILES.iter().map(|name| woff_to_sfnt(&read_from_asar(&path, &format!("{name}.woff"))?)).collect();
+    let fonts: Option<Vec<Vec<u8>>> = FILES.iter().map(|name| woff_to_sfnt(&read_from_asar(&path, &["app", "fonts"], &format!("{name}.woff"))?)).collect();
     let Some(fonts) = fonts else { return Vec::new() };
     if fs::create_dir_all(&dir).is_ok() {
         for (name, font) in FILES.iter().zip(&fonts) {
