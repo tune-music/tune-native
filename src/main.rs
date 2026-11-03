@@ -2,6 +2,7 @@
 
 mod api;
 mod anim;
+mod dpi;
 mod fonts;
 mod glow;
 mod login;
@@ -4396,6 +4397,7 @@ impl App {
                 self.hwnd = hwnd;
                 if let Some(hwnd) = hwnd {
                     paint_caption(hwnd);
+                    dpi::guard(hwnd);
                 }
                 self.media = hwnd.map(Media::new);
             }
