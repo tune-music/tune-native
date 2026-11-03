@@ -112,12 +112,26 @@ pub fn remove(saved: &Saved) {
     let _ = fs::remove_file(cover_path(&saved.track.id));
 }
 
-/// Обложка скачанного трека с диска. Для всего остального её здесь нет.
+/// Номер трека, а не ключ другой обложки.
+pub fn is_track(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_digit() || c == ':')
+}
+
+/// Обложка с диска: у скачанного трека — рядом с файлом, у закреплённого и аватарки — среди
+/// сохранённых обложек.
 pub fn cover(id: &str) -> Option<Vec<u8>> {
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit() || c == ':') {
-        return None;
+    if is_track(id) {
+        return fs::read(cover_path(id)).ok();
     }
-    fs::read(cover_path(id)).ok()
+    fs::read(api::data_dir().join("covers").join(format!("{}.jpg", safe(id)))).ok()
+}
+
+/// Сохраняет обложку, которая нужна и без сети: закреплённого и аватарки.
+pub fn keep_cover(id: &str, bytes: &[u8]) {
+    let dir = api::data_dir().join("covers");
+    if fs::create_dir_all(&dir).is_ok() {
+        let _ = fs::write(dir.join(format!("{}.jpg", safe(id))), bytes);
+    }
 }
 
 fn read_json(name: &str) -> Option<Value> {
@@ -217,6 +231,6 @@ mod tests {
         assert_eq!(safe("123:456"), "123-456");
         assert_eq!(size_label(13_002_342), "12,4 МБ");
         assert_eq!(size_label(1_288_490_189), "1,2 ГБ");
-        assert!(cover("album:5").is_none());
+        assert!(is_track("123:456") && !is_track("pin:album:5") && !is_track(""));
     }
 }

@@ -655,8 +655,18 @@ fn parse_pin(item: &Value) -> Option<Pin> {
     }
 }
 
+/// Закреплённое. Ответ сохраняется: без сети показывается то, что было в прошлый раз.
 pub fn pins(token: &str) -> Result<Vec<Pin>, String> {
-    let v = get("pins", &[], token)?;
+    let saved = data_dir().join("pins.json");
+    let v = match get("pins", &[], token) {
+        Ok(v) => {
+            let _ = std::fs::create_dir_all(data_dir());
+            let _ = std::fs::write(&saved, v.to_string());
+            v
+        }
+        Err(e) if network_error(&e) => std::fs::read(&saved).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).ok_or(e)?,
+        Err(e) => return Err(e),
+    };
     Ok(result(&v)["pins"].as_array().into_iter().flatten().filter_map(parse_pin).collect())
 }
 

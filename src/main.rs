@@ -379,6 +379,8 @@ enum Dialog {
     Account,
     /// Удалить всё скачанное с компьютера.
     ClearDownloads,
+    /// Скачать все треки «Мне нравится».
+    DownloadLikes,
 }
 
 /// Вкладка поиска.
@@ -563,6 +565,8 @@ struct App {
     download_now: Option<String>,
     download_done: usize,
     download_failed: usize,
+    /// Сколько треков в текущей пачке всего: для «Скачиваем 3 из 20».
+    download_batch: usize,
     /// Нет сети: вместо ошибок спокойная плашка, играет только скачанное, связь проверяется сама.
     offline: bool,
     online_checking: bool,
@@ -920,6 +924,11 @@ enum Message {
     Downloaded(String, Result<offline::Saved, String>),
     DownloadRemove(Vec<String>),
     DownloadsClear,
+    /// Не качать то, что ещё в очереди скачивания: текущий трек докачается.
+    DownloadStop,
+    /// «Мне нравится» целиком: сначала сведения обо всех треках, потом скачивание.
+    DownloadLikes,
+    LikesForDownload(Result<Vec<Track>, String>),
     KidsToggle,
     EqToggle,
     EqPreset(usize),
@@ -1030,6 +1039,7 @@ impl App {
             download_now: None,
             download_done: 0,
             download_failed: 0,
+            download_batch: 0,
             offline: false,
             online_checking: false,
             track_info: None,
@@ -1502,7 +1512,24 @@ impl App {
             let (tx, jobs) = (tx.clone(), jobs.clone());
             std::thread::spawn(move || loop {
                 let Some((id, uri)) = jobs.lock().unwrap().pop() else { break };
-                if let Some(handle) = offline::cover(&id).or_else(|| api::cover(&uri, size)).and_then(|bytes| decoded(&bytes)) {
+                // Скачанный трек берёт обложку с диска; закреплённое и аватарка — из сети, а без
+                // неё с диска, куда сохраняются при каждой загрузке.
+                let bytes = if offline::is_track(&id) {
+                    offline::cover(&id).or_else(|| api::cover(&uri, size))
+                } else {
+                    let kept = id.starts_with(PIN_COVER_PREFIX) || id == AVATAR_COVER;
+                    match api::cover(&uri, size) {
+                        Some(bytes) => {
+                            if kept {
+                                offline::keep_cover(&id, &bytes);
+                            }
+                            Some(bytes)
+                        }
+                        None if kept => offline::cover(&id),
+                        None => None,
+                    }
+                };
+                if let Some(handle) = bytes.and_then(|bytes| decoded(&bytes)) {
                     if tx.unbounded_send((id, handle)).is_err() {
                         break;
                     }
@@ -3531,7 +3558,7 @@ impl App {
                         move || api::track_details(&id, &token)
                     }), move |r| Message::TrackInfoLoaded(id.clone(), r));
                 }
-                let focus = !matches!(dialog, Dialog::Delete(_) | Dialog::RemoveTrack(_) | Dialog::WaveTune | Dialog::Logout | Dialog::Account | Dialog::ClearDownloads);
+                let focus = !matches!(dialog, Dialog::Delete(_) | Dialog::RemoveTrack(_) | Dialog::WaveTune | Dialog::Logout | Dialog::Account | Dialog::ClearDownloads | Dialog::DownloadLikes);
                 self.dialog = Some(dialog);
                 if focus {
                     return operation::focus(Id::new(DIALOG_INPUT));
@@ -3564,6 +3591,7 @@ impl App {
                     Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account => Task::none(),
                     Dialog::Logout => self.handle(Message::Logout),
                     Dialog::ClearDownloads => self.handle(Message::DownloadsClear),
+                    Dialog::DownloadLikes => self.handle(Message::DownloadLikes),
                     Dialog::Create => Task::perform(background(move || api::create_playlist(&uid, &title, &token)), Message::PlaylistCreated),
                     Dialog::Rename(list) => {
                         let kind = list.kind;
@@ -3985,6 +4013,7 @@ impl App {
                     return self.notify("Уже скачано".to_string());
                 }
                 let count = fresh.len();
+                self.download_batch += count;
                 self.download_queue.extend(fresh);
                 let note = self.notify(if count == 1 { "Скачиваем трек".to_string() } else { format!("Скачиваем {count} {}", tracks_word(count)) });
                 return Task::batch([note, self.download_next()]);
@@ -4007,6 +4036,7 @@ impl App {
                     return self.download_next();
                 }
                 let (done, failed) = (std::mem::take(&mut self.download_done), std::mem::take(&mut self.download_failed));
+                self.download_batch = 0;
                 let note = match (done, failed) {
                     (_, 0) => format!("Скачано: {done} {}", tracks_word(done)),
                     (0, _) => "Не удалось скачать. Проверьте подключение к интернету".to_string(),
@@ -4023,6 +4053,29 @@ impl App {
                 self.downloads_changed();
                 return self.notify(if gone.len() == 1 { "Удалено из скачанного".to_string() } else { format!("Удалено из скачанного: {} {}", gone.len(), tracks_word(gone.len())) });
             }
+            Message::DownloadStop => {
+                let left = self.download_queue.len();
+                self.download_queue.clear();
+                self.download_batch = self.download_batch.saturating_sub(left);
+                return self.notify("Скачивание остановлено: текущий трек докачается".to_string());
+            }
+            Message::DownloadLikes => {
+                let Some(token) = self.token() else { return Task::none() };
+                let ids = self.liked_ids.clone();
+                // Сведения о треках просятся пачками: сотни номеров в одном запросе Яндекс не любит.
+                return Task::perform(
+                    background(move || {
+                        let mut tracks = Vec::new();
+                        for chunk in ids.chunks(LIKES_PAGE) {
+                            tracks.extend(api::tracks_by_ids(chunk, &token)?);
+                        }
+                        Ok(tracks)
+                    }),
+                    Message::LikesForDownload,
+                );
+            }
+            Message::LikesForDownload(Ok(tracks)) => return self.update(Message::Download(tracks)),
+            Message::LikesForDownload(Err(e)) => return self.fail(e),
             Message::DownloadsClear => {
                 self.download_queue.clear();
                 std::mem::take(&mut self.downloads).iter().for_each(offline::remove);
@@ -4398,6 +4451,14 @@ impl App {
             }
             page = page.push(container(line).width(Length::Fill).padding([10, 16]).style(ui::tile));
         }
+        if self.download_now.is_some() && matches!(self.section, Section::Downloads | Section::Likes | Section::Playlists) {
+            let at = (self.download_done + self.download_failed + 1).min(self.download_batch.max(1));
+            let mut line = row![ui::icon(ui::DOWNLOAD, 20.0, ui::ACCENT), text(format!("Скачиваем: {at} из {}", self.download_batch.max(at))).color(ui::TEXT).width(Length::Fill)].spacing(12).align_y(Alignment::Center);
+            if !self.download_queue.is_empty() {
+                line = line.push(shine(button(text("Остановить").color(ui::TEXT)).padding([6, 14]).style(ui::secondary).on_press(Message::DownloadStop), 24.0));
+            }
+            page = page.push(container(line).width(Length::Fill).padding([10, 16]).style(ui::tile));
+        }
         if let Some(error) = &self.error {
             // Плашка с понятным текстом: подробности ошибки нужны только в журнале.
             let mut line = row![ui::icon(ui::INFO, 20.0, ui::DANGER), text(human_error(error)).color(ui::TEXT).width(Length::Fill)].spacing(12).align_y(Alignment::Center);
@@ -4465,6 +4526,10 @@ impl App {
             Dialog::TrackInfo(track) => return self.view_track_info(track),
             Dialog::Account => return self.view_account(),
             Dialog::Logout => ("Выйти из аккаунта?".to_string(), "Выйти", true),
+            Dialog::DownloadLikes => {
+                let left = self.liked_ids.iter().filter(|id| !self.download_ids.contains(*id)).count();
+                (format!("Скачать «Мне нравится»: {left} {}?", tracks_word(left)), "Скачать", false)
+            }
             Dialog::ClearDownloads => (format!("Удалить всё скачанное ({})?", offline::size_label(self.downloads.iter().map(|saved| saved.bytes).sum())), "Удалить", true),
             Dialog::Create => ("Новый плейлист".to_string(), "Создать", false),
             Dialog::Rename(_) => ("Название плейлиста".to_string(), "Сохранить", false),
@@ -5387,6 +5452,15 @@ impl App {
         shine(button(container(ui::icon(ui::PIN, 20.0, if pinned { ui::ACCENT } else { ui::TEXT })).center(20)).padding(7).style(ui::secondary).on_press(Message::Pin(target)), 20.0).into()
     }
 
+    /// Скачать «Мне нравится» целиком. Всё уже скачано — значок отмечен и не нажимается.
+    fn view_likes_download<'a>(&self) -> Element<'a, Message> {
+        let all = !self.liked_ids.is_empty() && self.liked_ids.iter().all(|id| self.download_ids.contains(id));
+        let busy = self.download_now.is_some();
+        let (icon, tint) = if all { (ui::DOWNLOAD_DONE, ui::ACCENT) } else { (ui::DOWNLOAD, ui::TEXT) };
+        let press = (!all && !busy && !self.offline && !self.liked_ids.is_empty()).then_some(Message::DialogOpen(Dialog::DownloadLikes));
+        shine(button(container(ui::icon(icon, 20.0, tint)).center(20)).padding(7).style(ui::secondary).on_press_maybe(press), 20.0).into()
+    }
+
     fn view_filter<'a>(&self) -> Element<'a, Message> {
         let width = if self.main_width() < FILTER_WIDE { FILTER_WIDTH_SMALL } else { FILTER_WIDTH };
         let input = text_input("Поиск по трекам", &self.filter).id(FILTER_INPUT).on_input(Message::Filter).padding(Padding { top: 8.0, right: 34.0, bottom: 8.0, left: 16.0 }).size(14).width(width).style(ui::input);
@@ -5420,6 +5494,7 @@ impl App {
             glow(button(ui::icon(ui::BACK, 24.0, ui::TEXT)).padding(6).style(ui::ghost).on_press(Message::Back), 20.0),
             container(name).width(Length::Fill).clip(true),
             self.view_likes_pin(),
+            self.view_likes_download(),
             self.view_filter(),
         ]
         .spacing(12)
