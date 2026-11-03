@@ -181,6 +181,11 @@ const NOTICE_CLOSE: f32 = 0.18;
 const FRAME_LIMIT: f32 = 0.05;
 /// Самая длинная подпись волны.
 const WAVE_LABEL: usize = 56;
+/// Заголовок страницы волны: пределы размера, ширина буквы в долях размера и поля по бокам.
+const WAVE_TITLE_MAX: f32 = 56.0;
+const WAVE_TITLE_MIN: f32 = 32.0;
+const WAVE_TITLE_CHAR: f32 = 0.62;
+const WAVE_TITLE_GAP: f32 = 80.0;
 const WAVE_CARD: &str = "wave:";
 /// Сколько треков показать в блоке главной.
 const HOME_TRACKS: usize = 5;
@@ -4752,8 +4757,11 @@ impl App {
             // Волна от исполнителя, альбома или настроения: можно вернуться к обычной.
             tools = tools.push(shine(button(text("К Моей волне").color(ui::TEXT)).padding([8, 16]).style(ui::secondary).on_press(Message::WaveReset), 24.0));
         }
+        // Длинное название уменьшается под ширину, а если и так не влезает — переносится на вторую строку.
+        let room = (self.main_width() - WAVE_TITLE_GAP).max(200.0);
+        let size = (room / (title.chars().count().max(1) as f32 * WAVE_TITLE_CHAR)).clamp(WAVE_TITLE_MIN, WAVE_TITLE_MAX);
         let body = column![
-            text(title).size(56).font(ui::font_headline()).color(ui::WHITE).wrapping(Wrapping::None),
+            text(title).size(size).font(ui::font_headline()).color(ui::WHITE).wrapping(Wrapping::WordOrGlyph).align_x(Alignment::Center).width(room),
             text(note).size(16).color(if tuned.is_empty() { ui::MUTED } else { ui::ACCENT }).wrapping(Wrapping::None),
             Space::new().height(28),
             play,
