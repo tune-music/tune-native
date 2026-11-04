@@ -431,6 +431,33 @@ pub fn raw(path: &str, token: &str) -> Result<String, String> {
     get(path, &[], token).map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
 }
 
+/// Прошёл ли аккаунт мастер первого запуска: иначе оригинал предлагает выбрать исполнителей.
+pub fn wizard_passed(token: &str) -> Result<bool, String> {
+    let v = get("account/settings", &[], token)?;
+    Ok(result(&v)["wizardIsPassed"].as_bool().unwrap_or(true))
+}
+
+/// Жанры мастера: номер для запроса и название, первым «Микс» — всё вместе.
+pub fn wizard_genres(token: &str) -> Result<Vec<(String, String)>, String> {
+    let v = get("feed/wizard2-new/get-genres", &[], token)?;
+    Ok(result(&v)["genres"].as_array().into_iter().flatten().filter_map(|g| Some((g["id"].as_str()?.to_string(), g["title"].as_str()?.to_string()))).collect())
+}
+
+/// Ещё исполнители жанра для мастера, кроме уже показанных.
+pub fn wizard_artists(genre: &str, showed: &[String], liked: &[String], count: usize, token: &str) -> Result<Vec<Card>, String> {
+    let ids = |list: &[String]| list.iter().filter_map(|id| id.parse::<u64>().ok()).collect::<Vec<_>>();
+    let body = json!({ "genre": genre, "showedArtists": ids(showed), "likedArtists": ids(liked), "unlikedArtists": [], "countOfNewArtists": count });
+    let v = post("feed/wizard2-new/get-artists-by-genre", "application/json", body.to_string(), token)?;
+    Ok(result(&v)["artists"].as_array().into_iter().flatten().filter_map(artist_card).collect())
+}
+
+/// Завершает мастер: выбранные исполнители уходят в рекомендации, мастер больше не предлагается.
+pub fn wizard_finish(genre: &str, liked: &[String], token: &str) -> Result<(), String> {
+    let ids: Vec<u64> = liked.iter().filter_map(|id| id.parse().ok()).collect();
+    let body = json!({ "genre": genre, "likedArtists": ids, "unlikedArtists": [] });
+    post("feed/wizard2-new/finish", "application/json", body.to_string(), token).map(|_| ())
+}
+
 /// Включено ли «Меньше ИИ» в аккаунте.
 pub fn ai_reduction(token: &str) -> Result<bool, String> {
     let v = get("account/settings", &[], token)?;

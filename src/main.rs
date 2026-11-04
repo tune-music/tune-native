@@ -436,7 +436,26 @@ enum Dialog {
     ClearDownloads,
     /// Скачать все треки «Мне нравится».
     DownloadLikes,
+    /// Мастер первого запуска: выбрать любимых исполнителей.
+    Wizard,
 }
+
+/// Мастер первого запуска: жанры, исполнители каждого жанра и выбранные.
+#[derive(Default)]
+struct Wizard {
+    genres: Vec<(String, String)>,
+    genre: usize,
+    artists: HashMap<String, Vec<Card>>,
+    liked: Vec<String>,
+    loading: bool,
+    sending: bool,
+}
+
+/// Сколько исполнителей приходит в мастер за раз, как в оригинале.
+const WIZARD_BATCH: usize = 60;
+const WIZARD_WIDTH: f32 = 760.0;
+const WIZARD_HEIGHT: f32 = 640.0;
+const WIZARD_CARD: f32 = 104.0;
 
 /// Вкладка поиска.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -513,6 +532,8 @@ struct Place {
 /// Запуск с готовым разделом: первый трек показывается в плеере, но не играет.
 #[derive(Clone)]
 enum Preview {
+    /// Мастер первого запуска поверх главной, без отправки.
+    Wizard,
     /// Страница из блоков по её адресу у Яндекса: `landing:music_genres`.
     Landing(String),
     Dislikes,
@@ -615,6 +636,7 @@ struct App {
     home_page: Section,
     /// Последняя открытая вкладка главной и книг с подкастами.
     landing_tabs: [usize; 4],
+    wizard: Wizard,
     /// Открытая страница из блоков вне разделов: её адрес у Яндекса и название.
     landing: Option<(String, String)>,
     /// Скелет, чьи блоки сейчас в `home`.
@@ -1017,6 +1039,14 @@ enum Message {
     /// Другие альбомы исполнителя для страницы альбома.
     AlbumOthers(String, Result<api::Releases, String>),
     AlbumGenre(String, Result<Vec<Card>, String>),
+    /// Мастер первого запуска: нужен ли, жанры, выбор жанра, исполнители, выбор и завершение.
+    WizardNeeded(Result<bool, String>),
+    WizardGenres(Result<Vec<(String, String)>, String>),
+    WizardGenre(usize),
+    WizardArtists(String, Result<Vec<Card>, String>),
+    WizardToggle(String),
+    WizardFinish,
+    WizardDone(Result<(), String>),
     /// Окно закрывают: сначала надо запомнить, что играло.
     Quit,
     /// Новая сессия для волны, восстановленной после запуска.
@@ -1169,6 +1199,7 @@ impl App {
             home_loading: false,
             home_page: Section::Home,
             landing_tabs: [0; 4],
+            wizard: Wizard::default(),
             landing: None,
             home_skeleton: String::new(),
             progress: HashMap::new(),
@@ -2936,7 +2967,13 @@ impl App {
                 self.liked_ids = ids;
                 let pins = self.token().map_or(Task::none(), |token| Task::perform(background(move || api::pins(&token)), Message::PinsLoaded));
                 let avatar = self.profile.as_ref().and_then(|p| p.avatar.clone()).map_or(Task::none(), |uri| self.fetch_cover_jobs(vec![(AVATAR_COVER.to_string(), uri)], "islands-200"));
-                let pins = Task::batch([pins, avatar, self.liked_pages_load()]);
+                // Новому аккаунту оригинал сразу предлагает выбрать любимых исполнителей.
+                let wizard = match (self.token(), self.offline, &self.preview) {
+                    (Some(token), false, None) => Task::perform(background(move || api::wizard_passed(&token).map(|passed| !passed)), Message::WizardNeeded),
+                    (_, _, Some(Preview::Wizard)) => Task::done(Message::WizardNeeded(Ok(true))),
+                    _ => Task::none(),
+                };
+                let pins = Task::batch([pins, avatar, self.liked_pages_load(), wizard]);
                 let page = match self.preview.clone() {
                     Some(Preview::Wave | Preview::WaveSeek) => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
                     Some(Preview::Lyrics) => self.wave_load(vec!["artist:3121".to_string()], None, false),
@@ -2963,6 +3000,10 @@ impl App {
                         self.preview = None;
                         let page = self.update(Message::Open(Section::Playlists));
                         Task::batch([page, self.update(Message::DialogOpen(Dialog::Create))])
+                    }
+                    Some(Preview::Wizard) => {
+                        self.preview = None;
+                        Task::none()
                     }
                     Some(Preview::Home) => {
                         self.preview = None;
@@ -3267,6 +3308,67 @@ impl App {
                 let jobs = others.iter().filter_map(|c| Some((format!("{ALBUM_COVER}{}", c.id), c.cover.clone()?))).collect();
                 self.album_others = others;
                 return self.fetch_cover_jobs(jobs, "300x300");
+            }
+            Message::WizardNeeded(Ok(true)) => {
+                let Some(token) = self.token() else { return Task::none() };
+                self.wizard = Wizard { loading: true, ..Wizard::default() };
+                let open = self.update(Message::DialogOpen(Dialog::Wizard));
+                return Task::batch([open, Task::perform(background(move || api::wizard_genres(&token)), Message::WizardGenres)]);
+            }
+            Message::WizardNeeded(_) => {}
+            Message::WizardGenres(Ok(genres)) if !genres.is_empty() => {
+                self.wizard.genres = genres;
+                return self.update(Message::WizardGenre(0));
+            }
+            // Без жанров мастер показать не на чем: тихо закрываем, предложим в другой раз.
+            Message::WizardGenres(_) => {
+                if self.dialog == Some(Dialog::Wizard) {
+                    return self.update(Message::MenuClose);
+                }
+            }
+            Message::WizardGenre(index) => {
+                let (Some((genre, _)), Some(token)) = (self.wizard.genres.get(index).cloned(), self.token()) else { return Task::none() };
+                self.wizard.genre = index;
+                if self.wizard.artists.contains_key(&genre) {
+                    return Task::none();
+                }
+                self.wizard.loading = true;
+                let liked = self.wizard.liked.clone();
+                let wanted = genre.clone();
+                return Task::perform(background(move || api::wizard_artists(&genre, &[], &liked, WIZARD_BATCH, &token)), move |r| Message::WizardArtists(wanted.clone(), r));
+            }
+            Message::WizardArtists(genre, result) => {
+                self.wizard.loading = false;
+                let cards = result.unwrap_or_default();
+                let jobs = cards.iter().filter_map(|c| Some((format!("{ARTIST_COVER}{}", c.id), c.cover.clone()?))).collect();
+                self.wizard.artists.insert(genre, cards);
+                return self.fetch_cover_jobs(jobs, "200x200");
+            }
+            Message::WizardToggle(id) => {
+                if let Some(at) = self.wizard.liked.iter().position(|liked| *liked == id) {
+                    self.wizard.liked.remove(at);
+                } else {
+                    self.wizard.liked.push(id);
+                }
+            }
+            Message::WizardFinish => {
+                let (Some(token), Some((genre, _))) = (self.token(), self.wizard.genres.get(self.wizard.genre).cloned()) else { return Task::none() };
+                if self.wizard.liked.len() < 3 || self.wizard.sending {
+                    return Task::none();
+                }
+                self.wizard.sending = true;
+                let liked = self.wizard.liked.clone();
+                return Task::perform(background(move || api::wizard_finish(&genre, &liked, &token)), Message::WizardDone);
+            }
+            Message::WizardDone(result) => {
+                self.wizard.sending = false;
+                return match result {
+                    Ok(()) => {
+                        let close = self.update(Message::MenuClose);
+                        Task::batch([close, self.liked_pages_load(), self.notify("Рекомендации подстроятся под ваш вкус".to_string())])
+                    }
+                    Err(e) => self.fail(e),
+                };
             }
             Message::AlbumGenre(id, result) => {
                 let Some(album) = self.album.as_ref().filter(|album| album.id == id) else { return Task::none() };
@@ -4135,7 +4237,7 @@ impl App {
             }
             Message::FocusMove(forward) => return if forward { operation::focus_next() } else { operation::focus_previous() },
             Message::Enter => {
-                let confirmable = !matches!(self.dialog, None | Some(Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account));
+                let confirmable = !matches!(self.dialog, None | Some(Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account | Dialog::Wizard));
                 if confirmable {
                     return self.handle(Message::DialogConfirm);
                 }
@@ -4214,7 +4316,7 @@ impl App {
                 }
                 self.dialog = None;
                 return match dialog {
-                    Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account => Task::none(),
+                    Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account | Dialog::Wizard => Task::none(),
                     Dialog::Logout => self.handle(Message::Logout),
                     Dialog::ClearDownloads => self.handle(Message::DownloadsClear),
                     Dialog::DownloadLikes => self.handle(Message::DownloadLikes),
@@ -5199,6 +5301,7 @@ impl App {
     fn view_dialog<'a>(&'a self, dialog: &'a Dialog) -> Element<'a, Message> {
         let (title, confirm, danger): (String, &str, bool) = match dialog {
             Dialog::WaveTune => return self.view_wave_tune(),
+            Dialog::Wizard => return self.view_wizard(),
             Dialog::TrackInfo(track) => return self.view_track_info(track),
             Dialog::Account => return self.view_account(),
             Dialog::Logout => ("Выйти из аккаунта?".to_string(), "Выйти", true),
@@ -5341,6 +5444,59 @@ impl App {
     }
 
     /// Настройки волны: каждый выбор сразу запускает волну заново.
+    /// Мастер первого запуска, как в оригинале: жанры вкладками, исполнители кружками, выбранные
+    /// отмечены; кнопка подсказывает, сколько ещё выбрать, и завершает с трёх.
+    fn view_wizard(&self) -> Element<'_, Message> {
+        let alpha = self.dialog_fade.shown();
+        let wizard = &self.wizard;
+        let head = column![
+            text("Выберите любимых исполнителей").size(24).font(ui::font_headline()).color(ui::c().text.scale_alpha(alpha)),
+            text("Это поможет получить более точные и интересные рекомендации").size(14).color(ui::c().muted.scale_alpha(alpha)),
+        ]
+        .spacing(6);
+        let genres = wizard.genres.iter().enumerate().fold(row![].spacing(8), |chips, (index, (_, title))| {
+            chips.push(shine(button(text(title.as_str()).wrapping(Wrapping::None)).padding([7, 14]).style(ui::chip_faded(index == wizard.genre, alpha)).on_press(Message::WizardGenre(index)), 18.0))
+        });
+        let genres = scrollable(genres.padding(Padding::ZERO.bottom(10))).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(4).scroller_width(4)));
+        let artists = wizard.genres.get(wizard.genre).and_then(|(genre, _)| wizard.artists.get(genre));
+        let grid: Element<'_, Message> = match artists {
+            Some(cards) if !cards.is_empty() => {
+                let cells = cards.iter().map(|card| {
+                    let chosen = wizard.liked.contains(&card.id);
+                    let photo: Element<'_, Message> = match self.covers.get(&format!("{ARTIST_COVER}{}", card.id)) {
+                        Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle) * alpha).width(WIZARD_CARD).height(WIZARD_CARD).border_radius(WIZARD_CARD / 2.0).into(),
+                        None => container(Space::new()).width(WIZARD_CARD).height(WIZARD_CARD).style(ui::avatar).into(),
+                    };
+                    let mut photo = stack![photo];
+                    if chosen {
+                        photo = photo.push(container(ui::icon(ui::CHECK, 36.0, iced::Color::WHITE)).center(WIZARD_CARD).style(move |_| container::Style::default().background(ui::c().accent.scale_alpha(0.55)).border(iced::border::rounded(WIZARD_CARD / 2.0))));
+                    }
+                    let name = text(card.title.as_str()).size(13).width(WIZARD_CARD).align_x(Alignment::Center).color(ui::c().text.scale_alpha(alpha));
+                    button(column![photo, name].spacing(6).align_x(Alignment::Center)).padding(4).style(ui::ghost).on_press(Message::WizardToggle(card.id.clone())).into()
+                });
+                ui::scroll(row(cells).spacing(12).width(Length::Fill).wrap().vertical_spacing(12)).width(Length::Fill).height(Length::Fill).into()
+            }
+            Some(_) => container(text("Здесь пока никого нет").color(ui::c().muted)).center(Length::Fill).into(),
+            None => container(text(if wizard.loading { "Загружаем исполнителей…" } else { "" }).color(ui::c().muted)).center(Length::Fill).into(),
+        };
+        let label = match wizard.liked.len() {
+            0 => "Настраиваем под вас",
+            1 => "Осталось чуть-чуть",
+            2 => "Еще один, и всё",
+            _ => "Готово",
+        };
+        let ready = wizard.liked.len() >= 3 && !wizard.sending;
+        // Пока не выбрано трёх, кнопка только подсказывает и не нажимается.
+        let (style, ink) = if ready { (ui::accent as fn(&iced::Theme, button::Status) -> button::Style, ui::c().on_accent) } else { (ui::secondary as fn(&iced::Theme, button::Status) -> button::Style, ui::c().muted) };
+        let done = shine(button(text(label).font(ui::font_medium()).color(ink.scale_alpha(alpha))).padding([10, 24]).style(ui::button_faded(style, alpha)).on_press_maybe(ready.then_some(Message::WizardFinish)), 24.0);
+        let close = shine(button(text("Позже").color(ui::c().text.scale_alpha(alpha))).padding([10, 18]).style(ui::button_faded(ui::secondary, alpha)).on_press(Message::MenuClose), 24.0);
+        let buttons = row![close, Space::new().width(Length::Fill), done].align_y(Alignment::Center);
+        let body = column![head, genres, grid, buttons].spacing(16);
+        let window = reveal(container(body).width(WIZARD_WIDTH).height(WIZARD_HEIGHT).padding(24).style(ui::popover_faded(alpha))).scale(0.94 + 0.06 * alpha, 0.5, 0.5).shift(0.0, 10.0 * (1.0 - alpha));
+        let dim = iced::Color::BLACK.scale_alpha(0.6 * alpha);
+        reveal(mouse_area(container(mouse_area(window).on_press(Message::DialogInput(self.dialog_text.clone()))).center(Length::Fill).style(move |_| container::Style::default().background(dim))).on_press(Message::MenuClose)).inert(!self.dialog_fade.live).into()
+    }
+
     fn view_wave_tune(&self) -> Element<'_, Message> {
         let alpha = self.dialog_fade.shown();
         let mut body = column![text("Настроить волну").size(20).font(ui::font_medium()).color(ui::c().text.scale_alpha(alpha))].spacing(16);
@@ -8639,6 +8795,7 @@ fn main() -> iced::Result {
             what if what.starts_with("album:") => Preview::Album(what[6..].to_string()),
             what if what.starts_with("artist:") => Preview::Artist(what[7..].to_string()),
             what if what.starts_with("landing:") => Preview::Landing(what[8..].to_string()),
+            "wizard" => Preview::Wizard,
             what if what.starts_with("artist-familiar:") => Preview::ArtistFamiliar(what[16..].to_string()),
             what if what.starts_with("artist-menu:") => Preview::ArtistMenu(what[12..].to_string()),
             "disliked-artists" => Preview::DislikedArtists,
