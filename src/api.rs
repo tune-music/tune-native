@@ -55,6 +55,8 @@ pub struct Track {
     pub finished: bool,
     /// Без подписки играет только отрывок: в оригинале у таких треков значок Плюса.
     pub plus_only: bool,
+    /// Громкость по EBU R128 из ответа о треке: интегральная в LUFS и истинный пик в dBTP.
+    pub loudness: Option<(f32, f32)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -406,6 +408,7 @@ fn parse_track(v: &Value) -> Option<Track> {
         batch: None,
         unavailable: v["available"].as_bool() == Some(false),
         plus_only: v["availableFullWithoutPermission"].as_bool() == Some(false),
+        loudness: v["r128"]["i"].as_f64().zip(v["r128"]["tp"].as_f64()).map(|(i, tp)| (i as f32, tp as f32)),
         // Как в оригинале: переход только между музыкальными треками, не подкастами и книгами.
         fade: Fade::parse(&v["fade"]).filter(|_| v["type"].as_str() == Some("music")),
         remember: v["rememberPosition"].as_bool() == Some(true),

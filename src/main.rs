@@ -119,6 +119,9 @@ const WAVE_HISTORY: usize = 50;
 const MAX_FAILURES: u32 = 3;
 /// Высота строки трека. Одинаковая у всех: по ней считается, какие строки видны.
 const ROW: f32 = 58.0;
+/// Выравнивание громкости: цель в LUFS, как у большинства стримингов, и потолок пика в dBTP.
+const LOUDNESS_TARGET: f32 = -14.0;
+const LOUDNESS_PEAK: f32 = -1.0;
 /// Полоса у края списка, где перетаскивание само прокручивает его, и скорость у самого края.
 const DRAG_EDGE: f32 = 64.0;
 /// Сверху списки начинаются под заголовком страницы.
@@ -716,6 +719,8 @@ struct App {
     eq: equalizer::EqSettings,
     /// Плавные переходы между треками.
     crossfade: bool,
+    /// Выравнивать громкость треков по R128.
+    normalize: bool,
     /// Показывать пункт «Детям» в боковой панели.
     kids: bool,
     /// Скорость подкастов и книг.
@@ -1027,6 +1032,7 @@ enum Message {
     DragEnd,
     TrackMoved(Result<(), String>),
     CrossfadeToggle,
+    NormalizeToggle,
     /// Проверка связи без сети и её итог.
     OnlineCheck,
     OnlineChecked(Result<(), String>),
@@ -1230,6 +1236,7 @@ impl App {
             quality: saved.quality,
             eq: saved.eq,
             crossfade: saved.crossfade,
+            normalize: saved.normalize,
             kids: saved.kids,
             speed: saved.speed,
             look: saved.look,
@@ -1406,12 +1413,13 @@ impl App {
 
     fn apply_volume(&self) {
         if let Some(p) = &self.player {
-            p.set_volume(if self.muted { 0.0 } else { self.volume });
+            let gain = if self.normalize { self.current_track().and_then(|track| track.loudness).map_or(1.0, loudness_gain) } else { 1.0 };
+            p.set_volume(if self.muted { 0.0 } else { self.volume * gain });
         }
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, kids: self.kids, speed: self.speed, look: self.look });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, kids: self.kids, speed: self.speed, look: self.look });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -4410,6 +4418,11 @@ impl App {
                 self.crossfade = !self.crossfade;
                 self.save_settings();
             }
+            Message::NormalizeToggle => {
+                self.normalize = !self.normalize;
+                self.apply_volume();
+                self.save_settings();
+            }
             Message::Download(tracks) => {
                 self.menu = None;
                 let fresh: Vec<Track> = tracks
@@ -4636,6 +4649,8 @@ impl App {
                     Ok(sound) => {
                         self.sound = Some(sound);
                         self.active = true;
+                        // У каждого трека своя громкость: выравнивание пересчитывается при смене.
+                        self.apply_volume();
                         self.listen_tick = Some(Instant::now());
                         if let Some(listen) = self.listen.as_mut().filter(|listen| listen.started.is_none()) {
                             listen.started = Some(api::now_stamp());
@@ -5818,6 +5833,14 @@ impl App {
         .align_y(Alignment::Center);
         let cross = glow(button(cross).width(Length::Fill).padding(8).style(ui::row).on_press(Message::CrossfadeToggle), 8.0);
 
+        let normalize = row![
+            column![text("Одинаковая громкость треков").color(ui::c().text), text("Тихие и громкие записи звучат на одном уровне, по данным Яндекса о громкости трека").size(13).color(ui::c().muted)].spacing(2).width(Length::Fill),
+            view_switch(Some(self.normalize)),
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center);
+        let normalize = glow(button(normalize).width(Length::Fill).padding(8).style(ui::row).on_press(Message::NormalizeToggle), 8.0);
+
         let kids = row![
             column![text("Детский раздел").color(ui::c().text), text("Пункт «Детям» в боковой панели: сказки, песни и аудиокниги для детей").size(13).color(ui::c().muted)].spacing(2).width(Length::Fill),
             view_switch(Some(self.kids)),
@@ -5833,6 +5856,7 @@ impl App {
             sound,
             self.view_equalizer(),
             cross,
+            normalize,
             column![title("Рекомендации"), ai, kids].spacing(8),
             self.view_stored(),
             view_hotkeys(),
@@ -7063,6 +7087,13 @@ fn show_window(hwnd: isize) {
     }
 }
 
+/// Множитель громкости, который приводит трек к `LOUDNESS_TARGET` по его R128.
+/// Тихий трек поднимается не выше, чем позволяет его пик, громкий — не тише, чем на 12 дБ.
+fn loudness_gain((integrated, peak): (f32, f32)) -> f32 {
+    let db = (LOUDNESS_TARGET - integrated).min(LOUDNESS_PEAK - peak).clamp(-12.0, 6.0);
+    10f32.powf(db / 20.0)
+}
+
 fn remembers_scroll(section: Section) -> bool {
     !matches!(section, Section::Lyrics | Section::Queue | Section::Wave)
 }
@@ -8247,6 +8278,18 @@ mod tests {
         assert_eq!(wave_label("playlist:1_2", "Лист"), "Моя волна по плейлисту · Лист");
         assert_eq!(clipped("короткое", 56), "короткое");
         assert_eq!(clipped("один два три", 6), "один…");
+    }
+
+    #[test]
+    fn evens_out_loudness_within_peak() {
+        let db = |gain: f32| (20.0 * gain.log10() * 10.0).round() / 10.0;
+        // Громкий мастер: тише на разницу с целью.
+        assert_eq!(db(loudness_gain((-9.2, 1.31))), -4.8);
+        // Тихая запись поднимается, но пик не выходит за −1 dBTP.
+        assert_eq!(db(loudness_gain((-20.0, -3.0))), 2.0);
+        // Пределы: не громче +6 и не тише −12 дБ.
+        assert_eq!(db(loudness_gain((-40.0, -30.0))), 6.0);
+        assert_eq!(db(loudness_gain((10.0, 0.0))), -12.0);
     }
 
     #[test]
