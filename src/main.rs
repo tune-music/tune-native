@@ -452,6 +452,59 @@ enum Dialog {
     Wizard,
     /// Название и исполнитель своего загруженного трека.
     EditTrack(Track),
+    /// HTML-код для сайта: адрес плеера и подпись со ссылками.
+    Embed(Embed),
+}
+
+/// Что вставить на сайт: адрес плеера Яндекса и подпись «Слушайте … на Яндекс Музыке».
+#[derive(Clone, Debug, PartialEq)]
+struct Embed {
+    src: String,
+    listen: String,
+    width: &'static str,
+    height: &'static str,
+}
+
+impl Embed {
+    fn album(id: &str, title: &str, artists: &[(String, String)]) -> Self {
+        let listen = listen_html(&format!("{YANDEX}/album/{id}"), title, artists.first());
+        Embed { src: format!("{YANDEX}/iframe/album/{id}"), listen, width: "614", height: "556" }
+    }
+
+    fn playlist(owner: &str, kind: &str, title: &str) -> Self {
+        let listen = listen_html(&format!("{YANDEX}/users/{owner}/playlists/{kind}"), title, None);
+        Embed { src: format!("{YANDEX}/iframe/playlist/{owner}/{kind}"), listen, width: "614", height: "556" }
+    }
+
+    fn track(track: &Track) -> Self {
+        let src = match &track.album {
+            Some(album) => format!("{YANDEX}/iframe/album/{album}/track/{}", track.id),
+            None => format!("{YANDEX}/iframe/track/{}", track.id),
+        };
+        Embed { src, listen: listen_html(&track.share_link(), &track.title, track.artist_list.first()), width: "614", height: "244" }
+    }
+}
+
+const YANDEX: &str = "https://music.yandex.ru";
+
+/// `<a href="…">Название</a> — <a href="…">Исполнитель</a>`, как в подписи оригинала.
+fn listen_html(link: &str, title: &str, artist: Option<&(String, String)>) -> String {
+    let escape = |text: &str| text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+    let main = format!("<a href=\"{link}\">{}</a>", escape(title));
+    match artist.filter(|(_, id)| !id.is_empty()) {
+        Some((name, id)) => format!("{main} — <a href=\"{YANDEX}/artist/{id}\">{}</a>", escape(name)),
+        None => main,
+    }
+}
+
+/// Код вставки, как его собирает оригинал: размер без единиц — в пикселях, с `%` — как есть.
+fn embed_code(embed: &Embed, width: &str, height: &str) -> String {
+    let bare = |size: &str| size.trim().trim_end_matches("px").to_string();
+    let css = |size: &str| if size.trim().ends_with('%') { size.trim().to_string() } else { format!("{}px", bare(size)) };
+    format!(
+        "<iframe frameborder=\"0\" allow=\"clipboard-write\" style=\"border:none;width:{};height:{};\" width=\"{}\" height=\"{}\" src=\"{}\">Слушайте {} на Яндекс Музыке</iframe>",
+        css(width), css(height), bare(width), bare(height), embed.src, embed.listen
+    )
 }
 
 /// Мастер первого запуска: жанры, исполнители каждого жанра и выбранные.
@@ -2088,6 +2141,9 @@ impl App {
                 let Some(list) = &self.playlist else { return Vec::new() };
                 if list.source == Source::Album {
                     let mut items = link_and_pin(PinRef::Album(list.kind.clone()), format!("https://music.yandex.ru/album/{}", list.kind));
+                    if let Some(album) = &self.album {
+                        items.push((ui::LINK, "HTML-код".to_string(), Message::DialogOpen(Dialog::Embed(Embed::album(&album.id, &album.title, &album.artists))), false));
+                    }
                     if let Some(album) = self.album.as_ref().filter(|album| album.kind != AlbumKind::Music) {
                         let label = if album.finished { "Отметить непрослушанным" } else { "Отметить прослушанным" };
                         items.push((ui::CHECK, label.to_string(), Message::AlbumFinished(!album.finished), false));
@@ -2096,6 +2152,7 @@ impl App {
                     return items;
                 }
                 let mut items = link_and_pin(PinRef::Playlist(list.owner.clone(), list.kind.clone()), format!("https://music.yandex.ru/users/{}/playlists/{}", list.owner, list.kind));
+                items.push((ui::LINK, "HTML-код".to_string(), Message::DialogOpen(Dialog::Embed(Embed::playlist(&list.owner, &list.kind, &list.title))), false));
                 items.extend(self.download_item());
                 if self.is_own(list) {
                     items.push((ui::EDIT, "Переименовать".to_string(), Message::DialogOpen(Dialog::Rename(list.clone())), false));
@@ -4531,10 +4588,12 @@ impl App {
                     Dialog::Rename(list) => list.title.clone(),
                     Dialog::Describe(_) => self.list_meta.as_ref().map_or_else(String::new, |meta| meta.1.clone()),
                     Dialog::EditTrack(track) => track.title.clone(),
+                    Dialog::Embed(embed) => embed.width.to_string(),
                     _ => String::new(),
                 };
                 self.dialog_artist = match &dialog {
                     Dialog::EditTrack(track) => track.artists.clone(),
+                    Dialog::Embed(embed) => embed.height.to_string(),
                     _ => String::new(),
                 };
                 if let Dialog::TrackInfo(track) = &dialog {
@@ -4605,6 +4664,11 @@ impl App {
                         Task::batch([notice, back])
                     }
                     Dialog::RemoveTrack(track) => self.handle(Message::TrackRemove(track)),
+                    Dialog::Embed(embed) => {
+                        let code = embed_code(&embed, &self.dialog_text, &self.dialog_artist);
+                        let _ = (uid, token);
+                        Task::batch([iced::clipboard::write(code), self.notify("HTML-код скопирован".to_string())])
+                    }
                     Dialog::EditTrack(track) => {
                         let artist = self.dialog_artist.trim().to_string();
                         // Новое имя сразу видно во всех списках, где лежит трек.
@@ -5677,10 +5741,18 @@ impl App {
             Dialog::Delete(list) => (format!("Удалить плейлист «{}»?", list.title), "Удалить", true),
             Dialog::RemoveTrack(track) => (format!("Удалить «{}» из плейлиста?", track.title), "Удалить", true),
             Dialog::EditTrack(_) => ("Редактировать трек".to_string(), "Сохранить", false),
+            Dialog::Embed(_) => ("Настройте размер и скопируйте код на сайт".to_string(), "Скопировать", false),
         };
         let alpha = self.dialog_fade.shown();
         let mut body = column![text(title).size(20).font(ui::font_medium()).color(ui::c().text.scale_alpha(alpha))].spacing(16);
-        if !danger {
+        if let Dialog::Embed(embed) = dialog {
+            let label = |name| text(name).size(13).color(ui::c().muted.scale_alpha(alpha));
+            let width = text_input("614", &self.dialog_text).id(DIALOG_INPUT).on_input(Message::DialogInput).on_submit(Message::DialogConfirm).padding([10, 16]).style(ui::input_faded(alpha));
+            let height = text_input("556", &self.dialog_artist).on_input(Message::DialogArtist).on_submit(Message::DialogConfirm).padding([10, 16]).style(ui::input_faded(alpha));
+            body = body.push(row![column![label("Ширина"), width].spacing(6).width(Length::Fill), column![label("Высота"), height].spacing(6).width(Length::Fill)].spacing(12));
+            let code = embed_code(embed, &self.dialog_text, &self.dialog_artist);
+            body = body.push(column![text("Код").size(13).color(ui::c().muted.scale_alpha(alpha)), container(text(code).size(12).font(iced::Font::MONOSPACE).color(ui::c().text.scale_alpha(alpha))).padding(12).width(Length::Fill).style(ui::tile)].spacing(6));
+        } else if !danger {
             body = body.push(text_input(if matches!(dialog, Dialog::Describe(_)) { "Описание" } else { "Название" }, &self.dialog_text).id(DIALOG_INPUT).on_input(Message::DialogInput).on_submit(Message::DialogConfirm).padding([10, 16]).style(ui::input_faded(alpha)));
         }
         if matches!(dialog, Dialog::EditTrack(_)) {
@@ -6048,6 +6120,10 @@ impl App {
             count += 1.0;
         }
         items = items.push(item(ui::LINK, "Скопировать ссылку", Message::CopyLink(track.clone())));
+        if !track.ugc {
+            items = items.push(item(ui::LINK, "HTML-код", Message::DialogOpen(Dialog::Embed(Embed::track(track)))));
+            count += 1.0;
+        }
         items = items.push(item(ui::INFO, "Сведения о треке", Message::DialogOpen(Dialog::TrackInfo(track.clone()))));
         count += 2.0;
         popup(items.into(), x, y, MENU_WIDTH, count * MENU_ITEM, alpha, live)
@@ -9376,6 +9452,11 @@ mod tests {
         let today = (2026, 3, 1);
         assert_eq!(history_day("2026-03-01", today), "Сегодня");
         assert_eq!(history_day("2026-02-28", today), "Вчера");
+        let embed = Embed::album("1", "A & B", &[("Группа".to_string(), "7".to_string())]);
+        assert_eq!(
+            embed_code(&embed, "100%", "556"),
+            "<iframe frameborder=\"0\" allow=\"clipboard-write\" style=\"border:none;width:100%;height:556px;\" width=\"100%\" height=\"556\" src=\"https://music.yandex.ru/iframe/album/1\">Слушайте <a href=\"https://music.yandex.ru/album/1\">A &amp; B</a> — <a href=\"https://music.yandex.ru/artist/7\">Группа</a> на Яндекс Музыке</iframe>"
+        );
         let by = api::UpdatedBy::Owner { name: "Аня".to_string(), female: true };
         assert_eq!(updated_text(&api::Updated { date: "2026-02-28".to_string(), by }, today), "Аня обновила плейлист вчера");
         let made = api::UpdatedBy::MadeFor("Егора".to_string());
