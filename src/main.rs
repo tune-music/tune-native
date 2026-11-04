@@ -5248,6 +5248,9 @@ impl App {
             Section::Artists => self.view_card_page("Исполнители", &self.liked_artists, ARTIST_COVER, true, "Здесь появятся исполнители, которые вам понравились"),
             Section::Search => self.view_search(),
         };
+        // Альбома, исполнителя или плейлиста нет у Яндекса: страница, как в оригинале, а не плашка.
+        let missing = self.error.as_deref().is_some_and(|error| error.starts_with("Яндекс ответил 404")) && matches!(self.section, Section::Playlists | Section::Artist | Section::Landing | Section::Block);
+        let page = if missing { view_missing() } else { page };
         // Вместо затухания самой страницы её на миг закрывает фон и плавно уходит.
         let rest = 1.0 - anim::ease_out(1.0 - self.page_veil);
         let back = ui::c().content;
@@ -5268,7 +5271,7 @@ impl App {
             }
             page = page.push(container(line).width(Length::Fill).padding([10, 16]).style(ui::tile));
         }
-        if let Some(error) = &self.error {
+        if let Some(error) = self.error.as_ref().filter(|_| !missing) {
             // Плашка с понятным текстом: подробности ошибки нужны только в журнале.
             let mut line = row![ui::icon(ui::INFO, 20.0, ui::c().danger), text(human_error(error)).color(ui::c().text).width(Length::Fill)].spacing(12).align_y(Alignment::Center);
             if self.retry.is_some() {
@@ -9075,4 +9078,17 @@ fn with_disclaimer<'a>(header: Element<'a, Message>, notices: &[String]) -> Elem
         lines.push(row![ui::icon(ui::INFO, 14.0, ui::c().muted), text(notice.clone()).size(13).color(ui::c().muted)].spacing(6).align_y(iced::Alignment::Center))
     });
     column![header, lines].spacing(4).into()
+}
+
+/// «Ничего не нашлось»: страницы нет у Яндекса — удалили или ссылка неверна.
+fn view_missing<'a>() -> Element<'a, Message> {
+    let note = column![
+        text("Ничего не нашлось").size(28).font(ui::font_headline()).color(ui::c().strong),
+        text("Попробуйте поискать в этом разделе").color(ui::c().muted),
+        Space::new().height(8),
+        shine(button(text("Поиск").color(ui::c().text)).padding([8, 18]).style(ui::secondary).on_press(Message::Open(Section::Search)), 24.0),
+    ]
+    .spacing(8)
+    .align_x(Alignment::Center);
+    column![container(back_button()).padding(PAGE_HEADER_PAD), container(note).center(Length::Fill)].into()
 }

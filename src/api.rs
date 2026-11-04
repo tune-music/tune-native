@@ -1050,10 +1050,16 @@ pub fn releases(id: &str, also: bool, by_year: bool, page: u64, token: &str) -> 
     Ok(Releases { albums: parse_cards(&v["albums"], album_card), total: v["pager"]["total"].as_u64().unwrap_or(0) })
 }
 
+/// Так же, как настоящий 404: страницы нет, показываем «Ничего не нашлось».
+const NOT_FOUND: &str = "Яндекс ответил 404: not-found";
+
 pub fn album(id: &str, token: &str) -> Result<(Album, Vec<Track>), String> {
     // Как в официальном клиенте: у выпусков и глав приходят место, где остановились, и дата выхода.
     let v = get(&format!("albums/{id}/with-tracks"), &[("resumeStream", "true"), ("richTracks", "true"), ("withListeningFinished", "true")], token)?;
     let v = result(&v);
+    if v["error"].as_str() == Some("not-found") {
+        return Err(NOT_FOUND.to_string());
+    }
     let mut disks: Vec<Vec<Track>> = v["volumes"].as_array().into_iter().flatten().map(|disk| disk.as_array().into_iter().flatten().filter_map(parse_track).collect()).collect();
     // Подкасты приходят от новых выпусков к старым: здесь всегда от первого сезона к последнему.
     if v["sortOrder"].as_str() == Some("desc") {
@@ -1068,6 +1074,10 @@ pub fn album(id: &str, token: &str) -> Result<(Album, Vec<Track>), String> {
 
 pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
     let v = get(&format!("artists/{id}/brief-info"), &[], token)?;
+    // Несуществующего исполнителя Яндекс отдаёт пустым, с пометкой вместо 404.
+    if result(&v)["artist"]["error"].as_str() == Some("not-found") {
+        return Err(NOT_FOUND.to_string());
+    }
     let mut artist = parse_artist(result(&v)).ok_or_else(|| "Яндекс не прислал исполнителя".to_string())?;
     artist.disclaimer = disclaimer("artists", id, &result(&v)["artist"]["disclaimers"], token);
     // Предстоящего релиза чаще всего нет: тогда Яндекс отвечает 404.
