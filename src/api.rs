@@ -2103,9 +2103,8 @@ fn sign(data: &str) -> String {
 
 pub fn file_info(track_id: &str, quality: &str, token: &str) -> Result<FileInfo, String> {
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs().to_string();
-    // HE-AAC не просим: декодер понимает только основу AAC без SBR, и у такого файла
-    // пропали бы верхние частоты. На «Экономичном» Яндекс тогда отдаёт AAC 192, как на «Оптимальном».
-    let codecs: Vec<&str> = CODECS.iter().copied().filter(|codec| !codec.starts_with("he-aac")).collect();
+    // HE-AAC просим только в MP4: его кадры декодирует декодер Windows (см. `heaac`).
+    let codecs: Vec<&str> = CODECS.iter().copied().filter(|codec| *codec != "he-aac").collect();
     let signature = sign(&format!("{ts}{track_id}{quality}{}{TRANSPORT}", codecs.concat()));
     let codecs = codecs.join(",");
     let v = get(

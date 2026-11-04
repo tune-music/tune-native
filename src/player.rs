@@ -538,13 +538,20 @@ impl Player {
 
     fn start(&self, generation: u64, path: &Path, progress: Arc<Progress>, len: u64, codec: &str) -> Result<(), String> {
         let reader = Reader { file: File::open(path).map_err(|e| e.to_string())?, pos: 0, len, progress };
-        let decoder = Decoder::builder()
-            .with_data(reader)
-            .with_byte_len(len)
-            .with_seekable(true)
-            .with_hint(hint(codec))
-            .build()
-            .map_err(|e| format!("Не удалось прочитать файл трека: {e}"))?;
+        // HE-AAC целиком понимает только декодер Windows, остальное — symphonia внутри rodio.
+        let decoder: Box<dyn Source + Send> = if codec.starts_with("he-aac") {
+            Box::new(crate::heaac::HeAac::new(reader, len)?)
+        } else {
+            Box::new(
+                Decoder::builder()
+                    .with_data(reader)
+                    .with_byte_len(len)
+                    .with_seekable(true)
+                    .with_hint(hint(codec))
+                    .build()
+                    .map_err(|e| format!("Не удалось прочитать файл трека: {e}"))?,
+            )
+        };
         // Пока декодер открывался, могли включить другой трек.
         if self.generation.load(Ordering::Acquire) != generation {
             return Ok(());

@@ -10,6 +10,7 @@ mod icons;
 mod glow;
 mod login;
 mod media;
+mod heaac;
 mod player;
 mod seek;
 mod session;
@@ -7801,11 +7802,28 @@ fn smoke_format(query: &str) -> Result<(), String> {
         player::save_file(&info, &path)?;
         let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
         let len = file.metadata().map_err(|e| e.to_string())?.len();
-        let decoder = rodio::Decoder::builder().with_data(file).with_byte_len(len).with_seekable(true).with_hint(player::hint(&info.codec)).build().map_err(|e| e.to_string())?;
+        let decoder: Box<dyn rodio::Source + Send> = if info.codec.starts_with("he-aac") {
+            Box::new(heaac::HeAac::new(file, len)?)
+        } else {
+            Box::new(rodio::Decoder::builder().with_data(file).with_byte_len(len).with_seekable(true).with_hint(player::hint(&info.codec)).build().map_err(|e| e.to_string())?)
+        };
         let (rate, channels, total) = (decoder.sample_rate().get(), decoder.channels().get(), decoder.total_duration());
-        let samples = decoder.count();
+        // Доля энергии выше 12 кГц по левому каналу: разность через отсчёт гасит низы,
+        // три таких разности подряд оставляют почти только верха.
+        let (mut samples, mut all, mut high, mut last) = (0usize, 0f64, 0f64, [0f64; 3]);
+        for (i, x) in decoder.enumerate() {
+            samples += 1;
+            if i % channels as usize != 0 {
+                continue;
+            }
+            let x = x as f64;
+            let d = x - 3.0 * last[0] + 3.0 * last[1] - last[2];
+            last = [x, last[0], last[1]];
+            all += x * x;
+            high += d * d;
+        }
         let real = samples as f64 / (rate as f64 * channels as f64);
-        println!("{}: {} ({}), {len} байт, {rate} Гц, каналов {channels}, по заголовку {total:?}, по звуку {real:.2} с", quality.code(), info.label(), info.codec, );
+        println!("{}: {} ({}), {len} байт, {rate} Гц, каналов {channels}, по заголовку {total:?}, по звуку {real:.2} с, верха {:.4}", quality.code(), info.label(), info.codec, high / all.max(1e-9));
         println!("  файл {}", path.display());
     }
     Ok(())
