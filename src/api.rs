@@ -2002,6 +2002,11 @@ pub fn now_stamp() -> String {
 }
 
 /// Можно ли сейчас слушать треки: номер трека и ответ.
+/// Что оригинал вставляет после трека (`after-track`): спрашивает он только рекламу.
+pub fn after_track(from: &str, types: &str, prev: &str, next: &str, token: &str) -> Result<Value, String> {
+    get("after-track", &[("from", from), ("types", types), ("prevTrackId", prev), ("nextTrackId", next)], token)
+}
+
 pub fn availability(ids: &[String], token: &str) -> Result<Vec<(String, bool)>, String> {
     let mut found = Vec::new();
     for part in ids.chunks(100) {

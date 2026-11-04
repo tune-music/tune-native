@@ -7788,6 +7788,22 @@ fn smoke(query: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Что Яндекс отвечает на `after-track` для этого аккаунта: реклама и шоты в разных местах.
+fn smoke_after(query: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let tracks = api::search(query, &token)?;
+    let (prev, next) = (tracks.first().ok_or("Ничего не найдено")?, tracks.get(1).ok_or("Нужно два трека")?);
+    for from in ["desktop_win-own_tracks-track-default", "desktop-wave_landing_screen-default"] {
+        for types in ["ad", "shot"] {
+            match api::after_track(from, types, &prev.id, &next.id, &token) {
+                Ok(v) => println!("{from} {types}: {}", v["result"]),
+                Err(e) => println!("{from} {types}: ошибка {e}"),
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Проверка смены устройства: посреди трека устройство открывается заново, как после пропажи,
 /// и трек играет дальше с того же места.
 fn smoke_device(query: &str) -> Result<(), String> {
@@ -8290,7 +8306,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -8309,6 +8325,7 @@ fn main() -> iced::Result {
             "--smoke-download" => smoke_download(query),
             "--smoke-offline" => smoke_offline(query),
             "--smoke-device" => smoke_device(query),
+            "--smoke-after" => smoke_after(query),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
