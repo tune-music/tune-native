@@ -2661,6 +2661,10 @@ impl App {
         self.home.blocks.clear();
         self.error = None;
         let skeleton = self.skeleton_of(page);
+        // Вкладки остаются, только пока переключают вкладку той же страницы: у другой они свои.
+        if skeleton != self.home_skeleton {
+            self.home.tabs.clear();
+        }
         self.home_skeleton = skeleton.clone();
         let wanted = skeleton.clone();
         Task::perform(background(move || api::landing(&skeleton, tab, &token)), move |r| Message::HomeLoaded(wanted.clone(), tab, r))
@@ -7221,7 +7225,8 @@ impl App {
         let mut tabs = self.home.tabs.iter().enumerate().fold(row![].spacing(8), |tabs, (index, title)| {
             tabs.push(shine(button(text(title)).padding([7, 16]).style(ui::chip(index == self.home_tab)).on_press(Message::HomeTab(index)), 18.0))
         });
-        if self.home_loading && self.home.tabs.is_empty() {
+        // Заглушки вкладок — только у главной: у других страниц вкладок может и не быть.
+        if self.home_loading && self.home.tabs.is_empty() && self.section == Section::Home {
             tabs = SKELETON_TABS.iter().fold(tabs, |tabs, &width| tabs.push(container(Space::new()).width(width).height(SKELETON_TAB).style(skeleton_round(SKELETON_TAB / 2.0))));
         }
         let title = match (&self.landing, self.section) {
