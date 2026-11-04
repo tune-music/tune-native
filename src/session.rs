@@ -20,6 +20,8 @@ pub struct Saved {
     pub title: String,
     /// Зёрна волны, если играла волна, а не список.
     pub wave: Option<Vec<String>>,
+    /// Сессия той волны у Яндекса: после перезапуска её продолжают, а не начинают заново.
+    pub wave_session: Option<String>,
     /// Откуда играла очередь: альбом, плейлист, исполнитель, поиск и так далее.
     pub from: Value,
     pub current: usize,
@@ -106,7 +108,8 @@ fn load_from(dir: &Path) -> Option<Saved> {
     }
     let position = Duration::from_secs_f64(position).min(tracks[current].duration);
     let wave = serde_json::from_value(queue["wave"].clone()).ok();
-    Some(Saved { title: queue["title"].as_str().unwrap_or_default().to_string(), wave, from: queue["from"].clone(), tracks, current, position })
+    let wave_session = queue["waveSession"].as_str().map(str::to_string);
+    Some(Saved { title: queue["title"].as_str().unwrap_or_default().to_string(), wave, wave_session, from: queue["from"].clone(), tracks, current, position })
 }
 
 pub fn load() -> Option<Saved> {
@@ -121,10 +124,11 @@ fn run(wait: bool, job: impl FnOnce() + Send + 'static) {
     }
 }
 
-pub fn save_queue(tracks: Vec<Track>, title: String, wave: Option<Vec<String>>, from: Value, wait: bool) {
+pub fn save_queue(tracks: Vec<Track>, title: String, wave: Option<(Vec<String>, Option<String>)>, from: Value, wait: bool) {
     run(wait, move || {
         let tracks: Vec<Value> = tracks.iter().map(track_value).collect();
-        write(&api::data_dir(), QUEUE_FILE, &json!({ "title": title, "wave": wave, "from": from, "tracks": tracks }));
+        let (wave, session) = wave.map_or((None, None), |(seeds, session)| (Some(seeds), session));
+        write(&api::data_dir(), QUEUE_FILE, &json!({ "title": title, "wave": wave, "waveSession": session, "from": from, "tracks": tracks }));
     });
 }
 

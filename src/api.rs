@@ -164,6 +164,8 @@ pub struct Pin {
 pub struct Wave {
     pub session: String,
     pub tracks: Vec<Track>,
+    /// Затравки, с которыми Яндекс ведёт сессию.
+    pub seeds: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -2241,7 +2243,22 @@ pub fn wave_new(seeds: &[String], token: &str) -> Result<Wave, String> {
     let v = post("rotor/session/new", "application/json", body, token)?;
     let v = result(&v);
     let session = v["radioSessionId"].as_str().ok_or("Яндекс не запустил волну")?;
-    Ok(Wave { session: session.to_string(), tracks: parse_sequence(v) })
+    Ok(Wave { session: session.to_string(), tracks: parse_sequence(v), seeds: wave_seeds(v) })
+}
+
+/// Затравки сессии: `acceptedSeeds` — `{type, value}`, вместе `user:onyourwave`.
+fn wave_seeds(v: &Value) -> Vec<String> {
+    v["acceptedSeeds"].as_array().into_iter().flatten().filter_map(|seed| Some(format!("{}:{}", seed["type"].as_str()?, seed["value"].as_str()?))).collect()
+}
+
+/// Продолжает прежнюю сессию волны, как оригинал после перезапуска: копия помнит, что уже
+/// звучало и что понравилось. `queue` — уже показанные треки, `id:альбом`.
+pub fn wave_clone(session: &str, queue: &[String], token: &str) -> Result<Wave, String> {
+    let body = json!({ "queue": queue, "includeTracksInResponse": true, "allowExplicit": true }).to_string();
+    let v = post(&format!("rotor/session/{session}/clone"), "application/json", body, token)?;
+    let v = result(&v);
+    let session = v["radioSessionId"].as_str().ok_or("Яндекс не продолжил волну")?;
+    Ok(Wave { session: session.to_string(), tracks: parse_sequence(v), seeds: wave_seeds(v) })
 }
 
 /// Разбирает последнюю волну: зёрна без настроек (они выбираются отдельно) и название.
@@ -2576,6 +2593,12 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_seeds() {
+        let v = json!({"acceptedSeeds": [{"tag": "onyourwave", "type": "user", "value": "onyourwave"}, {"type": "artist", "value": "3121"}]});
+        assert_eq!(wave_seeds(&v), ["user:onyourwave", "artist:3121"]);
+    }
 
     #[test]
     fn trailer_snippets() {

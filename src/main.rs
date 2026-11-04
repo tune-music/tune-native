@@ -168,6 +168,8 @@ const DIALOG_WIDTH: f32 = 400.0;
 const INFO_MARGIN: f32 = 80.0;
 /// Сколько последних треков показать в истории.
 const HISTORY_LIMIT: usize = 200;
+/// Сколько последних треков очереди отдать Яндексу, продолжая волну, как оригинал.
+const WAVE_CLONE_QUEUE: usize = 100;
 /// Качество, в котором Яндекс отдаёт отрывки трейлера.
 const SMART_PREVIEW: &str = "smart_preview";
 /// Фильтр над списком показывается, если в нём столько треков; всего фильтров не больше стольких.
@@ -2443,11 +2445,23 @@ impl App {
         self.wave_queue = true;
         self.wave_base = seeds.clone();
         self.wave_wanted = seeds.clone();
-        // Старая сессия на сервере могла закончиться, а новая нужна, чтобы волна шла дальше.
+        // Прежнюю сессию продолжаем, как оригинал; если Яндекс её уже забыл — начинаем новую.
         let Some(token) = self.token() else { return Task::none() };
         let mut asked = seeds.clone();
         asked.extend(settings::wave_seeds(self.wave_tuning));
-        Task::perform(background(move || api::wave_new(&asked, &token)), move |result| Message::WaveResumed(seeds.clone(), result))
+        let played: Vec<String> = self.queue.iter().map(Track::full_id).collect();
+        let played = played[played.len().saturating_sub(WAVE_CLONE_QUEUE)..].to_vec();
+        let old = saved.wave_session;
+        let base = seeds.clone();
+        let resume = move || {
+            // Забытую сессию Яндекс тоже «продолжает», но уже Моей волной: такую копию не берём.
+            let copy = old.and_then(|old| api::wave_clone(&old, &played, &token).inspect_err(|e| eprintln!("волна не продолжилась: {e}")).ok());
+            if let Some(wave) = copy.filter(|copy| base.iter().all(|seed| copy.seeds.contains(seed))) {
+                return Ok(wave);
+            }
+            api::wave_new(&asked, &token)
+        };
+        Task::perform(background(resume), move |result| Message::WaveResumed(seeds.clone(), result))
     }
 
     /// Запоминает очередь и место, волну вместе с её зёрнами.
@@ -2462,7 +2476,7 @@ impl App {
         let key = queue_key(&self.queue, &title);
         if self.session_key != Some(key) {
             self.session_key = Some(key);
-            session::save_queue(self.queue.clone(), title, self.wave_queue.then(|| self.wave_base.clone()), self.queue_from_value(), wait);
+            session::save_queue(self.queue.clone(), title, self.wave_queue.then(|| (self.wave_base.clone(), self.wave.clone())), self.queue_from_value(), wait);
         }
         session::save_place(current, self.position, wait);
     }
@@ -8819,6 +8833,21 @@ fn smoke_format(query: &str) -> Result<(), String> {
 }
 
 /// Что Яндекс отвечает на `after-track` для этого аккаунта: реклама и шоты в разных местах.
+fn smoke_clone(_: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let wave = api::wave_new(&[api::MY_WAVE.to_string()], &token)?;
+    let played: Vec<String> = wave.tracks.iter().map(Track::full_id).collect();
+    println!("Сессия {}: {} треков", wave.session, wave.tracks.len());
+    let copy = api::wave_clone(&wave.session, &played, &token).map_err(|e| format!("копия: {e}"))?;
+    let repeats = copy.tracks.iter().filter(|track| played.contains(&track.full_id())).count();
+    println!("Копия {}: {} треков, повторов из прежней очереди {repeats}, затравки {:?} (у исходной {:?})", copy.session, copy.tracks.len(), copy.seeds, wave.seeds);
+    match api::wave_clone("missing-session", &played, &token) {
+        Ok(copy) => println!("Чужая сессия продолжилась: {}, затравки {:?}", copy.session, copy.seeds),
+        Err(e) => println!("Чужая сессия: {e}"),
+    }
+    Ok(())
+}
+
 fn smoke_preview(track: &str) -> Result<(), String> {
     let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
     use rodio::Source;
@@ -9364,7 +9393,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" || flag == "--smoke-clone" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -9389,6 +9418,7 @@ fn main() -> iced::Result {
             "--smoke-catalog" => smoke_catalog(query),
             "--smoke-filters" => smoke_filters(query),
             "--smoke-preview" => smoke_preview(query),
+            "--smoke-clone" => smoke_clone(query),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
