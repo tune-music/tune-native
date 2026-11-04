@@ -474,6 +474,11 @@ pub fn set_ai_reduction(enabled: bool, token: &str) -> Result<(), String> {
     post(&format!("account/settings?aiContentReductionEnabled={enabled}"), "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
 }
 
+/// «Показывать раздел «Детям»» в настройках аккаунта.
+pub fn set_child_mode(enabled: bool, token: &str) -> Result<(), String> {
+    post(&format!("account/settings?childModEnabled={enabled}"), "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
+}
+
 pub fn profile(token: &str) -> Result<Profile, String> {
     let v = get("account/status", &[], token)?;
     let v = result(&v);

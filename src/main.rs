@@ -1166,6 +1166,7 @@ enum Message {
     AiLessLoaded(Result<bool, String>),
     AiLessSet(bool),
     AiLessSaved(Result<(), String>),
+    KidsSaved(Result<(), String>),
     PinsLoaded(Result<Vec<Pin>, String>),
     /// Пора сверить коллекцию с Яндексом.
     SyncTick,
@@ -5273,7 +5274,12 @@ impl App {
             Message::KidsToggle => {
                 self.kids = !self.kids;
                 self.save_settings();
+                // Как в оригинале, настройка живёт и в аккаунте; не сохранилась там — здесь всё равно работает.
+                let (Some(token), kids) = (self.token(), self.kids) else { return Task::none() };
+                return Task::perform(background(move || api::set_child_mode(kids, &token)), Message::KidsSaved);
             }
+            Message::KidsSaved(Ok(())) => {}
+            Message::KidsSaved(Err(e)) => eprintln!("раздел «Детям» не сохранён в аккаунте: {e}"),
             Message::LookSet(look) => {
                 self.look = look;
                 self.apply_look();
