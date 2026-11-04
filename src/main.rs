@@ -168,6 +168,13 @@ const DIALOG_WIDTH: f32 = 400.0;
 const INFO_MARGIN: f32 = 80.0;
 /// Сколько последних треков показать в истории.
 const HISTORY_LIMIT: usize = 200;
+/// К скольким трекам волны вперёд просить карточки «Слов в волне».
+const WORDS_AHEAD: usize = 10;
+/// Ширина карточки «Слов в волне» и высота рассказа, дальше он прокручивается.
+const WORD_WIDTH: f32 = 560.0;
+const WORD_STORY_HEIGHT: f32 = 220.0;
+/// Что пишет оригинал, пока готовит рассказ к карточке.
+const WORD_LOADING: [&str; 5] = ["Изучаю звучание", "Настраиваюсь", "Собираю интересное силой ИИ", "Читаю про артиста", "Ловлю ритм"];
 /// Сколько последних треков очереди отдать Яндексу, продолжая волну, как оригинал.
 const WAVE_CLONE_QUEUE: usize = 100;
 /// Качество, в котором Яндекс отдаёт отрывки трейлера.
@@ -603,6 +610,8 @@ struct Place {
 /// Запуск с готовым разделом: первый трек показывается в плеере, но не играет.
 #[derive(Clone)]
 enum Preview {
+    /// Волна на треке с карточкой «Слов в волне» и открытым рассказом.
+    WaveWords,
     /// Мастер первого запуска поверх главной, без отправки.
     Wizard,
     /// Страница из блоков по её адресу у Яндекса: `landing:music_genres`.
@@ -901,6 +910,15 @@ struct App {
     wave_queue: bool,
     wave_loading: bool,
     wave_fetching: bool,
+    /// «Слова в волне»: карточка к треку по его номеру.
+    words: HashMap<String, api::WordCard>,
+    /// Треки, о карточках которых уже спросили.
+    words_asked: HashSet<String>,
+    /// Показанные карточки и рассказы: уйдут со следующим запросом, чтобы Яндекс их не повторял.
+    words_viewed: Vec<String>,
+    words_viewed_big: Vec<(String, Vec<String>)>,
+    /// Открытый рассказ к карточке: её номер и сам рассказ, пока грузится — `None`.
+    word_open: Option<(String, Option<api::WordBig>)>,
     play_id: u64,
     current: Option<usize>,
     /// Трек запущен и ещё не доиграл.
@@ -1134,6 +1152,13 @@ enum Message {
     WaveStartSeeds(Vec<String>, Option<String>),
     WaveStarted(bool, Vec<String>, Option<String>, Result<Wave, String>),
     WaveMore(Result<Vec<Track>, String>),
+    WordsLoaded(Vec<String>, Result<Vec<(String, api::WordCard)>, String>),
+    /// Открыть или свернуть рассказ к карточке трека.
+    WordOpen(String),
+    WordBigLoaded(String, Result<api::WordBig, String>),
+    /// Оценка карточки трека: `like` или `dislike`.
+    WordRate(String, &'static str),
+    WordRated(String, String, Result<(), String>),
     Cover(String, image::Handle),
     PlaylistsLoaded(Result<Vec<Playlist>, String>),
     PlaylistOpen(usize),
@@ -1440,6 +1465,11 @@ impl App {
             wave_queue: false,
             wave_loading: false,
             wave_fetching: false,
+            words: HashMap::new(),
+            words_asked: HashSet::new(),
+            words_viewed: Vec::new(),
+            words_viewed_big: Vec::new(),
+            word_open: None,
             play_id: 0,
             current: None,
             active: false,
@@ -1997,6 +2027,54 @@ impl App {
     }
 
     /// Экран волны показывает обложку крупно.
+    /// Просит карточки «Слов в волне» к ближайшим трекам волны, как оригинал.
+    fn words_load(&mut self, from: usize) -> Task<Message> {
+        if !self.wave_queue || self.offline {
+            return Task::none();
+        }
+        let Some(token) = self.token() else { return Task::none() };
+        let ids: Vec<String> = self.queue.iter().skip(from).take(WORDS_AHEAD).filter(|track| !track.ugc && !self.words_asked.contains(&track.id)).map(|track| track.id.clone()).collect();
+        if ids.is_empty() {
+            return Task::none();
+        }
+        self.words_asked.extend(ids.iter().cloned());
+        let viewed = std::mem::take(&mut self.words_viewed);
+        let viewed_big = std::mem::take(&mut self.words_viewed_big);
+        let asked = ids.clone();
+        Task::perform(background(move || api::words_cards(&ids, &viewed, &viewed_big, &token)), move |r| Message::WordsLoaded(asked.clone(), r))
+    }
+
+    /// Карточка играющего трека волны: факт, рассказ подробнее и оценка.
+    fn view_word(&self) -> Option<Element<'_, Message>> {
+        let track = self.current_track().filter(|_| self.wave_queue)?;
+        let card = self.words.get(&track.id)?;
+        let width = (self.main_width() - 80.0).clamp(240.0, WORD_WIDTH);
+        let open = self.word_open.as_ref().filter(|(id, _)| *id == card.id);
+        let mut body = column![text(&card.text).size(16).color(ui::c().text).wrapping(Wrapping::WordOrGlyph)].spacing(10);
+        match open {
+            Some((_, None)) => {
+                let phrase = WORD_LOADING[card.id.bytes().map(usize::from).sum::<usize>() % WORD_LOADING.len()];
+                body = body.push(text(format!("{phrase}…")).size(14).color(ui::c().muted));
+            }
+            Some((_, Some(big))) => {
+                let story = scrollable(text(&big.text).size(14).color(ui::c().muted).wrapping(Wrapping::WordOrGlyph)).height(Length::Shrink);
+                body = body.push(container(story).max_height(WORD_STORY_HEIGHT));
+                if let Some((title, url)) = &big.action {
+                    body = body.push(hover_line(text(title.as_str()).size(14), ui::c().accent, ui::c().strong, Message::OpenUrl(url.clone())));
+                }
+            }
+            None if card.big.is_some() => body = body.push(text("Подробнее").size(13).color(ui::c().accent)),
+            None => {}
+        }
+        let rate = |label: &'static str, state: &'static str| {
+            let active = card.feedback == state;
+            shine(button(text(label).size(13).color(if active { ui::c().on_accent } else { ui::c().text })).padding([6, 14]).style(ui::chip(active)).on_press(Message::WordRate(track.id.clone(), state)), 16.0)
+        };
+        let story = button(body).padding(0).style(ui::ghost).on_press_maybe(card.big.as_ref().map(|_| Message::WordOpen(track.id.clone())));
+        let content = column![story, row![rate("Больше такого", "like"), rate("Мимо", "dislike")].spacing(8)].spacing(14);
+        Some(container(content).padding(18).width(width).style(ui::tile).into())
+    }
+
     fn fetch_wave_covers(&self, tracks: &[Track]) -> Task<Message> {
         self.fetch_cover_jobs(tracks.iter().filter_map(|t| Some((t.id.clone(), t.cover.clone()?))).collect(), "300x300")
     }
@@ -2512,6 +2590,13 @@ impl App {
         if let Some(session) = self.wave_pending.take() {
             self.wave = Some(session);
             self.feedback("radioStarted", None, None);
+        }
+        // Карточка трека видна на экране волны: Яндексу скажем, что её уже показали.
+        self.word_open = None;
+        if let Some(card) = self.words.get(&track.id).filter(|_| self.wave_queue) {
+            if !self.words_viewed.contains(&card.id) {
+                self.words_viewed.push(card.id.clone());
+            }
         }
         let restart = self.restart.take();
         // Место прошлого запуска относится только к тому же треку.
@@ -3230,7 +3315,7 @@ impl App {
                 };
                 let pins = Task::batch([pins, avatar, self.liked_pages_load(), wizard]);
                 let page = match self.preview.clone() {
-                    Some(Preview::Wave | Preview::WaveSeek) => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
+                    Some(Preview::Wave | Preview::WaveSeek | Preview::WaveWords) => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
                     Some(Preview::Lyrics) => self.wave_load(vec!["artist:3121".to_string()], None, false),
                     Some(Preview::WaveTune) => {
                         self.preview = None;
@@ -3492,7 +3577,7 @@ impl App {
                 }
                 self.wave = Some(wave.session);
                 self.feedback("radioStarted", None, None);
-                return self.wave_refill();
+                return Task::batch([self.words_load(self.current.unwrap_or(0)), self.wave_refill()]);
             }
             Message::AiLessLoaded(result) => match result {
                 Ok(enabled) => self.ai_less = Some(enabled),
@@ -4447,6 +4532,76 @@ impl App {
                 self.seeking = Some(time);
                 return self.update(Message::SeekDone);
             }
+            Message::WordsLoaded(asked, result) => match result {
+                Ok(cards) => {
+                    self.words.extend(cards);
+                    if matches!(self.preview, Some(Preview::WaveWords)) {
+                        if let Some(at) = self.queue.iter().position(|track| self.words.contains_key(&track.id)) {
+                            self.preview = None;
+                            self.current = Some(at);
+                            return self.update(Message::WordOpen(self.queue[at].id.clone()));
+                        }
+                    }
+                }
+                // Не загрузились — спросим ещё раз со следующей порцией волны.
+                Err(e) => {
+                    eprintln!("слова в волне: {e}");
+                    for id in asked {
+                        self.words_asked.remove(&id);
+                    }
+                }
+            },
+            Message::WordOpen(track) => {
+                let Some(card) = self.words.get(&track).cloned() else { return Task::none() };
+                if self.word_open.as_ref().is_some_and(|(id, _)| *id == card.id) {
+                    self.word_open = None;
+                    return Task::none();
+                }
+                let (Some(big), Some(token)) = (card.big.clone(), self.token()) else { return Task::none() };
+                self.word_open = Some((card.id.clone(), None));
+                if !self.words_viewed_big.iter().any(|(id, _)| *id == card.id) {
+                    self.words_viewed_big.push((card.id.clone(), vec![big.clone()]));
+                }
+                let id = card.id;
+                return Task::perform(background({
+                    let id = id.clone();
+                    move || api::words_big(&big, &track, &id, &token)
+                }), move |r| Message::WordBigLoaded(id.clone(), r));
+            }
+            Message::WordBigLoaded(card, result) => {
+                if self.word_open.as_ref().is_some_and(|(id, _)| *id == card) {
+                    match result {
+                        Ok(big) => self.word_open = Some((card, Some(big))),
+                        Err(e) => {
+                            self.word_open = None;
+                            return self.fail(e);
+                        }
+                    }
+                }
+            }
+            Message::WordRate(track, state) => {
+                let Some(token) = self.token() else { return Task::none() };
+                let Some(card) = self.words.get_mut(&track) else { return Task::none() };
+                // Повторное нажатие снимает оценку.
+                let state = if card.feedback == state { "neutral" } else { state };
+                let before = std::mem::replace(&mut card.feedback, state.to_string());
+                let id = card.id.clone();
+                let note = match state {
+                    "like" => self.notify("Спасибо за оценку".to_string()),
+                    "dislike" => self.notify("Спасибо, что помогаете мне стать лучше".to_string()),
+                    _ => Task::none(),
+                };
+                let send = Task::perform(background(move || api::words_feedback(&id, state, &token)), move |r| Message::WordRated(track.clone(), before.clone(), r));
+                return Task::batch([note, send]);
+            }
+            Message::WordRated(track, before, result) => {
+                if let Err(e) = result {
+                    if let Some(card) = self.words.get_mut(&track) {
+                        card.feedback = before;
+                    }
+                    return self.fail(e);
+                }
+            }
             Message::WaveStartSeeds(seeds, title) => {
                 if self.section != Section::Wave {
                     self.remember();
@@ -4462,7 +4617,7 @@ impl App {
                         return self.notify("Для этой волны у Яндекса нет треков".to_string());
                     }
                     // Пока грузилась фоновая волна, пользователь мог включить свой список.
-                    Ok(_) if !autoplay && self.current.is_some() && !matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded | Preview::Lyrics)) => {}
+                    Ok(_) if !autoplay && self.current.is_some() && !matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded | Preview::Lyrics | Preview::WaveWords)) => {}
                     Ok(wave) => {
                         if let Some(p) = &self.player {
                             p.stop();
@@ -4492,10 +4647,11 @@ impl App {
                         if matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded | Preview::Lyrics)) {
                             self.preview = None;
                         }
+                        let words = self.words_load(0);
                         if autoplay {
-                            return Task::batch([covers, self.play(0)]);
+                            return Task::batch([covers, words, self.play(0)]);
                         }
-                        return covers;
+                        return Task::batch([covers, words]);
                     }
                     Err(e) => return self.fail_retry(e, Message::WaveStartSeeds(seeds, title)),
                 }
@@ -4508,7 +4664,7 @@ impl App {
                         let fresh: Vec<Track> = tracks.into_iter().filter(|t| !known.contains(&t.id)).collect();
                         let task = self.fetch_wave_covers(&fresh);
                         self.queue.extend(fresh);
-                        return task;
+                        return Task::batch([task, self.words_load(self.current.unwrap_or(0))]);
                     }
                     Ok(_) => {}
                     Err(e) => return self.fail(e),
@@ -6559,6 +6715,10 @@ impl App {
         ]
         .spacing(8)
         .align_x(Alignment::Center);
+        let body = match self.view_word() {
+            Some(word) => body.push(Space::new().height(28)).push(word),
+            None => body,
+        };
         container(body).center(Length::Fill).into()
     }
 
@@ -8849,7 +9009,23 @@ fn smoke_format(query: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Что Яндекс отвечает на `after-track` для этого аккаунта: реклама и шоты в разных местах.
+/// Карточки «Слов в волне» к свежей волне и рассказ к первой из них. Оценок не ставит.
+fn smoke_words(how: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let wave = api::wave_new(&[api::MY_WAVE.to_string()], &token)?;
+    let ids: Vec<String> = wave.tracks.iter().map(|track| if how == "full" { track.full_id() } else { track.id.clone() }).collect();
+    let cards = api::words_cards(&ids, &[], &[], &token)?;
+    println!("Карточек {} на {} треков", cards.len(), ids.len());
+    for (track, card) in &cards {
+        println!("{track}: {} [{}]", card.text, card.feedback);
+    }
+    if let Some((track, card)) = cards.iter().find(|(_, card)| card.big.is_some()) {
+        let big = api::words_big(card.big.as_deref().unwrap_or_default(), track, &card.id, &token)?;
+        println!("Подробнее: {}\n{:?}", big.text.chars().take(300).collect::<String>(), big.action);
+    }
+    Ok(())
+}
+
 fn smoke_clone(_: &str) -> Result<(), String> {
     let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
     let wave = api::wave_new(&[api::MY_WAVE.to_string()], &token)?;
@@ -9410,7 +9586,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" || flag == "--smoke-clone" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" || flag == "--smoke-clone" || flag == "--smoke-words" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -9436,6 +9612,7 @@ fn main() -> iced::Result {
             "--smoke-filters" => smoke_filters(query),
             "--smoke-preview" => smoke_preview(query),
             "--smoke-clone" => smoke_clone(query),
+            "--smoke-words" => smoke_words(query),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
@@ -9448,6 +9625,7 @@ fn main() -> iced::Result {
         [_, link] if api::parse_link(link).is_some() => Some(Preview::Search(link.clone())),
         [_, flag, what] if flag == "--preview" => Some(match what.as_str() {
             "wave" => Preview::Wave,
+            "wave-words" => Preview::WaveWords,
             "home" => Preview::Home,
             "home-trends" => Preview::HomeTrends,
             "history" => Preview::History,

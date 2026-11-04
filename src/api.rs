@@ -344,7 +344,7 @@ fn fetch(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, Strin
 
 fn post(path: &str, content_type: &str, body: String, token: &str) -> Result<Value, String> {
     // Отзывы волны и отчёты о прослушивании ничего из сохранённого не меняют.
-    if !path.starts_with("rotor") && !path.starts_with("plays") && !path.starts_with("availability") && !path.starts_with("streams/progress/sync") {
+    if !path.starts_with("rotor") && !path.starts_with("words") && !path.starts_with("plays") && !path.starts_with("availability") && !path.starts_with("streams/progress/sync") {
         forget_cache();
     }
     let resp = agent()
@@ -2251,6 +2251,75 @@ fn wave_seeds(v: &Value) -> Vec<String> {
     v["acceptedSeeds"].as_array().into_iter().flatten().filter_map(|seed| Some(format!("{}:{}", seed["type"].as_str()?, seed["value"].as_str()?))).collect()
 }
 
+/// Карточка «Слов в волне»: короткий факт о треке и, если есть, рассказ подробнее.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WordCard {
+    pub id: String,
+    pub text: String,
+    pub big: Option<String>,
+    /// `like`, `dislike` или `neutral`.
+    pub feedback: String,
+}
+
+/// Подробный рассказ к карточке и ссылка «Обсудить с Алисой AI».
+#[derive(Clone, Debug, PartialEq)]
+pub struct WordBig {
+    pub text: String,
+    pub action: Option<(String, String)>,
+}
+
+/// Карточки к трекам волны, как на экране волны оригинала. Показанные с прошлого раза
+/// карточки и рассказы уходят вместе с запросом: Яндекс не повторяет их.
+pub fn words_cards(track_ids: &[String], viewed: &[String], viewed_big: &[(String, Vec<String>)], token: &str) -> Result<Vec<(String, WordCard)>, String> {
+    let viewed_big: Vec<Value> = viewed_big.iter().map(|(card, big)| json!({ "cardId": card, "bigCardIds": big })).collect();
+    let body = json!({ "trackIds": track_ids, "viewedCards": viewed, "viewedBigCards": viewed_big }).to_string();
+    Ok(parse_word_cards(result(&post("words/cards", "application/json", body, token)?)))
+}
+
+fn parse_word_cards(v: &Value) -> Vec<(String, WordCard)> {
+    let card = |track: &Value| -> Option<(String, WordCard)> {
+        let item = &track["cards"][0];
+        let card = &item["card"];
+        let text = card["text"].as_str()?.trim().to_string();
+        let big = card["bigCardIds"][0].as_str().map(str::to_string);
+        let feedback = item["feedbackState"].as_str().unwrap_or("neutral").to_string();
+        Some((id_text(&track["id"])?, WordCard { id: card["id"].as_str()?.to_string(), text, big, feedback }))
+    };
+    v.as_array().into_iter().flatten().filter_map(card).filter(|(_, card)| !card.text.is_empty()).collect()
+}
+
+pub fn words_big(big: &str, track: &str, card: &str, token: &str) -> Result<WordBig, String> {
+    let body = json!({ "bigCardIds": [big], "bigCardContexts": [{ "bigCardId": big, "trackId": track, "cardId": card }] }).to_string();
+    let v = post("words/big-cards", "application/json", body, token)?;
+    parse_word_big(&result(&v)[0]).ok_or_else(|| "Яндекс не рассказал подробнее".to_string())
+}
+
+fn parse_word_big(v: &Value) -> Option<WordBig> {
+    let text = v["text"].as_str()?.trim().to_string();
+    let action = v["actions"].as_array().into_iter().flatten().find_map(|action| {
+        let url = action["url"].as_str().filter(|url| url.starts_with("https://"))?;
+        Some((action["title"].as_str()?.to_string(), url.to_string()))
+    });
+    Some(WordBig { text, action })
+}
+
+/// Оценка карточки: «Больше такого» — `like`, «Мимо» — `dislike`.
+pub fn words_feedback(card: &str, state: &str, token: &str) -> Result<(), String> {
+    let body = json!({ "feedback": [{ "id": card, "feedbackState": state }] }).to_string();
+    let resp = agent()
+        .put(format!("{API}/words/cards/feedback"))
+        .header("Authorization", &format!("OAuth {token}"))
+        .header("X-Yandex-Music-Client", CLIENT)
+        .header("Content-Type", "application/json")
+        .send(body)
+        .map_err(|e| format!("Не удалось связаться с Яндексом: {e}"))?;
+    match resp.status().as_u16() {
+        401 => Err(NEED_LOGIN.into()),
+        200..=299 => Ok(()),
+        status => Err(format!("Яндекс ответил {status}")),
+    }
+}
+
 /// Продолжает прежнюю сессию волны, как оригинал после перезапуска: копия помнит, что уже
 /// звучало и что понравилось. `queue` — уже показанные треки, `id:альбом`.
 pub fn wave_clone(session: &str, queue: &[String], token: &str) -> Result<Wave, String> {
@@ -2593,6 +2662,18 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_cards() {
+        let v = json!([
+            {"id": "5", "type": "track", "cards": [{"card": {"id": "fact:1", "text": " Факт ", "bigCardIds": ["big:1"]}, "feedbackState": "like"}]},
+            {"id": "6", "type": "track", "cards": []},
+        ]);
+        let cards = parse_word_cards(&v);
+        assert_eq!(cards, vec![("5".to_string(), WordCard { id: "fact:1".into(), text: "Факт".into(), big: Some("big:1".into()), feedback: "like".into() })]);
+        let big = parse_word_big(&json!({"id": "big:1", "text": "Долго", "actions": [{"title": "Обсудить с Алисой AI", "url": "https://alice.yandex.ru/"}]})).unwrap();
+        assert_eq!(big.action, Some(("Обсудить с Алисой AI".to_string(), "https://alice.yandex.ru/".to_string())));
+    }
 
     #[test]
     fn accepted_seeds() {
