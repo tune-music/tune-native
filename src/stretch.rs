@@ -276,9 +276,16 @@ impl<S: Source> Iterator for Stretched<S> {
     }
 }
 
+/// Длина куска в кадрах, о которой сообщаем очереди rodio.
+const SPAN_FRAMES: usize = 1024;
+
 impl<S: Source> Source for Stretched<S> {
+    /// Частота трека не меняется, но очередь rodio перечитывает её только на границе куска.
+    /// Без границ она так и осталась бы от тишины перед треком (44,1 кГц), и трек в 48 кГц
+    /// звучал бы замедленным. Поэтому куски короткие: готовый выход или до границы блока.
     fn current_span_len(&self) -> Option<usize> {
-        None
+        let pending = self.out.len() - self.out_at;
+        Some(if pending > 0 { pending } else { SPAN_FRAMES * self.channels - self.channel })
     }
 
     fn channels(&self) -> ChannelCount {

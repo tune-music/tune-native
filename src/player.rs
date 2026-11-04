@@ -110,7 +110,7 @@ impl Seek for Reader {
     }
 }
 
-fn hint(codec: &str) -> &'static str {
+pub fn hint(codec: &str) -> &'static str {
     match codec {
         "mp3" => "mp3",
         "flac" => "flac",

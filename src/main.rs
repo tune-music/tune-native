@@ -7788,6 +7788,29 @@ fn smoke(query: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Файл трека в каждом качестве: что говорит декодер о частоте и каналах и сколько звука
+/// в нём на самом деле. Если длина по декодеру не сходится с длиной трека, частота неверна.
+fn smoke_format(query: &str) -> Result<(), String> {
+    use rodio::Source;
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let track = api::search(query, &token)?.into_iter().next().ok_or("Ничего не найдено")?;
+    println!("Трек: {} — {} ({:?})", track.artists, track.title, track.duration);
+    for quality in Quality::ALL {
+        let info = api::file_info(&track.id, quality.code(), &token)?;
+        let path = std::env::temp_dir().join(format!("tune-native-format-{}.{}", quality.code(), info.codec));
+        player::save_file(&info, &path)?;
+        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+        let len = file.metadata().map_err(|e| e.to_string())?.len();
+        let decoder = rodio::Decoder::builder().with_data(file).with_byte_len(len).with_seekable(true).with_hint(player::hint(&info.codec)).build().map_err(|e| e.to_string())?;
+        let (rate, channels, total) = (decoder.sample_rate().get(), decoder.channels().get(), decoder.total_duration());
+        let samples = decoder.count();
+        let real = samples as f64 / (rate as f64 * channels as f64);
+        println!("{}: {} ({}), {len} байт, {rate} Гц, каналов {channels}, по заголовку {total:?}, по звуку {real:.2} с", quality.code(), info.label(), info.codec, );
+        println!("  файл {}", path.display());
+    }
+    Ok(())
+}
+
 /// Что Яндекс отвечает на `after-track` для этого аккаунта: реклама и шоты в разных местах.
 fn smoke_after(query: &str) -> Result<(), String> {
     let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
@@ -8306,7 +8329,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -8326,6 +8349,7 @@ fn main() -> iced::Result {
             "--smoke-offline" => smoke_offline(query),
             "--smoke-device" => smoke_device(query),
             "--smoke-after" => smoke_after(query),
+            "--smoke-format" => smoke_format(query),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
