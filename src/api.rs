@@ -61,6 +61,8 @@ pub struct Track {
     pub loudness: Option<(f32, f32)>,
     /// Загружен самим пользователем: название и исполнителя можно править.
     pub ugc: bool,
+    /// Отрывок из трейлера: играет короткий «умный» фрагмент вместо трека.
+    pub smart_preview: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -414,6 +416,7 @@ fn parse_track(v: &Value) -> Option<Track> {
         unavailable: v["available"].as_bool() == Some(false),
         plus_only: v["availableFullWithoutPermission"].as_bool() == Some(false),
         loudness: v["r128"]["i"].as_f64().zip(v["r128"]["tp"].as_f64()).map(|(i, tp)| (i as f32, tp as f32)),
+        smart_preview: false,
         // Как в оригинале: переход только между музыкальными треками, не подкастами и книгами.
         fade: Fade::parse(&v["fade"]).filter(|_| v["type"].as_str() == Some("music")),
         mix_fade: Fade::parse(&v["mixFade"]).filter(|_| v["type"].as_str() == Some("music")),
@@ -1104,6 +1107,33 @@ pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
         (artist.familiar_collection, artist.familiar_wave) = parse_familiar(result(&v));
     }
     Ok(artist)
+}
+
+/// Трейлер альбома, исполнителя или плейлиста: название и отрывки. `path` — `albums/1`,
+/// `artists/1` или `users/1/playlists/3`. Нет трейлера — `None`.
+pub fn trailer(path: &str, token: &str) -> Result<Option<(String, Vec<Track>)>, String> {
+    let v = get(&format!("{path}/trailer"), &[], token)?;
+    Ok(parse_trailer(&result(&v)["trailer"]))
+}
+
+fn parse_trailer(v: &Value) -> Option<(String, Vec<Track>)> {
+    let tracks: Vec<Track> = v["tracks"].as_array().into_iter().flatten().filter_map(smart_preview_track).collect();
+    if tracks.is_empty() {
+        return None;
+    }
+    Some((v["title"].as_str().unwrap_or("Трейлер").to_string(), tracks))
+}
+
+/// Отрывок трейлера: своя длина и свои точки перехода.
+fn smart_preview_track(v: &Value) -> Option<Track> {
+    let params = &v["smartPreviewParams"];
+    let length = params["durationMs"].as_u64().filter(|&ms| ms > 0)?;
+    let mut track = parse_track(v)?;
+    track.duration = Duration::from_millis(length);
+    track.fade = Fade::parse(&params["fade"]);
+    track.mix_fade = None;
+    track.smart_preview = true;
+    Some(track)
 }
 
 /// Предстоящий альбом: `{album, artists, releaseDate}`, в подписи — дата выхода.
@@ -2499,6 +2529,15 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trailer_snippets() {
+        let v = json!({"title": "Трейлер альбома", "tracks": [{"id": 1, "title": "А", "durationMs": 200000, "smartPreviewParams": {"durationMs": 12300, "fade": {"inStart": 0.0, "inStop": 1.3, "outStart": 11.0, "outStop": 12.3}}}, {"id": 2, "title": "Б"}]});
+        let (title, tracks) = parse_trailer(&v).unwrap();
+        assert_eq!((title.as_str(), tracks.len(), tracks[0].duration, tracks[0].smart_preview), ("Трейлер альбома", 1, Duration::from_millis(12300), true));
+        assert_eq!(tracks[0].fade.map(|fade| fade.out_start), Some(11.0));
+        assert!(parse_trailer(&json!({})).is_none());
+    }
 
     #[test]
     fn playlist_updated() {

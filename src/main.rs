@@ -168,6 +168,8 @@ const DIALOG_WIDTH: f32 = 400.0;
 const INFO_MARGIN: f32 = 80.0;
 /// Сколько последних треков показать в истории.
 const HISTORY_LIMIT: usize = 200;
+/// Качество, в котором Яндекс отдаёт отрывки трейлера.
+const SMART_PREVIEW: &str = "smart_preview";
 /// Фильтр над списком показывается, если в нём столько треков; всего фильтров не больше стольких.
 const CHIP_TRACKS: usize = 8;
 const CHIPS_MAX: usize = 7;
@@ -741,6 +743,8 @@ struct App {
     /// Поиск внутри открытого плейлиста или лайков.
     filter: String,
     filter_tracks: Vec<Track>,
+    /// Трейлер открытой страницы: адрес у Яндекса, название и отрывки.
+    trailer: Option<(String, String, Vec<Track>)>,
     /// Фильтры Яндекса над списком («Бодрое», «Рэп и хип-хоп»): номер, название, треки.
     chips: Vec<(String, String, Vec<String>)>,
     /// Для какого списка фильтры: «likes» или «владелец:номер» плейлиста.
@@ -1187,6 +1191,8 @@ enum Message {
     HistoryLoaded(Result<api::History, String>),
     DislikesLoaded(Result<Vec<Track>, String>),
     ChipsLoaded(String, Result<Vec<(String, String, Vec<String>)>, String>),
+    TrailerLoaded(String, Result<Option<(String, Vec<Track>)>, String>),
+    TrailerPlay,
     /// Выбрать фильтр над списком; `None` — «Всё».
     Chip(Option<String>),
     /// Следующие треки истории при прокрутке к концу.
@@ -1318,6 +1324,7 @@ impl App {
             filter: String::new(),
             filter_tracks: Vec::new(),
             chips: Vec::new(),
+            trailer: None,
             chips_key: String::new(),
             chip: None,
             filter_loading: false,
@@ -2464,12 +2471,19 @@ impl App {
         }
         let id = track.id.clone();
         let quality = self.quality;
-        let local = self.downloads.iter().find(|saved| saved.track.id == track.id).map(|saved| (saved.path(), saved.codec.clone(), saved.sound()));
+        // Отрывок трейлера — свой короткий файл: ни скачанный трек, ни подготовленный заранее не подходят.
+        let preview = track.smart_preview;
+        let local = self.downloads.iter().find(|saved| saved.track.id == track.id && !preview).map(|saved| (saved.path(), saved.codec.clone(), saved.sound()));
         let start = Task::perform(
             background(move || {
                 if let Some((path, codec, sound)) = local.filter(|(path, _, _)| path.exists()) {
                     player.play_file(generation, &path, &codec)?;
                     return Ok(sound);
+                }
+                if preview {
+                    let info = api::file_info(&id, SMART_PREVIEW, &token)?;
+                    player.play(generation, &info)?;
+                    return Ok(info.sound());
                 }
                 if let Some(started) = player.play_prepared(generation, &preload_key(&id, quality)) {
                     return started;
@@ -2514,8 +2528,8 @@ impl App {
             return;
         }
         let Some(next) = self.next_index().and_then(|i| self.queue.get(i)) else { return };
-        // Скачанный следующий трек и так на диске.
-        if self.download_ids.contains(&next.id) {
+        // Скачанный следующий трек и так на диске, а отрывок трейлера короткий.
+        if self.download_ids.contains(&next.id) || next.smart_preview {
             return;
         }
         let (id, quality) = (next.id.clone(), self.quality);
@@ -2689,6 +2703,11 @@ impl App {
         self.similar.clear();
         let similar = self.similar_load(&playlist);
         let kind = playlist.kind.clone();
+        let similar = match playlist.source {
+            Source::Album => Task::batch([similar, self.trailer_load(format!("albums/{kind}"))]),
+            Source::Playlist => Task::batch([similar, self.trailer_load(format!("users/{}/playlists/{kind}", playlist.owner))]),
+            Source::Artist => similar,
+        };
         if playlist.source == Source::Album {
             return Task::batch([similar, Task::perform(background(move || api::album(&playlist.kind, &token)), move |r| Message::AlbumLoaded(kind.clone(), r))]);
         }
@@ -2729,6 +2748,25 @@ impl App {
         match (self.section, &self.playlist) {
             (Section::Likes, _) => Some("likes".to_string()),
             (Section::Playlists, Some(list)) if list.source == Source::Playlist => Some(format!("{}:{}", list.owner, list.kind)),
+            _ => None,
+        }
+    }
+
+    fn trailer_load(&mut self, path: String) -> Task<Message> {
+        let Some(token) = self.token() else { return Task::none() };
+        self.trailer = None;
+        Task::perform(background({
+            let path = path.clone();
+            move || api::trailer(&path, &token)
+        }), move |r| Message::TrailerLoaded(path.clone(), r))
+    }
+
+    /// Адрес трейлера открытой страницы.
+    fn trailer_place(&self) -> Option<String> {
+        match (self.section, &self.playlist, &self.artist) {
+            (Section::Artist, _, Some(artist)) => Some(format!("artists/{}", artist.id)),
+            (Section::Playlists, Some(list), _) if list.source == Source::Album => Some(format!("albums/{}", list.kind)),
+            (Section::Playlists, Some(list), _) if list.source == Source::Playlist => Some(format!("users/{}/playlists/{}", list.owner, list.kind)),
             _ => None,
         }
     }
@@ -4093,7 +4131,8 @@ impl App {
                 self.error = None;
                 self.artist_loading = Some(id.clone());
                 let wanted = id.clone();
-                return Task::perform(background(move || api::artist(&id, &token)), move |r| Message::ArtistLoaded(wanted.clone(), r));
+                let trailer = self.trailer_load(format!("artists/{id}"));
+                return Task::batch([trailer, Task::perform(background(move || api::artist(&id, &token)), move |r| Message::ArtistLoaded(wanted.clone(), r))]);
             }
             Message::ArtistLoaded(id, result) => {
                 // Пока грузился, могли уйти на другую страницу.
@@ -4711,6 +4750,16 @@ impl App {
                     }
                     Err(e) => return self.fail_retry(e, Message::Open(Section::History)),
                 }
+            }
+            Message::TrailerLoaded(path, result) => {
+                if let Ok(Some((title, tracks))) = result {
+                    self.trailer = Some((path, title, tracks));
+                }
+            }
+            Message::TrailerPlay => {
+                let Some((_, title, tracks)) = self.trailer.clone() else { return Task::none() };
+                self.queue_from = QueueFrom::Unknown;
+                return self.play_list(tracks, title, 0);
             }
             Message::ChipsLoaded(key, result) => {
                 if key != self.chips_key {
@@ -7158,7 +7207,16 @@ impl App {
             .padding([8, 18])
             .style(ui::secondary)
             .on_press(Message::WaveStartSeeds(vec![seed], Some(title))), 24.0);
-        row![play, wave].spacing(8).align_y(Alignment::Center)
+        let mut actions = row![play, wave].spacing(8).align_y(Alignment::Center);
+        // Трейлер — несколько коротких отрывков, как в оригинале.
+        if self.trailer.as_ref().is_some_and(|(path, _, _)| Some(path) == self.trailer_place().as_ref()) {
+            let trailer = shine(button(row![ui::icon(ui::PLAY, 20.0, ui::c().text), text("Трейлер").color(ui::c().text)].spacing(6).align_y(Alignment::Center))
+                .padding([8, 18])
+                .style(ui::secondary)
+                .on_press(Message::TrailerPlay), 24.0);
+            actions = actions.push(trailer);
+        }
+        actions
     }
 
     fn page_like<'a>(&self, liked: bool, message: Message) -> Element<'a, Message> {
@@ -8612,6 +8670,24 @@ fn smoke_format(query: &str) -> Result<(), String> {
 }
 
 /// Что Яндекс отвечает на `after-track` для этого аккаунта: реклама и шоты в разных местах.
+fn smoke_preview(track: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    use rodio::Source;
+    let (title, tracks) = api::trailer(&format!("albums/{track}"), &token)?.ok_or("У альбома нет трейлера")?;
+    println!("{title}: {} отрывков", tracks.len());
+    let first = tracks.first().ok_or("Пусто")?;
+    let info = api::file_info(&first.id, SMART_PREVIEW, &token)?;
+    let path = std::env::temp_dir().join(format!("tune-native-preview.{}", info.codec));
+    player::save_file(&info, &path)?;
+    let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    let len = file.metadata().map_err(|e| e.to_string())?.len();
+    let decoder = rodio::Decoder::builder().with_data(file).with_byte_len(len).with_seekable(true).with_hint(player::hint(&info.codec)).build().map_err(|e| e.to_string())?;
+    let (rate, channels) = (decoder.sample_rate().get(), decoder.channels().get());
+    let frames = decoder.count() / channels as usize;
+    println!("«{}»: {} {} кбит/с, обещано {:?}, в файле {:.1} с", first.title, info.codec, info.bitrate, first.duration, frames as f64 / rate as f64);
+    Ok(())
+}
+
 fn smoke_filters(count: &str) -> Result<(), String> {
     let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
     let uid = api::profile(&token)?.uid;
@@ -9139,7 +9215,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -9163,6 +9239,7 @@ fn main() -> iced::Result {
             "--smoke-get" => smoke_get(query),
             "--smoke-catalog" => smoke_catalog(query),
             "--smoke-filters" => smoke_filters(query),
+            "--smoke-preview" => smoke_preview(query),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
