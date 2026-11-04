@@ -173,6 +173,9 @@ const WORDS_AHEAD: usize = 10;
 /// Ширина карточки «Слов в волне» и высота рассказа, дальше он прокручивается.
 const WORD_WIDTH: f32 = 560.0;
 const WORD_STORY_HEIGHT: f32 = 220.0;
+const WORD_STORY_MIN: f32 = 72.0;
+/// Сколько высоты окна занимает экран волны без рассказа: заголовок, кнопки, плеер и сама карточка.
+const WORD_PAGE_REST: f32 = 900.0;
 /// Что пишет оригинал, пока готовит рассказ к карточке.
 const WORD_LOADING: [&str; 5] = ["Изучаю звучание", "Настраиваюсь", "Собираю интересное силой ИИ", "Читаю про артиста", "Ловлю ритм"];
 /// Сколько последних треков очереди отдать Яндексу, продолжая волну, как оригинал.
@@ -2066,10 +2069,11 @@ impl App {
                 body = body.push(text(format!("{phrase}…")).size(14).color(ui::c().muted));
             }
             Some((_, Some(big))) => {
-                let story = scrollable(text(&big.text).size(15).line_height(1.45).color(ui::c().text).wrapping(Wrapping::WordOrGlyph)).height(Length::Shrink);
-                // Рассказ отбит тонкой полосой акцента слева, как цитата.
-                let bar = container(Space::new().width(3).height(Length::Fill)).style(|_| container::Style::default().background(ui::c().accent).border(iced::border::rounded(2)));
-                body = body.push(container(row![bar, container(story).max_height(WORD_STORY_HEIGHT).width(Length::Fill)].spacing(14).height(Length::Shrink)).max_height(WORD_STORY_HEIGHT));
+                let story = scrollable(container(text(&big.text).size(15).line_height(1.45).color(ui::c().text).wrapping(Wrapping::WordOrGlyph)).padding(Padding::ZERO.right(14))).height(Length::Shrink);
+                // Рассказ занимает то, что осталось от окна, чтобы кнопки под ним не сжимались.
+                let (_, window) = *WINDOW.lock().unwrap();
+                let room = (window - WORD_PAGE_REST).clamp(WORD_STORY_MIN, WORD_STORY_HEIGHT);
+                body = body.push(container(story).max_height(room).width(Length::Fill));
             }
             None => {}
         }
