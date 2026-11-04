@@ -559,6 +559,8 @@ enum Preview {
     WaveTune,
     Lyrics,
     Collection,
+    /// Исполнители коллекции с топом месяца.
+    CollectionArtists,
     Likes,
     /// Открытые очередь и выбор качества.
     Panels,
@@ -676,6 +678,8 @@ struct App {
     liked_albums: Vec<Card>,
     /// Предсохранённые альбомы, которые ещё не вышли.
     presaved: Vec<Card>,
+    /// «Ваш топ месяца» на странице исполнителей коллекции.
+    top_artists: Vec<Card>,
     liked_artists: Vec<Card>,
     /// Исполнители с дизлайком и открыта ли их вкладка на странице дизлайков.
     disliked_artists: Vec<Card>,
@@ -961,6 +965,7 @@ enum Message {
     HomeOpen(HomeItem),
     LikedPages(Result<(Vec<Card>, Vec<Card>, Vec<Card>), String>),
     Presaves(Result<Vec<Card>, String>),
+    TopArtists(Result<Vec<Card>, String>),
     /// Предсохранить альбом или снять предсохранение.
     Presave(Card),
     /// Ссылку или ярлык открыли, когда программа уже работала.
@@ -1239,6 +1244,7 @@ impl App {
             search_cache: HashMap::new(),
             liked_albums: Vec::new(),
             presaved: Vec::new(),
+            top_artists: Vec::new(),
             liked_artists: Vec::new(),
             disliked_artists: Vec::new(),
             dislikes_artists: false,
@@ -1758,6 +1764,7 @@ impl App {
         self.searched = false;
         self.liked_albums.clear();
         self.presaved.clear();
+        self.top_artists.clear();
         self.liked_artists.clear();
         self.queue.clear();
         self.liked.clear();
@@ -2499,7 +2506,9 @@ impl App {
         let lists = Task::perform(background(move || api::liked_playlists(&list_uid, &list_token)), Message::LikedLists);
         let (presave_uid, presave_token) = (uid.clone(), token.clone());
         let presaves = Task::perform(background(move || api::presaves(&presave_uid, &presave_token)), Message::Presaves);
-        Task::batch([lists, presaves, Task::perform(background(move || api::liked_pages(&uid, &token)), Message::LikedPages)])
+        let top_token = token.clone();
+        let top = Task::perform(background(move || api::top_artists(&top_token)), Message::TopArtists);
+        Task::batch([lists, presaves, top, Task::perform(background(move || api::liked_pages(&uid, &token)), Message::LikedPages)])
     }
 
     /// Включает новый список вместо очереди.
@@ -3015,6 +3024,7 @@ impl App {
                     Some(Preview::WaveSeeded) => self.wave_load(vec!["artist:3121".to_string()], Some(wave_label("artist:3121", "Metallica")), false),
                     Some(Preview::Likes | Preview::LikesEnd | Preview::Menu | Preview::Panels | Preview::TrackInfo | Preview::QueueJump) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
+                    Some(Preview::CollectionArtists) => self.update(Message::Open(Section::Artists)),
                     Some(Preview::Playlists | Preview::Playlist | Preview::PlaylistHome | Preview::PageMenu) => self.update(Message::Open(Section::Playlists)),
                     Some(Preview::Dislikes) => {
                         self.preview = None;
@@ -3785,6 +3795,11 @@ impl App {
                 return self.fetch_card_covers(self.presaved.iter(), std::iter::empty(), &[]);
             }
             Message::Presaves(Err(e)) => eprintln!("предсохранения не загрузились: {e}"),
+            Message::TopArtists(Ok(artists)) => {
+                self.top_artists = artists;
+                return self.fetch_card_covers(std::iter::empty(), self.top_artists.iter(), &[]);
+            }
+            Message::TopArtists(Err(e)) => eprintln!("топ месяца не загрузился: {e}"),
             Message::Presave(card) => {
                 let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
                 let presaved = !self.presaved.iter().any(|c| c.id == card.id);
@@ -5297,6 +5312,7 @@ impl App {
             Section::Playlists => self.view_playlists(),
             Section::Artist => self.view_artist(),
             Section::Albums => self.view_card_page("Альбомы", &self.liked_albums, ALBUM_COVER, false, "Здесь появятся альбомы, которые вам понравились"),
+            Section::Artists if !self.top_artists.is_empty() => self.view_artists(),
             Section::Artists => self.view_card_page("Исполнители", &self.liked_artists, ARTIST_COVER, true, "Здесь появятся исполнители, которые вам понравились"),
             Section::Search => self.view_search(),
         };
@@ -6471,6 +6487,18 @@ impl App {
             let open = if round { open_artist } else { open_album };
             ui::scroll(container(self.view_cards(cards, prefix, round, open)).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
         };
+        column![head, center].spacing(16).height(Length::Fill).into()
+    }
+
+    /// Исполнители коллекции: сверху «Ваш топ месяца», как в оригинале, ниже понравившиеся.
+    fn view_artists(&self) -> Element<'_, Message> {
+        let head = row![back_button(), text("Исполнители").size(36).font(ui::font_headline()).color(ui::c().text)].spacing(12).align_y(Alignment::Center);
+        let block = |title| text(title).size(24).font(ui::font_headline()).color(ui::c().text);
+        let mut body = column![block("Ваш топ месяца"), self.view_cards(&self.top_artists, ARTIST_COVER, true, open_artist)].spacing(12);
+        if !self.liked_artists.is_empty() {
+            body = body.push(Space::new().height(8)).push(block("Вам нравятся")).push(self.view_cards(&self.liked_artists, ARTIST_COVER, true, open_artist));
+        }
+        let center = ui::scroll(container(body).padding(Padding::ZERO.right(SCROLLBAR))).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill);
         column![head, center].spacing(16).height(Length::Fill).into()
     }
 
@@ -8916,6 +8944,7 @@ fn main() -> iced::Result {
             "pin-play-1" => Preview::PinPlay(1),
             "pin-play-2" => Preview::PinPlay(2),
             "collection" => Preview::Collection,
+            "collection-artists" => Preview::CollectionArtists,
             "playlists" => Preview::Playlists,
             "playlist" => Preview::Playlist,
             "page-menu" => Preview::PageMenu,

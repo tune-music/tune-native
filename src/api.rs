@@ -1112,6 +1112,27 @@ fn upcoming_card(v: &Value) -> Option<Card> {
     Some(card)
 }
 
+/// «Ваш топ месяца»: исполнители, которых слушали дольше всего; в подписи место и время.
+pub fn top_artists(token: &str) -> Result<Vec<Card>, String> {
+    let v = get("personal/top/artists/month", &[], token)?;
+    Ok(parse_top_artists(result(&v)))
+}
+
+fn parse_top_artists(v: &Value) -> Vec<Card> {
+    v["artists"].as_array().into_iter().flatten().filter_map(|item| {
+        let mut card = artist_card(&item["artist"])?;
+        let place = item["top"]["position"].as_u64().map(|at| format!("{at} место"));
+        let minutes = item["listenTimeSeconds"].as_u64().unwrap_or(0) / 60;
+        let time = match minutes {
+            0 => None,
+            1..60 => Some(format!("{minutes} мин")),
+            _ => Some(format!("{} ч", minutes / 60)),
+        };
+        card.subtitle = place.into_iter().chain(time).collect::<Vec<_>>().join(" · ");
+        Some(card)
+    }).collect()
+}
+
 /// Предсохранённые альбомы, которые ещё не вышли.
 pub fn presaves(uid: &str, token: &str) -> Result<Vec<Card>, String> {
     let v = get(&format!("users/{uid}/presaves"), &[("includeReleased", "false"), ("includeUpcoming", "true")], token)?;
@@ -2360,6 +2381,13 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_artists_parse() {
+        let v = serde_json::json!({"artists": [{"artist": {"id": 5, "name": "Дора"}, "listenTimeSeconds": 13476, "top": {"position": 4, "progress": "up"}}]});
+        let top = parse_top_artists(&v);
+        assert_eq!((top[0].title.as_str(), top[0].subtitle.as_str()), ("Дора", "4 место · 3 ч"));
+    }
 
     #[test]
     fn liked_ids_parse() {
