@@ -711,6 +711,8 @@ fn parse_sequence(v: &Value) -> Vec<Track> {
 pub struct Album {
     pub id: String,
     pub title: String,
+    /// Код жанра, например `rock`: по нему полка «Новые альбомы в жанре».
+    pub genre: Option<String>,
     pub year: Option<u64>,
     pub artists: Vec<(String, String)>,
     pub cover: Option<String>,
@@ -718,7 +720,8 @@ pub struct Album {
     pub volumes: Vec<usize>,
     /// Пометка издания, например «Deluxe Edition».
     pub version: String,
-    pub labels: Vec<String>,
+    /// Лейблы: номер страницы лейбла, если Яндекс его дал, и название.
+    pub labels: Vec<(Option<String>, String)>,
     /// Дата выхода словами: «1 января 2011».
     pub released: Option<String>,
     /// Другие издания того же альбома.
@@ -873,7 +876,8 @@ fn parse_album(v: &Value) -> Option<Album> {
         cover: cover_uri(v),
         volumes: Vec::new(),
         version: v["version"].as_str().unwrap_or_default().trim().to_string(),
-        labels: v["labels"].as_array().into_iter().flatten().filter_map(|label| label["name"].as_str().or(label.as_str()).map(str::to_string)).collect(),
+        genre: v["genre"].as_str().filter(|genre| !genre.is_empty()).map(str::to_string),
+        labels: v["labels"].as_array().into_iter().flatten().filter_map(|label| Some((id_text(&label["id"]), label["name"].as_str().or(label.as_str())?.to_string()))).collect(),
         released: v["releaseDate"].as_str().and_then(release_date),
         versions: parse_cards(&v["duplicates"], version_card),
         kind: AlbumKind::parse(v),
@@ -1300,6 +1304,9 @@ pub enum Link {
     Post(String),
 }
 
+/// Так помечена страница лейбла среди страниц из блоков: у Яндекса это не скелет, а свои запросы.
+pub const LABEL: &str = "label:";
+
 /// Разбирает ссылку на music.yandex.*, ссылку протокола `yandexmusic://` и внутреннюю ссылку
 /// оригинала `music-application://desktop/…`. Всё остальное не ссылка, а обычный поиск.
 pub fn parse_link(text: &str) -> Option<Link> {
@@ -1327,6 +1334,7 @@ pub fn parse_link(text: &str) -> Option<Link> {
         ["landing", landing, ..] => Some(Link::Landing(landing.to_string())),
         ["genre", genre, ..] => Some(Link::Landing(format!("tag_{genre}"))),
         ["post", post, ..] => Some(Link::Post(post.to_string())),
+        ["label", label, ..] => number(label).map(|label| Link::Landing(format!("{LABEL}{label}"))),
         ["non-music", "category", category, ..] => Some(Link::Tag(format!("{CATEGORY}{category}"))),
         [first @ ("collection" | "non-music" | "kids" | "chart"), ..] => page(&parts[..parts.len().min(if *first == "collection" { 2 } else { 1 })]),
         ["album", album, ..] => number(album).map(Link::Album),
@@ -1440,6 +1448,9 @@ fn parse_home_block(title: &str, v: &Value) -> HomeBlock {
 /// Страница из блоков: главная (`main`) или книги и подкасты (`non_music`). Скелет страницы
 /// и все блоки выбранной вкладки; блоки грузятся одновременно, порядок сохраняется.
 pub fn landing(skeleton: &str, tab: usize, token: &str) -> Result<Home, String> {
+    if let Some(id) = skeleton.strip_prefix(LABEL) {
+        return label(id, token);
+    }
     let skeleton_id = skeleton;
     let skeleton = get(&format!("landing/skeleton/{skeleton}"), &[], token)?;
     let skeleton = result(&skeleton);
@@ -1478,6 +1489,25 @@ pub fn landing(skeleton: &str, tab: usize, token: &str) -> Result<Home, String> 
         blocks = shelf;
     }
     Ok(Home { title: skeleton["title"].as_str().unwrap_or_default().to_string(), tabs: names, blocks })
+}
+
+/// Страница лейбла: название, альбомы и исполнители — так же, как страница из блоков.
+fn label(id: &str, token: &str) -> Result<Home, String> {
+    let info = get(&format!("labels/{id}"), &[], token)?;
+    let page = [("page", "0"), ("pageSize", "100")];
+    let albums = get(&format!("labels/{id}/albums"), &page, token)?;
+    let artists = get(&format!("labels/{id}/artists"), &page, token)?;
+    let block = |title: &str, items: Vec<HomeItem>| HomeBlock { title: title.to_string(), items, ..HomeBlock::default() };
+    let albums = result(&albums)["albums"].as_array().into_iter().flatten().filter_map(album_card).map(HomeItem::Album).collect();
+    let artists = result(&artists)["artists"].as_array().into_iter().flatten().filter_map(artist_card).map(HomeItem::Artist).collect();
+    let blocks = [block("Альбомы", albums), block("Исполнители", artists)].into_iter().filter(|b| !b.items.is_empty()).collect();
+    Ok(Home { title: result(&info)["name"].as_str().unwrap_or_default().to_string(), tabs: Vec::new(), blocks })
+}
+
+/// Новые альбомы жанра за неделю, как на странице альбома в оригинале (`top/recent-albums`).
+pub fn genre_new_albums(genre: &str, token: &str) -> Result<Vec<Card>, String> {
+    let v = get("top/recent-albums", &[("genre", genre), ("period", "week"), ("page", "0"), ("pageSize", "8")], token)?;
+    Ok(result(&v)["albums"].as_array().into_iter().flatten().filter_map(album_card).collect())
 }
 
 /// Полный список жанра для «Все»: альбомы, плейлисты или исполнители, сначала популярные.
@@ -2239,7 +2269,7 @@ mod tests {
         let v = json!({"id":1,"title":"A","version":" Deluxe ","labels":[{"id":1,"name":"Universal"},"EMI"],"duplicates":[{"id":2,"title":"A","year":1977,"version":"Remaster"},{"id":3,"title":"A","year":1980}]});
         let album = parse_album(&v).unwrap();
         assert_eq!(album.version, "Deluxe");
-        assert_eq!(album.labels, vec!["Universal".to_string(), "EMI".to_string()]);
+        assert_eq!(album.labels, vec![(Some("1".to_string()), "Universal".to_string()), (None, "EMI".to_string())]);
         assert_eq!(album.versions.iter().map(|c| c.subtitle.as_str()).collect::<Vec<_>>(), vec!["Remaster", "1980"]);
     }
 

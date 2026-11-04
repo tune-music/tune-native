@@ -874,6 +874,8 @@ struct App {
     searches: Vec<String>,
     /// Другие альбомы исполнителя открытого альбома.
     album_others: Vec<Card>,
+    /// Новые альбомы в жанре открытого альбома.
+    album_genre: Vec<Card>,
     discography_total: u64,
     discography_also: bool,
     discography_by_year: bool,
@@ -1014,6 +1016,7 @@ enum Message {
     DiscographyLoaded(String, Result<api::Releases, String>),
     /// Другие альбомы исполнителя для страницы альбома.
     AlbumOthers(String, Result<api::Releases, String>),
+    AlbumGenre(String, Result<Vec<Card>, String>),
     /// Окно закрывают: сначала надо запомнить, что играло.
     Quit,
     /// Новая сессия для волны, восстановленной после запуска.
@@ -1332,6 +1335,7 @@ impl App {
             tag_loading: false,
             searches: session::searches(),
             album_others: Vec::new(),
+            album_genre: Vec::new(),
             discography_total: 0,
             discography_also: false,
             discography_by_year: false,
@@ -2570,6 +2574,7 @@ impl App {
         self.playlist_tracks.clear();
         self.album = None;
         self.album_others.clear();
+        self.album_genre.clear();
         self.similar.clear();
         let similar = self.similar_load(&playlist);
         let kind = playlist.kind.clone();
@@ -3263,6 +3268,14 @@ impl App {
                 self.album_others = others;
                 return self.fetch_cover_jobs(jobs, "300x300");
             }
+            Message::AlbumGenre(id, result) => {
+                let Some(album) = self.album.as_ref().filter(|album| album.id == id) else { return Task::none() };
+                let skip: HashSet<&str> = album.versions.iter().map(|c| c.id.as_str()).chain([album.id.as_str()]).collect();
+                let cards: Vec<Card> = result.unwrap_or_default().into_iter().filter(|c| !skip.contains(c.id.as_str())).collect();
+                let jobs = cards.iter().filter_map(|c| Some((format!("{ALBUM_COVER}{}", c.id), c.cover.clone()?))).collect();
+                self.album_genre = cards;
+                return self.fetch_cover_jobs(jobs, "300x300");
+            }
             Message::DiscographyLoaded(key, result) => {
                 if self.discography_key.as_ref() != Some(&key) {
                     return Task::none();
@@ -3719,6 +3732,14 @@ impl App {
                         }
                         _ => Task::none(),
                     };
+                    let genre = match (album.genre.clone().filter(|_| album.kind == AlbumKind::Music), self.token()) {
+                        (Some(genre), Some(token)) => {
+                            let id = album.id.clone();
+                            Task::perform(background(move || api::genre_new_albums(&genre, &token)), move |result| Message::AlbumGenre(id.clone(), result))
+                        }
+                        _ => Task::none(),
+                    };
+                    let others = Task::batch([others, genre]);
                     let podcast = album.kind == AlbumKind::Podcast;
                     self.album = Some(album);
                     self.episodes_old_first = false;
@@ -6865,7 +6886,19 @@ impl App {
             }
             let music = album.kind == AlbumKind::Music;
             if !album.labels.is_empty() {
-                facts = facts.push(text(format!("{}: {}", if music { "Лейбл" } else { "Издатель" }, album.labels.join(", "))).size(13).color(ui::c().muted));
+                // Лейбл с номером ведёт на свою страницу: его альбомы и исполнители.
+                let head = text(format!("{}:", if music { "Лейбл" } else { "Издатель" })).size(13).color(ui::c().muted);
+                let names = album.labels.iter().enumerate().fold(row![head].spacing(4), |line, (at, (id, name))| {
+                    let name = format!("{name}{}", if at + 1 < album.labels.len() { "," } else { "" });
+                    match id {
+                        Some(id) => {
+                            let page = HomeItem::Landing { page: format!("{}{id}", api::LABEL), title: name.trim_end_matches(',').to_string(), cover: None };
+                            line.push(hover_line(text(name).size(13), ui::c().muted, ui::c().strong, Message::HomeOpen(page)))
+                        }
+                        None => line.push(text(name).size(13).color(ui::c().muted)),
+                    }
+                });
+                facts = facts.push(names);
             }
             if !music && !album.description.is_empty() {
                 let title = if album.kind == AlbumKind::Podcast { "О подкасте" } else { "О книге" };
@@ -6874,7 +6907,8 @@ impl App {
             }
             list = list.push(container(facts).padding(Padding::new(8.0).top(16)));
             let others = if music { "Другие альбомы исполнителя" } else { "Ещё у автора" };
-            for (key, title, cards) in [("album:versions", "Другие версии", &album.versions), ("album:others", others, &self.album_others)] {
+            // Порядок как в оригинале: версии, новое в жанре, другие альбомы исполнителя.
+            for (key, title, cards) in [("album:versions", "Другие версии", &album.versions), ("album:genre", "Новые альбомы в жанре", &self.album_genre), ("album:others", others, &self.album_others)] {
                 if !cards.is_empty() {
                     list = list.push(Space::new().height(24)).push(self.shelf(key, title, None, cards.len(), |shown| self.album_cards(&cards[shown], ALBUM_COVER, false, open_album)));
                 }
@@ -7920,6 +7954,9 @@ fn smoke_catalog(genre: &str) -> Result<(), String> {
     }).collect();
     let landings = mixes.blocks.iter().flat_map(|b| &b.items).filter(|item| matches!(item, HomeItem::Landing { .. })).count();
     println!("в «Трендах»: подборок редакции {}, страниц из блоков {landings}", posts.len());
+    println!("новые альбомы в жанре {genre}: {}", api::genre_new_albums(genre, &token)?.len());
+    let label = api::landing(&format!("{}13", api::LABEL), 0, &token)?;
+    println!("лейбл «{}»: {}", label.title, label.blocks.iter().map(|b| format!("{} — {}", b.title, b.items.len())).collect::<Vec<_>>().join(", "));
     for (id, title) in posts {
         let post = api::editorial_post(&id, &token)?;
         println!("  {title}: «{}», карточек {}", post.title, post.items.len());
