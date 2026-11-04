@@ -22,6 +22,7 @@ mod pick;
 mod equalizer;
 mod settings;
 mod ui;
+mod vibe;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -203,6 +204,12 @@ const FULL_COVER_MAX: f32 = 560.0;
 const FULL_TINT: f32 = 0.55;
 /// Как быстро фон перетекает в цвет обложки нового трека: чем больше, тем короче переход.
 const FULL_TINT_SPEED: f32 = 5.0;
+/// Живой фон: как быстро он оживает и замирает, как быстро уровни подхватывают удар и
+/// отпускают его и во сколько раз усилить басы, середину и верха, чтобы громкая музыка была около 1.
+const VIBE_EASE: f32 = 2.0;
+const VIBE_ATTACK: f32 = 18.0;
+const VIBE_RELEASE: f32 = 4.0;
+const VIBE_BOOST: [f32; 3] = [2.5, 8.0, 20.0];
 const DIALOG_CLOSE: f32 = 0.13;
 /// За сколько секунд плеер на всё окно выезжает и уезжает.
 const FULL_OPEN: f32 = 0.32;
@@ -724,6 +731,13 @@ struct App {
     crossfade: bool,
     /// Выравнивать громкость треков по R128.
     normalize: bool,
+    /// Облегчённая версия: плеер на весь экран без живого фона.
+    lite: bool,
+    /// Время живого фона: идёт, пока играет музыка, и плавно замирает на паузе.
+    vibe_time: f32,
+    vibe_speed: f32,
+    /// Басы, середина и верха для живого фона, сглаженные от 0 до 1.
+    vibe_levels: [f32; 3],
     /// Показывать пункт «Детям» в боковой панели.
     kids: bool,
     /// Скорость подкастов и книг.
@@ -1038,6 +1052,7 @@ enum Message {
     TrackMoved(Result<(), String>),
     CrossfadeToggle,
     NormalizeToggle,
+    LiteToggle,
     /// Проверка связи без сети и её итог.
     OnlineCheck,
     OnlineChecked(Result<(), String>),
@@ -1242,6 +1257,10 @@ impl App {
             eq: saved.eq,
             crossfade: saved.crossfade,
             normalize: saved.normalize,
+            lite: saved.lite,
+            vibe_time: 0.0,
+            vibe_speed: 0.0,
+            vibe_levels: [0.0; 3],
             kids: saved.kids,
             speed: saved.speed,
             look: saved.look,
@@ -1316,7 +1335,7 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.eq_fade.busy() || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy()
+        self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.eq_fade.busy() || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy()
     }
 
     /// Сколько места занимает основная часть окна.
@@ -1461,7 +1480,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, kids: self.kids, speed: self.speed, look: self.look });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, speed: self.speed, look: self.look });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -2149,6 +2168,34 @@ impl App {
     }
 
     /// Цвет обложки играющего трека: по крупной, а пока её нет — по уже загруженной мелкой.
+    /// Живой фон плеера на весь экран просит кадры, пока играет музыка или он ещё замирает.
+    fn vibe_moving(&self) -> bool {
+        self.full_fade.item.is_some() && !self.lite && (self.is_playing() || self.vibe_speed > 0.0)
+    }
+
+    fn vibe_step(&mut self, elapsed: f32) {
+        if !self.vibe_moving() {
+            return;
+        }
+        let playing = self.is_playing();
+        let target = if playing { 1.0 } else { 0.0 };
+        self.vibe_speed += (target - self.vibe_speed) * (1.0 - (-elapsed * VIBE_EASE).exp());
+        if !playing && self.vibe_speed < 0.01 {
+            self.vibe_speed = 0.0;
+        }
+        self.vibe_time += elapsed * self.vibe_speed;
+        // Уровни сняты после громкости плеера: тихая громкость не должна гасить анимацию.
+        let gain = if self.normalize { self.current_track().and_then(|track| track.loudness).map_or(1.0, loudness_gain) } else { 1.0 };
+        let gain = (self.volume * gain).max(0.05);
+        let levels = self.player.as_ref().filter(|_| playing && !self.muted).map_or([0.0; 3], |player| player.levels());
+        for ((shown, level), boost) in self.vibe_levels.iter_mut().zip(levels).zip(VIBE_BOOST) {
+            let level = (level / gain * boost).min(1.0);
+            // Удар подхватывается быстро, затухает плавнее.
+            let speed = if level > *shown { VIBE_ATTACK } else { VIBE_RELEASE };
+            *shown += (level - *shown) * (1.0 - (-elapsed * speed).exp());
+        }
+    }
+
     fn full_target(&self) -> iced::Color {
         let Some(track) = self.current_track() else { return ui::c().tile };
         self.cover_tints.get(&track.id).copied().or_else(|| self.covers.get(&track.id).and_then(average_color)).unwrap_or(ui::c().tile)
@@ -2618,6 +2665,7 @@ impl App {
             self.page_menu_fade.step(elapsed);
             self.dialog_fade.step(elapsed);
             self.full_fade.step(elapsed);
+            self.vibe_step(elapsed);
             // Палитра меняется на середине появления плеера, когда он уже закрывает почти всё.
             ui::set_full_dark(self.full_fade.item.is_some() && self.full_fade.shown() >= 0.5);
             if self.full_fade.item.is_some() {
@@ -4474,6 +4522,10 @@ impl App {
                 self.crossfade = !self.crossfade;
                 self.save_settings();
             }
+            Message::LiteToggle => {
+                self.lite = !self.lite;
+                self.save_settings();
+            }
             Message::NormalizeToggle => {
                 self.normalize = !self.normalize;
                 self.apply_volume();
@@ -5755,7 +5807,14 @@ impl App {
             ..container::Style::default()
         };
         let shown = self.full_fade.shown();
-        let sheet = anim::block(container(page).width(Length::Fill).height(Length::Fill).style(back));
+        let page = container(page).width(Length::Fill).height(Length::Fill);
+        let page: Element<'_, Message> = if self.lite {
+            page.style(back).into()
+        } else {
+            let vibe = vibe::Vibe { color: tint, time: self.vibe_time, levels: self.vibe_levels };
+            stack![iced::widget::shader(vibe).width(Length::Fill).height(Length::Fill), page].into()
+        };
+        let sheet = anim::block(page);
         Some(reveal(sheet).shift(0.0, height * (1.0 - shown)).inert(!self.player_full).into())
     }
 
@@ -5905,6 +5964,14 @@ impl App {
         .align_y(Alignment::Center);
         let normalize = glow(button(normalize).width(Length::Fill).padding(8).style(ui::row).on_press(Message::NormalizeToggle), 8.0);
 
+        let lite = row![
+            column![text("Включить lite-версию").color(ui::c().text), text("Визуальные эффекты и анимации будут загружаться в облегчённом формате").size(13).color(ui::c().muted)].spacing(2).width(Length::Fill),
+            view_switch(Some(self.lite)),
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center);
+        let lite = glow(button(lite).width(Length::Fill).padding(8).style(ui::row).on_press(Message::LiteToggle), 8.0);
+
         let kids = row![
             column![text("Детский раздел").color(ui::c().text), text("Пункт «Детям» в боковой панели: сказки, песни и аудиокниги для детей").size(13).color(ui::c().muted)].spacing(2).width(Length::Fill),
             view_switch(Some(self.kids)),
@@ -5916,7 +5983,7 @@ impl App {
         let looks = Look::ALL.into_iter().fold(row![].spacing(8), |line, look| line.push(choice(look.label(), look == self.look, Message::LookSet(look))));
         let page = column![
             text("Настройки").size(36).font(ui::font_headline()).color(ui::c().text),
-            column![title("Оформление"), looks].spacing(12),
+            column![title("Оформление"), looks, lite].spacing(12),
             sound,
             self.view_equalizer(),
             cross,
@@ -7736,7 +7803,7 @@ fn smoke_device(query: &str) -> Result<(), String> {
     player.reopen_device();
     for _ in 0..3 {
         std::thread::sleep(Duration::from_secs(1));
-        println!("После смены: {:?}, пауза {}, пусто {}", player.position(), player.is_paused(), player.is_empty());
+        println!("После смены: {:?}, пауза {}, пусто {}, уровни {:?}", player.position(), player.is_paused(), player.is_empty(), player.levels());
     }
     Ok(())
 }

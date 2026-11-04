@@ -4,7 +4,7 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -255,6 +255,7 @@ pub struct Player {
     _device: Arc<Mutex<Option<SendDevice>>>,
     /// Сигнал, что устройство пропало и его надо открыть заново.
     device_lost: Sender<()>,
+    levels: Arc<[AtomicU32; 3]>,
 }
 
 /// Устройство только держим живым и из других потоков не трогаем.
@@ -262,11 +263,67 @@ struct SendDevice(#[allow(dead_code)] MixerDeviceSink);
 unsafe impl Send for SendDevice {}
 unsafe impl Sync for SendDevice {}
 
+/// Громкость басов (до 250 Гц), середины (500 Гц — 2 кГц) и верхов (2—4 кГц) того, что
+/// звучит, — те же полосы, что берёт оригинал для анимации. Фильтры простые, однополюсные:
+/// анимации хватает.
+struct Bands {
+    /// Доля шага фильтра для частот среза 250, 500, 2000 и 4000 Гц.
+    steps: [f32; 4],
+    /// Доля шага сглаживания энергии.
+    smooth: f32,
+    filters: [f32; 4],
+    energy: [f32; 3],
+    /// Сумма каналов текущего кадра и сколько каналов уже пришло.
+    frame: f32,
+    channel: u16,
+    channels: u16,
+    frames: u32,
+    out: Arc<[AtomicU32; 3]>,
+}
+
+/// Уровни обновляются примерно 90 раз в секунду, энергия сглаживается за 30 мс.
+const BANDS_EVERY: u32 = 512;
+const BANDS_SMOOTH: f32 = 0.03;
+
+impl Bands {
+    fn new(channels: ChannelCount, rate: SampleRate, out: Arc<[AtomicU32; 3]>) -> Self {
+        let rate = rate.get() as f32;
+        let step = |cut: f32| 1.0 - (-std::f32::consts::TAU * cut / rate).exp();
+        let smooth = 1.0 - (-1.0 / (BANDS_SMOOTH * rate)).exp();
+        Self { steps: [step(250.0), step(500.0), step(2000.0), step(4000.0)], smooth, filters: [0.0; 4], energy: [0.0; 3], frame: 0.0, channel: 0, channels: channels.get(), frames: 0, out }
+    }
+
+    fn push(&mut self, sample: f32) {
+        self.frame += sample;
+        self.channel += 1;
+        if self.channel < self.channels {
+            return;
+        }
+        let x = self.frame / self.channels as f32;
+        (self.frame, self.channel) = (0.0, 0);
+        for (filter, step) in self.filters.iter_mut().zip(self.steps) {
+            *filter += step * (x - *filter);
+        }
+        let [low, from, to, top] = self.filters;
+        let smooth = self.smooth;
+        for (energy, band) in self.energy.iter_mut().zip([low, to - from, top - to]) {
+            *energy += smooth * (band * band - *energy);
+        }
+        self.frames += 1;
+        if self.frames >= BANDS_EVERY {
+            self.frames = 0;
+            for (out, energy) in self.out.iter().zip(self.energy) {
+                out.store(energy.sqrt().to_bits(), Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Звук плеера на пути к устройству. Оба вывода играют в свой микшер, а устройство только
 /// забирает отсюда сэмплы: при смене устройства новое подхватывает тот же звук с того же места.
 #[derive(Clone)]
 struct Relay {
-    source: Arc<Mutex<MixerSource>>,
+    source: Arc<Mutex<(MixerSource, Bands)>>,
     channels: ChannelCount,
     rate: SampleRate,
 }
@@ -275,8 +332,12 @@ impl Iterator for Relay {
     type Item = rodio::Sample;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let mut output = self.source.lock().unwrap();
+        let (source, bands) = &mut *output;
         // Пустой микшер кончается, а устройство выкинуло бы его навсегда: вместо конца тишина.
-        Some(self.source.lock().unwrap().next().unwrap_or(0.0))
+        let sample = source.next().unwrap_or(0.0);
+        bands.push(sample);
+        Some(sample)
     }
 }
 
@@ -348,7 +409,8 @@ impl Player {
         let device = open_device(signal.clone())?;
         let (channels, rate) = (device.config().channel_count(), device.config().sample_rate());
         let (mixer, source) = rodio::mixer::mixer(channels, rate);
-        let relay = Relay { source: Arc::new(Mutex::new(source)), channels, rate };
+        let levels: Arc<[AtomicU32; 3]> = Arc::default();
+        let relay = Relay { source: Arc::new(Mutex::new((source, Bands::new(channels, rate, levels.clone())))), channels, rate };
         device.mixer().add(relay.clone());
         let outputs = [rodio::Player::connect_new(&mixer), rodio::Player::connect_new(&mixer)];
         let slot = Arc::new(Mutex::new(Some(SendDevice(device))));
@@ -369,6 +431,7 @@ impl Player {
             clock: Arc::default(),
             _device: slot,
             device_lost: signal,
+            levels,
         })
     }
 
@@ -508,6 +571,11 @@ impl Player {
     /// Открывает устройство вывода заново, как после его пропажи. Нужно только для проверки.
     pub fn reopen_device(&self) {
         let _ = self.device_lost.send(());
+    }
+
+    /// Громкость басов, середины и верхов того, что звучит сейчас, после громкости плеера.
+    pub fn levels(&self) -> [f32; 3] {
+        std::array::from_fn(|band| f32::from_bits(self.levels[band].load(Ordering::Relaxed)))
     }
 
     pub fn hold_next(&self, hold: bool) {
