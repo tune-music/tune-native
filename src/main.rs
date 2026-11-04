@@ -713,6 +713,9 @@ struct App {
     history_tracks: Vec<Track>,
     /// Дни и места, откуда слушали: строки `history_tracks` по порядку.
     history_blocks: Vec<api::HistoryBlock>,
+    /// Ещё не загруженная часть истории.
+    history_rest: Vec<api::HistoryPart>,
+    history_paging: bool,
     history_loading: bool,
     /// Скачанные треки, их номера и сами треки для списка; новые первыми.
     downloads: Vec<offline::Saved>,
@@ -1170,6 +1173,8 @@ enum Message {
     Availability(Result<Vec<(String, bool)>, String>),
     HistoryLoaded(Result<api::History, String>),
     DislikesLoaded(Result<Vec<Track>, String>),
+    /// Следующие треки истории при прокрутке к концу.
+    HistoryMore(Result<api::History, String>),
     LikedLists(Result<Vec<Playlist>, String>),
     ListLike(Playlist),
     ListMeta(String, Result<(String, String), String>),
@@ -1280,6 +1285,8 @@ impl App {
             uploading: 0,
             history_tracks: Vec::new(),
             history_blocks: Vec::new(),
+            history_rest: Vec::new(),
+            history_paging: false,
             history_loading: false,
             download_ids: downloads.iter().map(|saved| saved.track.id.clone()).collect(),
             download_tracks: downloads.iter().map(|saved| saved.track.clone()).collect(),
@@ -2698,6 +2705,16 @@ impl App {
         )
     }
 
+    fn history_more(&mut self) -> Task<Message> {
+        let Some(token) = self.token() else { return Task::none() };
+        if self.history_paging || self.history_loading || self.history_rest.is_empty() {
+            return Task::none();
+        }
+        self.history_paging = true;
+        let rest = self.history_rest.clone();
+        Task::perform(background(move || api::history_more(rest, HISTORY_LIMIT, &token)), Message::HistoryMore)
+    }
+
     fn likes_more(&mut self) -> Task<Message> {
         let Some(token) = self.token() else { return Task::none() };
         let from = self.likes_from;
@@ -2902,9 +2919,11 @@ impl App {
         self.sync_overlays();
         let lyrics = self.lyrics_sync();
         self.lyrics_follow();
-        // Лайки догружаются, когда до конца загруженного остаётся немного.
+        // Лайки и история догружаются, когда до конца загруженного остаётся немного.
         let more = if self.section == Section::Likes && !self.filtering() && self.visible().end + ROW_MARGIN >= self.liked.len() && !matches!(self.retry, Some(Message::LikesMore)) {
             self.likes_more()
+        } else if self.section == Section::History && !self.filtering() && self.visible().end + ROW_MARGIN >= self.history_tracks.len() {
+            self.history_more()
         } else {
             Task::none()
         };
@@ -4627,6 +4646,7 @@ impl App {
                     Ok(history) => {
                         self.history_tracks = history.tracks;
                         self.history_blocks = history.blocks;
+                        self.history_rest = history.rest;
                         if let Some(Preview::HistoryAt(y)) = self.preview {
                             self.preview = None;
                             return Task::batch([self.visible_covers(), operation::snap_to(Id::new(LIST), scrollable::RelativeOffset { x: 0.0, y })]);
@@ -4634,6 +4654,26 @@ impl App {
                         return self.visible_covers();
                     }
                     Err(e) => return self.fail_retry(e, Message::Open(Section::History)),
+                }
+            }
+            Message::HistoryMore(result) => {
+                self.history_paging = false;
+                match result {
+                    Ok(more) => {
+                        let shift = self.history_tracks.len();
+                        self.history_tracks.extend(more.tracks);
+                        for block in more.blocks {
+                            let tracks = block.tracks.start + shift..block.tracks.end + shift;
+                            // Блок, разрезанный на границе страницы, снова один.
+                            match self.history_blocks.last_mut() {
+                                Some(last) if last.date == block.date && last.from == block.from && last.tracks.end == tracks.start => last.tracks.end = tracks.end,
+                                _ => self.history_blocks.push(api::HistoryBlock { tracks, ..block }),
+                            }
+                        }
+                        self.history_rest = more.rest;
+                        return self.visible_covers();
+                    }
+                    Err(e) => eprintln!("история не догрузилась: {e}"),
                 }
             }
             Message::QualityOpen => self.quality_menu = Some(*CURSOR.lock().unwrap()),

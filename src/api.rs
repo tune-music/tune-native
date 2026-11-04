@@ -1917,7 +1917,12 @@ pub struct HistoryBlock {
 pub struct History {
     pub tracks: Vec<Track>,
     pub blocks: Vec<HistoryBlock>,
+    /// Что ещё не загружено: догружается при прокрутке к концу.
+    pub rest: Vec<HistoryPart>,
 }
+
+/// День, откуда слушали и номера треков — ещё без сведений о треках.
+pub type HistoryPart = (String, HistoryFrom, Vec<String>);
 
 fn parse_history_from(v: &Value) -> HistoryFrom {
     let (id, model) = (&v["data"]["itemId"], &v["data"]["fullModel"]);
@@ -1946,31 +1951,47 @@ fn parse_history_from(v: &Value) -> HistoryFrom {
     }
 }
 
-/// Дни истории, новые первыми, и в каждом — откуда слушали и какие треки. Не больше `limit`
-/// треков всего: старое отрезается.
-fn parse_history(v: &Value, limit: usize) -> Vec<(String, HistoryFrom, Vec<String>)> {
+/// Дни истории, новые первыми, и в каждом — откуда слушали и какие треки.
+fn parse_history(v: &Value) -> Vec<HistoryPart> {
     let mut blocks = Vec::new();
-    let mut left = limit;
     for tab in v["historyTabs"].as_array().into_iter().flatten() {
         let date = tab["date"].as_str().unwrap_or_default().to_string();
         for item in tab["items"].as_array().into_iter().flatten() {
-            let ids: Vec<String> = item["tracks"].as_array().into_iter().flatten().filter_map(|track| id_text(&track["data"]["itemId"]["trackId"])).take(left).collect();
-            if ids.is_empty() {
-                continue;
-            }
-            left -= ids.len();
-            blocks.push((date.clone(), parse_history_from(&item["context"]), ids));
-            if left == 0 {
-                return blocks;
+            let ids: Vec<String> = item["tracks"].as_array().into_iter().flatten().filter_map(|track| id_text(&track["data"]["itemId"]["trackId"])).collect();
+            if !ids.is_empty() {
+                blocks.push((date.clone(), parse_history_from(&item["context"]), ids));
             }
         }
     }
     blocks
 }
 
+/// Первые `limit` треков истории и остаток; блок на границе делится надвое.
+fn split_history(mut parts: Vec<HistoryPart>, limit: usize) -> (Vec<HistoryPart>, Vec<HistoryPart>) {
+    let mut left = limit;
+    let mut head = Vec::new();
+    while left > 0 && !parts.is_empty() {
+        let (date, from, mut ids) = parts.remove(0);
+        if ids.len() > left {
+            let tail = ids.split_off(left);
+            parts.insert(0, (date.clone(), from.clone(), tail));
+        }
+        left -= ids.len();
+        head.push((date, from, ids));
+    }
+    (head, parts)
+}
+
+/// Вся история за раз: и номера треков, и откуда слушали (`fullModelsCount` — сведения о местах).
+/// Сведения о треках — только для первых `limit`, остальное в `rest`.
 pub fn history(limit: usize, token: &str) -> Result<History, String> {
-    let v = get("music-history", &[("fullModelsCount", "50")], token)?;
-    let parsed = parse_history(result(&v), limit);
+    let v = get("music-history", &[("fullModelsCount", "400")], token)?;
+    history_more(parse_history(result(&v)), limit, token)
+}
+
+/// Следующие `limit` треков из ещё не загруженного остатка истории.
+pub fn history_more(rest: Vec<HistoryPart>, limit: usize, token: &str) -> Result<History, String> {
+    let (parsed, rest) = split_history(rest, limit);
     // Сведения о каждом треке просятся один раз, даже если его слушали в разные дни.
     let mut seen = HashSet::new();
     let unique: Vec<String> = parsed.iter().flat_map(|(_, _, ids)| ids.iter()).filter(|id| seen.insert((*id).clone())).cloned().collect();
@@ -1983,6 +2004,7 @@ pub fn history(limit: usize, token: &str) -> Result<History, String> {
             history.blocks.push(HistoryBlock { date, from, tracks: start..history.tracks.len() });
         }
     }
+    history.rest = rest;
     Ok(history)
 }
 
@@ -2604,14 +2626,15 @@ mod tests {
                 {"context":{"type":"wave","data":{"itemId":{"seeds":["user:onyourwave"]}}},"tracks":[{"data":{"itemId":{"trackId":"1"}}},{"data":{"itemId":{"trackId":"2"}}}]},
                 {"context":{"type":"playlist","data":{"itemId":{"uid":7,"kind":3},"fullModel":{"playlist":{"title":"Мне нравится"},"tracksCount":5}}},"tracks":[{"data":{"itemId":{"trackId":"5"}}}]}]},
             {"date":"2026-11-02","items":[{"context":{"type":"other"},"tracks":[{"data":{"itemId":{"trackId":"1"}}},{"data":{}},{"data":{"itemId":{"trackId":"3"}}}]}]}]});
-        let blocks = parse_history(&v, 10);
+        let blocks = parse_history(&v);
         assert_eq!(blocks.len(), 3);
         assert!(matches!(&blocks[0].1, HistoryFrom::Wave { title, seeds } if title == "Моя волна" && seeds == &["user:onyourwave"]));
         assert!(matches!(&blocks[1].1, HistoryFrom::Playlist(list) if list.title == "Мне нравится" && list.owner == "7" && list.kind == "3"));
         assert_eq!((blocks[2].0.as_str(), &blocks[2].1, blocks[2].2.as_slice()), ("2026-11-02", &HistoryFrom::Other, ["1".to_string(), "3".to_string()].as_slice()));
-        // Сверх предела старое отрезается.
-        let cut = parse_history(&v, 3);
-        assert_eq!(cut.iter().map(|(_, _, ids)| ids.len()).collect::<Vec<_>>(), [2, 1]);
+        // Сверх предела старое уходит в остаток, блок на границе делится.
+        let (head, rest) = split_history(blocks, 4);
+        assert_eq!(head.iter().map(|(_, _, ids)| ids.len()).collect::<Vec<_>>(), [2, 1, 1]);
+        assert_eq!((rest.len(), rest[0].0.as_str(), rest[0].2.as_slice()), (1, "2026-11-02", ["3".to_string()].as_slice()));
     }
 
     #[test]
