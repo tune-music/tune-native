@@ -1818,6 +1818,16 @@ pub fn uploaded_ready(ids: &[String], token: &str) -> Result<Vec<String>, String
     Ok(v["result"].as_array().into_iter().flatten().filter(|track| track["state"].as_str() == Some("playable")).filter_map(|track| id_text(&track["id"])).collect())
 }
 
+/// Фильтры списка треков, как над «Мне нравится» в оригинале: номер, название и треки каждого.
+pub fn track_filters(ids: &[String], token: &str) -> Result<Vec<(String, String, Vec<String>)>, String> {
+    let body = json!({"trackIds": ids}).to_string();
+    let v = post("filters/tracks", "application/json", body, token)?;
+    Ok(result(&v)["filters"].as_array().into_iter().flatten().filter_map(|filter| {
+        let tracks = filter["tracks"].as_array().into_iter().flatten().filter_map(id_text).collect();
+        Some((filter["id"].as_str()?.to_string(), filter["name"].as_str()?.to_string(), tracks))
+    }).collect())
+}
+
 /// Новые название и исполнитель своего загруженного трека.
 pub fn change_uploaded(id: &str, artist: &str, title: &str, token: &str) -> Result<(), String> {
     let body = serde_json::json!({"artist": artist, "title": title}).to_string();
@@ -2096,10 +2106,36 @@ pub fn set_pinned(target: &PinRef, pinned: bool, token: &str) -> Result<(), Stri
 }
 
 /// Описание и приватность плейлиста: их нет в общем списке треков.
-pub fn playlist_meta(uid: &str, kind: &str, token: &str) -> Result<(String, String), String> {
+/// Описание, приватность и кто и когда обновил плейлист.
+pub fn playlist_meta(uid: &str, kind: &str, token: &str) -> Result<(String, String, Option<Updated>), String> {
     let v = get(&format!("users/{uid}/playlists/{kind}"), &[("rich-tracks", "false")], token)?;
     let v = result(&v);
-    Ok((v["description"].as_str().unwrap_or_default().to_string(), v["visibility"].as_str().unwrap_or("public").to_string()))
+    Ok((v["description"].as_str().unwrap_or_default().to_string(), v["visibility"].as_str().unwrap_or("public").to_string(), parse_updated(v)))
+}
+
+/// Когда обновлён плейлист: день `2026-11-03` и кем.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Updated {
+    pub date: String,
+    pub by: UpdatedBy,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum UpdatedBy {
+    /// Собран Яндексом для пользователя: его имя в родительном падеже, если есть.
+    MadeFor(String),
+    /// Обновил владелец; без имени — «Плейлист обновлён».
+    Owner { name: String, female: bool },
+}
+
+fn parse_updated(v: &Value) -> Option<Updated> {
+    let date = v["modified"].as_str()?.get(..10)?.to_string();
+    let by = if v["madeForUser"].is_object() {
+        UpdatedBy::MadeFor(v["madeForUser"]["caseForms"]["genitive"].as_str().unwrap_or_default().to_string())
+    } else {
+        UpdatedBy::Owner { name: v["owner"]["name"].as_str().unwrap_or_default().to_string(), female: v["owner"]["sex"].as_str() == Some("female") }
+    };
+    Some(Updated { date, by })
 }
 
 pub fn set_description(uid: &str, kind: &str, text: &str, token: &str) -> Result<(), String> {
@@ -2463,6 +2499,15 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_updated() {
+        let made = parse_updated(&json!({"modified": "2026-11-03T05:00:00+00:00", "madeForUser": {"caseForms": {"genitive": "Егора"}}})).unwrap();
+        assert_eq!((made.date.as_str(), made.by), ("2026-11-03", UpdatedBy::MadeFor("Егора".to_string())));
+        let own = parse_updated(&json!({"modified": "2026-10-01T05:00:00+00:00", "owner": {"name": "Аня", "sex": "female"}})).unwrap();
+        assert_eq!(own.by, UpdatedBy::Owner { name: "Аня".to_string(), female: true });
+        assert!(parse_updated(&json!({})).is_none());
+    }
 
     #[test]
     fn top_artists_parse() {

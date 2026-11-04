@@ -168,6 +168,9 @@ const DIALOG_WIDTH: f32 = 400.0;
 const INFO_MARGIN: f32 = 80.0;
 /// Сколько последних треков показать в истории.
 const HISTORY_LIMIT: usize = 200;
+/// Фильтр над списком показывается, если в нём столько треков; всего фильтров не больше стольких.
+const CHIP_TRACKS: usize = 8;
+const CHIPS_MAX: usize = 7;
 /// Сколько плейлистов видно в меню трека без прокрутки.
 const MENU_LISTS: usize = 8;
 /// Плейлист «Мне нравится»: его нельзя ни менять, ни удалять как обычный.
@@ -563,6 +566,8 @@ enum Preview {
     Collection,
     /// Исполнители коллекции с топом месяца.
     CollectionArtists,
+    /// «Мне нравится» с выбранным первым фильтром.
+    LikesChip,
     Likes,
     /// Открытые очередь и выбор качества.
     Panels,
@@ -736,12 +741,20 @@ struct App {
     /// Поиск внутри открытого плейлиста или лайков.
     filter: String,
     filter_tracks: Vec<Track>,
+    /// Фильтры Яндекса над списком («Бодрое», «Рэп и хип-хоп»): номер, название, треки.
+    chips: Vec<(String, String, Vec<String>)>,
+    /// Для какого списка фильтры: «likes» или «владелец:номер» плейлиста.
+    chips_key: String,
+    /// Выбранный фильтр; нет — «Всё».
+    chip: Option<String>,
     filter_loading: bool,
     filter_id: u64,
     disliked_list: Vec<Track>,
     liked_lists: Vec<Playlist>,
     /// Описание и приватность открытого плейлиста.
     list_meta: Option<(String, String, String)>,
+    /// «Аня обновила плейлист вчера», «Собран для Егора сегодня».
+    list_updated: Option<String>,
     notice: Option<(u64, String, bool)>,
     liked: Vec<Track>,
     likes_loading: bool,
@@ -1173,11 +1186,14 @@ enum Message {
     Availability(Result<Vec<(String, bool)>, String>),
     HistoryLoaded(Result<api::History, String>),
     DislikesLoaded(Result<Vec<Track>, String>),
+    ChipsLoaded(String, Result<Vec<(String, String, Vec<String>)>, String>),
+    /// Выбрать фильтр над списком; `None` — «Всё».
+    Chip(Option<String>),
     /// Следующие треки истории при прокрутке к концу.
     HistoryMore(Result<api::History, String>),
     LikedLists(Result<Vec<Playlist>, String>),
     ListLike(Playlist),
-    ListMeta(String, Result<(String, String), String>),
+    ListMeta(String, Result<(String, String, Option<api::Updated>), String>),
     Visibility(Playlist),
     Pin(PinRef),
     PinSaved(Result<(), String>),
@@ -1301,11 +1317,15 @@ impl App {
             track_info: None,
             filter: String::new(),
             filter_tracks: Vec::new(),
+            chips: Vec::new(),
+            chips_key: String::new(),
+            chip: None,
             filter_loading: false,
             filter_id: 0,
             disliked_list: Vec::new(),
             liked_lists: Vec::new(),
             list_meta: None,
+            list_updated: None,
             notice: None,
             liked: Vec::new(),
             likes_loading: false,
@@ -2705,6 +2725,25 @@ impl App {
         )
     }
 
+    fn chips_place(&self) -> Option<String> {
+        match (self.section, &self.playlist) {
+            (Section::Likes, _) => Some("likes".to_string()),
+            (Section::Playlists, Some(list)) if list.source == Source::Playlist => Some(format!("{}:{}", list.owner, list.kind)),
+            _ => None,
+        }
+    }
+
+    /// Фильтры для списка, как в оригинале: по жанрам и настроениям его треков.
+    fn chips_load(&mut self, key: String, ids: Vec<String>) -> Task<Message> {
+        let Some(token) = self.token() else { return Task::none() };
+        if key == self.chips_key || ids.len() < CHIP_TRACKS * 2 {
+            return Task::none();
+        }
+        self.chips_key = key.clone();
+        self.chips.clear();
+        Task::perform(background(move || api::track_filters(&ids, &token)), move |r| Message::ChipsLoaded(key.clone(), r))
+    }
+
     fn history_more(&mut self) -> Task<Message> {
         let Some(token) = self.token() else { return Task::none() };
         if self.history_paging || self.history_loading || self.history_rest.is_empty() {
@@ -2748,10 +2787,16 @@ impl App {
     }
 
     fn filtering(&self) -> bool {
-        !self.filter.trim().is_empty()
+        !self.filter.trim().is_empty() || self.chip.is_some()
     }
 
     fn filter_reset(&mut self) {
+        self.chip = None;
+        // Фильтры той же страницы остаются: их просят, пока она открывается.
+        if self.chips_place().as_deref() != Some(self.chips_key.as_str()) {
+            self.chips.clear();
+            self.chips_key.clear();
+        }
         self.filter.clear();
         self.filter_tracks.clear();
         self.filter_loading = false;
@@ -3060,6 +3105,7 @@ impl App {
                     Some(Preview::Likes | Preview::LikesEnd | Preview::Menu | Preview::Panels | Preview::TrackInfo | Preview::QueueJump) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
                     Some(Preview::CollectionArtists) => self.update(Message::Open(Section::Artists)),
+                    Some(Preview::LikesChip) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Playlists | Preview::Playlist | Preview::PlaylistHome | Preview::PageMenu) => self.update(Message::Open(Section::Playlists)),
                     Some(Preview::Dislikes) => {
                         self.preview = None;
@@ -3588,7 +3634,11 @@ impl App {
                         let lists = if self.playlists.is_empty() { self.playlists_load() } else { Task::none() };
                         Task::batch([likes, lists])
                     }
-                    Section::Likes if self.liked.is_empty() => self.likes_more(),
+                    Section::Likes => {
+                        let likes = if self.liked.is_empty() { self.likes_more() } else { Task::none() };
+                        let ids = self.liked_ids.clone();
+                        Task::batch([likes, self.chips_load("likes".to_string(), ids)])
+                    }
                     Section::Playlists if self.playlists.is_empty() => self.playlists_load(),
                     Section::Search => operation::focus(Id::new(SEARCH_INPUT)),
                     Section::Discography => self.discography_load(0),
@@ -3616,6 +3666,7 @@ impl App {
             }
             Message::Search => return self.search_run(),
             Message::Filter(filter) => {
+                self.chip = None;
                 self.filter = filter;
                 // Новая буква отменяет поиск, который ещё ждёт паузы или ответа.
                 self.filter_id += 1;
@@ -4388,6 +4439,10 @@ impl App {
                             self.queue_title = self.playlist.as_ref().map(|p| p.title.clone());
                             self.section = Section::Wave;
                         }
+                        if let Some(list) = self.playlist.clone().filter(|list| list.source == Source::Playlist) {
+                            let ids = self.playlist_tracks.iter().map(|track| track.id.clone()).collect();
+                            return self.chips_load(format!("{}:{}", list.owner, list.kind), ids);
+                        }
                     }
                     Err(e) => return self.fail_retry(e, Message::ListReload),
                 }
@@ -4596,9 +4651,10 @@ impl App {
                 }
                 return Task::perform(background(move || api::set_playlist_liked(&uid, &list.owner, &list.kind, liked, &token)), Message::SimpleSaved);
             }
-            Message::ListMeta(kind, Ok((description, visibility))) => {
+            Message::ListMeta(kind, Ok((description, visibility, updated))) => {
                 if self.playlist.as_ref().is_some_and(|list| list.kind == kind) {
                     self.list_meta = Some((kind, description, visibility));
+                    self.list_updated = updated.map(|updated| updated_text(&updated, local_today()));
                 }
             }
             // Без описания плейлист всё равно работает.
@@ -4655,6 +4711,49 @@ impl App {
                     }
                     Err(e) => return self.fail_retry(e, Message::Open(Section::History)),
                 }
+            }
+            Message::ChipsLoaded(key, result) => {
+                if key != self.chips_key {
+                    return Task::none();
+                }
+                // Как в оригинале: только заметные фильтры, не меньше двух и не больше семи.
+                let chips: Vec<_> = result.unwrap_or_default().into_iter().filter(|(id, _, tracks)| id != "all" && tracks.len() >= CHIP_TRACKS).take(CHIPS_MAX).collect();
+                self.chips = if chips.len() >= 2 { chips } else { Vec::new() };
+                if matches!(self.preview, Some(Preview::LikesChip)) {
+                    self.preview = None;
+                    let first = self.chips.first().map(|chip| chip.0.clone());
+                    return self.update(Message::Chip(first));
+                }
+            }
+            Message::Chip(None) => {
+                self.chip = None;
+                self.filter_tracks.clear();
+                self.filter_loading = false;
+                self.filter_id += 1;
+                self.list_offset = 0.0;
+                return operation::snap_to(Id::new(LIST), scrollable::RelativeOffset::START);
+            }
+            Message::Chip(Some(id)) => {
+                let Some((_, _, ids)) = self.chips.iter().find(|chip| chip.0 == id).cloned() else { return Task::none() };
+                self.filter.clear();
+                self.chip = Some(id);
+                self.filter_id += 1;
+                self.list_offset = 0.0;
+                let snap = operation::snap_to(Id::new(LIST), scrollable::RelativeOffset::START);
+                let loaded = if self.section == Section::Likes { &self.liked } else { &self.playlist_tracks };
+                let found: HashMap<&str, &Track> = loaded.iter().map(|track| (track.id.as_str(), track)).collect();
+                // Плейлист загружен целиком, а лайки — по страницам: недостающие треки просим у Яндекса.
+                if ids.iter().all(|id| found.contains_key(id.as_str())) {
+                    let tracks = ids.iter().filter_map(|id| found.get(id.as_str()).map(|track| (*track).clone())).collect();
+                    self.filter_tracks = tracks;
+                    self.filter_loading = false;
+                    return snap;
+                }
+                let Some(token) = self.token() else { return snap };
+                self.filter_tracks.clear();
+                self.filter_loading = true;
+                let wanted = self.filter_id;
+                return Task::batch([snap, Task::perform(background(move || api::tracks_by_ids(&ids, &token)), move |r| Message::FilterLoaded(wanted, r))]);
             }
             Message::HistoryMore(result) => {
                 self.history_paging = false;
@@ -6735,6 +6834,18 @@ impl App {
         field.into()
     }
 
+    /// Фильтры над списком: «Всё» и до семи жанров и настроений.
+    fn view_chips<'a>(&self) -> Option<Element<'a, Message>> {
+        if self.chips.is_empty() {
+            return None;
+        }
+        let chip = |label: String, chosen: bool, press: Message| shine(button(text(label).size(14)).padding([7, 16]).style(if chosen { ui::accent } else { ui::secondary }).on_press(press), 20.0);
+        let chips = self.chips.iter().fold(row![chip("Всё".to_string(), self.chip.is_none(), Message::Chip(None))].spacing(8), |chips, (id, name, _)| {
+            chips.push(chip(name.clone(), self.chip.as_deref() == Some(id.as_str()), Message::Chip(Some(id.clone()))))
+        });
+        Some(chips.wrap().vertical_spacing(8).into())
+    }
+
     fn view_filter_list<'a>(&'a self, section: Section) -> Element<'a, Message> {
         if !self.filter_tracks.is_empty() {
             self.view_list(section, None)
@@ -6769,7 +6880,7 @@ impl App {
         } else {
             placeholder("Пока пусто", Some("Нажмите на сердце у трека, и он появится здесь"))
         };
-        column![title, center].spacing(16).height(Length::Fill).into()
+        column![title].push(self.view_chips()).push(center).spacing(16).height(Length::Fill).into()
     }
 
     fn view_playlist<'a>(&'a self, playlist: &'a Playlist) -> Element<'a, Message> {
@@ -6789,7 +6900,8 @@ impl App {
         if !self.playlist_tracks.is_empty() {
             tools = tools.push(self.view_filter());
         }
-        let header = self.page_header("Плейлист", playlist.title.clone(), playlist_cover_key(playlist), false, None, about.join(" · "), tools);
+        let updated = self.list_updated.as_ref().filter(|_| self.list_meta.as_ref().is_some_and(|meta| meta.0 == playlist.kind)).map(|line| text(line.clone()).size(16).color(ui::c().muted).into());
+        let header = self.page_header("Плейлист", playlist.title.clone(), playlist_cover_key(playlist), false, updated, about.join(" · "), tools);
         let center: Element<'_, Message> = if self.filtering() {
             self.view_filter_list(Section::Playlists)
         } else if !self.playlist_tracks.is_empty() {
@@ -6799,7 +6911,7 @@ impl App {
         } else {
             skeleton_list()
         };
-        column![header, center].spacing(16).height(Length::Fill).into()
+        column![header].push(self.view_chips()).push(center).spacing(16).height(Length::Fill).into()
     }
 
     fn view_playlists(&self) -> Element<'_, Message> {
@@ -7867,6 +7979,21 @@ fn day_number(year: i32, month: u32, day: u32) -> i64 {
 }
 
 /// «Сегодня», «Вчера», «1 ноября», а для прошлых лет — «1 ноября 2025».
+/// Строка под названием плейлиста, как в оригинале.
+fn updated_text(updated: &api::Updated, today: (i32, u32, u32)) -> String {
+    let when = match history_day(&updated.date, today).as_str() {
+        "Сегодня" => "сегодня".to_string(),
+        "Вчера" => "вчера".to_string(),
+        day => day.to_string(),
+    };
+    match &updated.by {
+        api::UpdatedBy::MadeFor(whom) if whom.is_empty() => format!("Собран {when}"),
+        api::UpdatedBy::MadeFor(whom) => format!("Собран для {whom} {when}"),
+        api::UpdatedBy::Owner { name, .. } if name.is_empty() => format!("Плейлист обновлён {when}"),
+        api::UpdatedBy::Owner { name, female } => format!("{name} {} плейлист {when}", if *female { "обновила" } else { "обновил" }),
+    }
+}
+
 fn history_day(date: &str, today: (i32, u32, u32)) -> String {
     const MONTHS: [&str; 12] = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
     let mut parts = date.split('-').map(|part| part.parse::<u32>().ok());
@@ -8485,6 +8612,16 @@ fn smoke_format(query: &str) -> Result<(), String> {
 }
 
 /// Что Яндекс отвечает на `after-track` для этого аккаунта: реклама и шоты в разных местах.
+fn smoke_filters(count: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let uid = api::profile(&token)?.uid;
+    let ids: Vec<String> = api::liked_ids(&uid, &token)?.into_iter().take(count.parse().unwrap_or(300)).collect();
+    for (id, name, tracks) in api::track_filters(&ids, &token)? {
+        println!("{id} «{name}»: {} треков, первые {:?}", tracks.len(), tracks.iter().take(3).collect::<Vec<_>>());
+    }
+    Ok(())
+}
+
 fn smoke_after(query: &str) -> Result<(), String> {
     let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
     let tracks = api::search(query, &token)?;
@@ -9002,7 +9139,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -9025,6 +9162,7 @@ fn main() -> iced::Result {
             "--smoke-format" => smoke_format(query),
             "--smoke-get" => smoke_get(query),
             "--smoke-catalog" => smoke_catalog(query),
+            "--smoke-filters" => smoke_filters(query),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
@@ -9064,6 +9202,7 @@ fn main() -> iced::Result {
             "pin-play-2" => Preview::PinPlay(2),
             "collection" => Preview::Collection,
             "collection-artists" => Preview::CollectionArtists,
+            "likes-chip" => Preview::LikesChip,
             "playlists" => Preview::Playlists,
             "playlist" => Preview::Playlist,
             "page-menu" => Preview::PageMenu,
@@ -9160,6 +9299,10 @@ mod tests {
         let today = (2026, 3, 1);
         assert_eq!(history_day("2026-03-01", today), "Сегодня");
         assert_eq!(history_day("2026-02-28", today), "Вчера");
+        let by = api::UpdatedBy::Owner { name: "Аня".to_string(), female: true };
+        assert_eq!(updated_text(&api::Updated { date: "2026-02-28".to_string(), by }, today), "Аня обновила плейлист вчера");
+        let made = api::UpdatedBy::MadeFor("Егора".to_string());
+        assert_eq!(updated_text(&api::Updated { date: "2025-12-31".to_string(), by: made }, today), "Собран для Егора 31 декабря 2025");
         assert_eq!(history_day("2026-02-27", today), "27 февраля");
         assert_eq!(history_day("2025-12-31", today), "31 декабря 2025");
         assert_eq!(history_day("2025-12-31", (2026, 1, 1)), "Вчера");
