@@ -20,6 +20,8 @@ pub struct Saved {
     pub title: String,
     /// Зёрна волны, если играла волна, а не список.
     pub wave: Option<Vec<String>>,
+    /// Откуда играла очередь: альбом, плейлист, исполнитель, поиск и так далее.
+    pub from: Value,
     pub current: usize,
     pub position: Duration,
 }
@@ -100,7 +102,7 @@ fn load_from(dir: &Path) -> Option<Saved> {
     }
     let position = Duration::from_secs_f64(position).min(tracks[current].duration);
     let wave = serde_json::from_value(queue["wave"].clone()).ok();
-    Some(Saved { title: queue["title"].as_str().unwrap_or_default().to_string(), wave, tracks, current, position })
+    Some(Saved { title: queue["title"].as_str().unwrap_or_default().to_string(), wave, from: queue["from"].clone(), tracks, current, position })
 }
 
 pub fn load() -> Option<Saved> {
@@ -115,10 +117,10 @@ fn run(wait: bool, job: impl FnOnce() + Send + 'static) {
     }
 }
 
-pub fn save_queue(tracks: Vec<Track>, title: String, wave: Option<Vec<String>>, wait: bool) {
+pub fn save_queue(tracks: Vec<Track>, title: String, wave: Option<Vec<String>>, from: Value, wait: bool) {
     run(wait, move || {
         let tracks: Vec<Value> = tracks.iter().map(track_value).collect();
-        write(&api::data_dir(), QUEUE_FILE, &json!({ "title": title, "wave": wave, "tracks": tracks }));
+        write(&api::data_dir(), QUEUE_FILE, &json!({ "title": title, "wave": wave, "from": from, "tracks": tracks }));
     });
 }
 
@@ -187,10 +189,12 @@ mod tests {
     fn restores_queue_and_place() {
         let dir = folder("full");
         let tracks = [track("1", 100), track("2", 200)];
-        write(&dir, QUEUE_FILE, &json!({ "title": "Лист", "tracks": tracks.iter().map(track_value).collect::<Vec<_>>() }));
+        let from = json!({ "type": "album", "kind": "123" });
+        write(&dir, QUEUE_FILE, &json!({ "title": "Лист", "from": from, "tracks": tracks.iter().map(track_value).collect::<Vec<_>>() }));
         write(&dir, PLACE_FILE, &json!({ "current": 1, "seconds": 42.5 }));
         let saved = load_from(&dir).unwrap();
         assert_eq!(saved.title, "Лист");
+        assert_eq!(saved.from, from);
         assert_eq!(saved.tracks, tracks);
         assert_eq!(saved.current, 1);
         assert_eq!(saved.position, Duration::from_secs_f64(42.5));

@@ -400,6 +400,8 @@ enum QueueFrom {
     Unknown,
     List(Playlist),
     Artist(String),
+    /// «Знакомое вам» на странице исполнителя.
+    Familiar(String),
     Likes,
     History,
     Dislikes,
@@ -1327,6 +1329,42 @@ impl App {
         list.source == Source::Playlist && list.kind == FAVORITES_KIND && self.uid.as_deref() == Some(list.owner.as_str())
     }
 
+    /// Источник очереди для файла сессии: после запуска очередь помнит, откуда играла.
+    fn queue_from_value(&self) -> serde_json::Value {
+        use serde_json::json;
+        match &self.queue_from {
+            QueueFrom::Unknown => serde_json::Value::Null,
+            QueueFrom::List(list) => json!({
+                "type": if list.source == Source::Album { "album" } else { "playlist" },
+                "owner": list.owner, "kind": list.kind, "title": list.title, "count": list.count, "cover": list.cover,
+            }),
+            QueueFrom::Artist(id) => json!({ "type": "artist", "id": id }),
+            QueueFrom::Familiar(id) => json!({ "type": "familiar", "id": id }),
+            QueueFrom::Likes => json!({ "type": "likes" }),
+            QueueFrom::History => json!({ "type": "history" }),
+            QueueFrom::Dislikes => json!({ "type": "dislikes" }),
+            QueueFrom::Search => json!({ "type": "search" }),
+            QueueFrom::Downloads => json!({ "type": "downloads" }),
+        }
+    }
+
+    fn queue_from_saved(v: &serde_json::Value) -> QueueFrom {
+        let text = |key: &str| v[key].as_str().unwrap_or_default().to_string();
+        let list = |source| Playlist { source, owner: text("owner"), kind: text("kind"), title: text("title"), count: v["count"].as_u64().unwrap_or(0), cover: v["cover"].as_str().map(str::to_string) };
+        match v["type"].as_str() {
+            Some("album") => QueueFrom::List(list(Source::Album)),
+            Some("playlist") => QueueFrom::List(list(Source::Playlist)),
+            Some("artist") => QueueFrom::Artist(text("id")),
+            Some("familiar") => QueueFrom::Familiar(text("id")),
+            Some("likes") => QueueFrom::Likes,
+            Some("history") => QueueFrom::History,
+            Some("dislikes") => QueueFrom::Dislikes,
+            Some("search") => QueueFrom::Search,
+            Some("downloads") => QueueFrom::Downloads,
+            _ => QueueFrom::Unknown,
+        }
+    }
+
     fn queue_from_list(&self, list: Playlist) -> QueueFrom {
         if self.is_favorites(&list) {
             QueueFrom::Likes
@@ -2097,7 +2135,7 @@ impl App {
                 let id = format!("{}:{}", list.owner, list.kind);
                 ("playlist", "playlist", Some(id.clone()), Some(id))
             }
-            QueueFrom::Artist(id) => ("artist", "artist", Some(id.clone()), None),
+            QueueFrom::Artist(id) | QueueFrom::Familiar(id) => ("artist", "artist", Some(id.clone()), None),
             QueueFrom::Search => ("search", "search", None, None),
             QueueFrom::Likes | QueueFrom::Dislikes => ("playlist", "other", None, None),
             QueueFrom::Downloads => ("downloads", "other", None, None),
@@ -2132,7 +2170,7 @@ impl App {
     fn restore_queue(&mut self, saved: session::Saved) -> Task<Message> {
         self.session_key = Some(queue_key(&saved.tracks, &saved.title));
         self.queue = saved.tracks;
-        self.queue_from = QueueFrom::Unknown;
+        self.queue_from = Self::queue_from_saved(&saved.from);
         self.current = Some(saved.current);
         self.position = saved.position;
         self.resume = Some(saved.position);
@@ -2165,7 +2203,7 @@ impl App {
         let key = queue_key(&self.queue, &title);
         if self.session_key != Some(key) {
             self.session_key = Some(key);
-            session::save_queue(self.queue.clone(), title, self.wave_queue.then(|| self.wave_base.clone()), wait);
+            session::save_queue(self.queue.clone(), title, self.wave_queue.then(|| self.wave_base.clone()), self.queue_from_value(), wait);
         }
         session::save_place(current, self.position, wait);
     }
@@ -3404,8 +3442,8 @@ impl App {
             Message::FamiliarPlay(index) => {
                 let Some(artist) = &self.artist else { return Task::none() };
                 let tracks = self.familiar_tracks(artist).to_vec();
-                let title = artist.name.clone();
-                self.queue_from = QueueFrom::Unknown;
+                let (title, id) = (artist.name.clone(), artist.id.clone());
+                self.queue_from = QueueFrom::Familiar(id);
                 return self.play_list(tracks, title, index);
             }
             Message::DislikesTab(artists) => {
@@ -3989,6 +4027,7 @@ impl App {
                 let Some((_, details)) = &self.track_info else { return Task::none() };
                 let similar = details.similar.clone();
                 self.dialog = None;
+                self.queue_from = QueueFrom::Unknown;
                 return self.play_list(similar, "Похожие треки".to_string(), index);
             }
             Message::MenuLyrics => {
@@ -4234,7 +4273,7 @@ impl App {
                 return match self.queue_from.clone() {
                     QueueFrom::Unknown => Task::none(),
                     QueueFrom::List(list) => self.open_list(list),
-                    QueueFrom::Artist(id) => self.handle(Message::ArtistOpen(id)),
+                    QueueFrom::Artist(id) | QueueFrom::Familiar(id) => self.handle(Message::ArtistOpen(id)),
                     QueueFrom::Likes => self.handle(Message::Open(Section::Likes)),
                     QueueFrom::History => self.handle(Message::Open(Section::History)),
                     QueueFrom::Dislikes => self.handle(Message::Open(Section::Dislikes)),
@@ -5383,9 +5422,12 @@ impl App {
             QueueFrom::Search => return link("из поиска".to_string()).into(),
             QueueFrom::History => return link("из истории".to_string()).into(),
             QueueFrom::Downloads => return link("из скачанного".to_string()).into(),
+            // У выпусков подкаста есть дата выхода, у треков альбома нет.
+            QueueFrom::List(list) if list.source == Source::Album && self.current_track().is_some_and(|track| track.published.is_some()) => "из подкаста",
             QueueFrom::List(list) if list.source == Source::Album => "из альбома",
             QueueFrom::List(_) | QueueFrom::Likes | QueueFrom::Dislikes => "из плейлиста",
             QueueFrom::Artist(_) => "из популярных треков исполнителя",
+            QueueFrom::Familiar(_) => "из знакомого вам у",
         };
         row![plain(prefix.to_string()), link(name)].spacing(5).into()
     }
