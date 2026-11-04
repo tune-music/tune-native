@@ -2092,8 +2092,11 @@ fn sign(data: &str) -> String {
 
 pub fn file_info(track_id: &str, quality: &str, token: &str) -> Result<FileInfo, String> {
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs().to_string();
-    let signature = sign(&format!("{ts}{track_id}{quality}{}{TRANSPORT}", CODECS.concat()));
-    let codecs = CODECS.join(",");
+    // HE-AAC не просим: декодер понимает только основу AAC без SBR, и у такого файла
+    // пропали бы верхние частоты. На «Экономичном» Яндекс тогда отдаёт AAC 192, как на «Оптимальном».
+    let codecs: Vec<&str> = CODECS.iter().copied().filter(|codec| !codec.starts_with("he-aac")).collect();
+    let signature = sign(&format!("{ts}{track_id}{quality}{}{TRANSPORT}", codecs.concat()));
+    let codecs = codecs.join(",");
     let v = get(
         "get-file-info",
         &[("ts", &ts), ("trackId", track_id), ("quality", quality), ("codecs", &codecs), ("transports", TRANSPORT), ("sign", &signature)],
