@@ -3508,8 +3508,8 @@ impl App {
                 if !(url.starts_with("https://") || url.starts_with("http://")) {
                     return Task::none();
                 }
-                if let Err(e) = std::process::Command::new("explorer").arg(&url).spawn() {
-                    return self.fail(format!("Не удалось открыть браузер: {e}"));
+                if let Err(e) = open_in_browser(&url) {
+                    return self.fail(e);
                 }
             }
             Message::DiscographyOpen(also) => {
@@ -3647,8 +3647,8 @@ impl App {
             }
             Message::OpenLink(link) => {
                 // Покупки и настройки аккаунта живут на сайтах Яндекса.
-                if let Err(e) = std::process::Command::new("explorer").arg(link).spawn() {
-                    return self.fail(format!("Не удалось открыть браузер: {e}"));
+                if let Err(e) = open_in_browser(link) {
+                    return self.fail(e);
                 }
             }
             // Без сети приложение открывается с аккаунтом прошлого запуска и сразу на скачанном.
@@ -9731,4 +9731,20 @@ fn upload_all(uid: &str, kind: &str, paths: &[std::path::PathBuf], token: &str) 
         }
     }
     (sent.len(), waiting.len(), error)
+}
+
+/// Открывает ссылку в браузере по умолчанию. Через explorer.exe ссылка с `?` и `&`
+/// открывала Проводник вместо браузера.
+fn open_in_browser(url: &str) -> Result<(), String> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let wide = |text: &str| text.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (verb, target) = (wide("open"), wide(url));
+    // SAFETY: строки с нулём на конце живут до конца вызова, остальное — «не задано».
+    let code = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), target.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) } as isize;
+    // Меньше 33 — ошибка, по документации ShellExecute.
+    if code <= 32 {
+        return Err(format!("Не удалось открыть браузер (код {code})"));
+    }
+    Ok(())
 }
