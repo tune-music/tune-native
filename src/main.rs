@@ -454,6 +454,8 @@ enum Dialog {
     EditTrack(Track),
     /// HTML-код для сайта: адрес плеера и подпись со ссылками.
     Embed(Embed),
+    /// Предупреждение перед альбомом или исполнителем: что открыть и что показать.
+    Unsafe(String, &'static str, api::Modal),
 }
 
 /// Что вставить на сайт: адрес плеера Яндекса и подпись «Слушайте … на Яндекс Музыке».
@@ -796,6 +798,8 @@ struct App {
     /// Поиск внутри открытого плейлиста или лайков.
     filter: String,
     filter_tracks: Vec<Track>,
+    /// Альбомы и исполнители, которые после предупреждения решили открыть: второй раз не спрашиваем.
+    unsafe_ok: HashSet<String>,
     /// Трейлер открытой страницы: адрес у Яндекса, название и отрывки.
     trailer: Option<(String, String, Vec<Track>)>,
     /// Фильтры Яндекса над списком («Бодрое», «Рэп и хип-хоп»): номер, название, треки.
@@ -1246,6 +1250,8 @@ enum Message {
     ChipsLoaded(String, Result<Vec<(String, String, Vec<String>)>, String>),
     TrailerLoaded(String, Result<Option<(String, Vec<Track>)>, String>),
     TrailerPlay,
+    /// Ответ на предупреждение: открыть страницу или уйти назад.
+    UnsafeAnswer(bool),
     /// Выбрать фильтр над списком; `None` — «Всё».
     Chip(Option<String>),
     /// Следующие треки истории при прокрутке к концу.
@@ -1378,6 +1384,7 @@ impl App {
             filter_tracks: Vec::new(),
             chips: Vec::new(),
             trailer: None,
+            unsafe_ok: HashSet::new(),
             chips_key: String::new(),
             chip: None,
             filter_loading: false,
@@ -3468,6 +3475,7 @@ impl App {
                 }
             }
             Message::OpenUrl(url) => {
+                self.menu = None;
                 if !(url.starts_with("https://") || url.starts_with("http://")) {
                     return Task::none();
                 }
@@ -4128,6 +4136,9 @@ impl App {
                     if let Some(playlist) = &mut self.playlist {
                         playlist.title = album.title.clone();
                     }
+                    if let Some(modal) = album.modal.clone().filter(|_| !self.unsafe_ok.contains(&format!("album:{}", album.id))) {
+                        self.dialog = Some(Dialog::Unsafe(format!("album:{}", album.id), "К альбому", modal));
+                    }
                     let main = album.cover.clone().map(|uri| (format!("{ALBUM_COVER}{}", album.id), uri));
                     let versions = album.versions.iter().filter_map(|c| Some((format!("{ALBUM_COVER}{}", c.id), c.cover.clone()?)));
                     let cover = main.into_iter().chain(versions).collect();
@@ -4208,6 +4219,9 @@ impl App {
                         let photos = artist.photos.iter().enumerate().map(|(at, uri)| (format!("{PHOTO_COVER}{}:{at}", artist.id), uri.clone()));
                         let jobs = main.into_iter().chain(artists).chain(albums).chain(release).chain(lists).chain(videos).chain(photos).collect();
                         self.familiar_wave = artist.familiar_collection.is_empty();
+                        if let Some(modal) = artist.modal.clone().filter(|_| !self.unsafe_ok.contains(&format!("artist:{}", artist.id))) {
+                            self.dialog = Some(Dialog::Unsafe(format!("artist:{}", artist.id), "К артисту", modal));
+                        }
                         self.artist = Some(artist);
                         let covers = Task::batch([self.fetch_cover_jobs(jobs, "300x300"), self.artist_familiar_covers()]);
                         return match self.preview.clone() {
@@ -4551,7 +4565,7 @@ impl App {
             }
             Message::FocusMove(forward) => return if forward { operation::focus_next() } else { operation::focus_previous() },
             Message::Enter => {
-                let confirmable = !matches!(self.dialog, None | Some(Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account | Dialog::Wizard));
+                let confirmable = !matches!(self.dialog, None | Some(Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account | Dialog::Wizard | Dialog::Unsafe(..)));
                 if confirmable {
                     return self.handle(Message::DialogConfirm);
                 }
@@ -4637,7 +4651,7 @@ impl App {
                 }
                 self.dialog = None;
                 return match dialog {
-                    Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account | Dialog::Wizard => Task::none(),
+                    Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account | Dialog::Wizard | Dialog::Unsafe(..) => Task::none(),
                     Dialog::Logout => self.handle(Message::Logout),
                     Dialog::ClearDownloads => self.handle(Message::DownloadsClear),
                     Dialog::DownloadLikes => self.handle(Message::DownloadLikes),
@@ -4819,6 +4833,15 @@ impl App {
                 if let Ok(Some((title, tracks))) = result {
                     self.trailer = Some((path, title, tracks));
                 }
+            }
+            Message::UnsafeAnswer(open) => {
+                let Some(Dialog::Unsafe(key, _, _)) = self.dialog.clone() else { return Task::none() };
+                self.dialog = None;
+                if open {
+                    self.unsafe_ok.insert(key);
+                    return Task::none();
+                }
+                return self.handle(Message::Back);
             }
             Message::TrailerPlay => {
                 let Some((_, title, tracks)) = self.trailer.clone() else { return Task::none() };
@@ -5729,6 +5752,7 @@ impl App {
             Dialog::Wizard => return self.view_wizard(),
             Dialog::TrackInfo(track) => return self.view_track_info(track),
             Dialog::Account => return self.view_account(),
+            Dialog::Unsafe(_, go, modal) => return self.view_unsafe(go, modal),
             Dialog::Logout => ("Выйти из аккаунта?".to_string(), "Выйти", true),
             Dialog::DownloadLikes => {
                 let left = self.liked_ids.iter().filter(|id| !self.download_ids.contains(*id)).count();
@@ -5768,6 +5792,28 @@ impl App {
         // Затемнение ловит клики, чтобы страница под окном не реагировала.
         let dim = iced::Color::BLACK.scale_alpha(0.6 * alpha);
         reveal(mouse_area(container(mouse_area(window).on_press(Message::DialogInput(self.dialog_text.clone()))).center(Length::Fill).style(move |_| container::Style::default().background(dim))).on_press(Message::MenuClose)).inert(!self.dialog_fade.live).into()
+    }
+
+    /// Предупреждение перед страницей, как в оригинале: «Не буду слушать» — главная кнопка.
+    fn view_unsafe<'a>(&'a self, go: &'static str, modal: &'a api::Modal) -> Element<'a, Message> {
+        let alpha = self.dialog_fade.shown();
+        let mut body = column![text(&modal.title).size(20).font(ui::font_medium()).color(ui::c().text.scale_alpha(alpha))].spacing(12);
+        if !modal.description.is_empty() {
+            body = body.push(text(&modal.description).color(ui::c().muted.scale_alpha(alpha)));
+        }
+        if let Some((label, url)) = &modal.details {
+            body = body.push(hover_line(text(label.as_str()), ui::c().accent, ui::c().strong, Message::OpenUrl(url.clone())));
+        }
+        let buttons = row![
+            Space::new().width(Length::Fill),
+            shine(button(text(go).color(ui::c().text.scale_alpha(alpha))).padding([8, 18]).style(ui::button_faded(ui::secondary, alpha)).on_press(Message::UnsafeAnswer(true)), 24.0),
+            shine(button(text("Не буду слушать").font(ui::font_medium()).color(ui::c().on_accent.scale_alpha(alpha))).padding([8, 18]).style(ui::button_faded(ui::accent, alpha)).on_press(Message::UnsafeAnswer(false)), 24.0),
+        ]
+        .spacing(8);
+        let window = reveal(container(body.push(Space::new().height(4)).push(buttons)).width(DIALOG_WIDTH).padding(24).style(ui::popover_faded(alpha))).scale(0.94 + 0.06 * alpha, 0.5, 0.5).shift(0.0, 10.0 * (1.0 - alpha));
+        // Клик мимо окна страницу не открывает: ответить нужно кнопкой.
+        let dim = iced::Color::BLACK.scale_alpha(0.6 * alpha);
+        reveal(mouse_area(container(window).center(Length::Fill).style(move |_| container::Style::default().background(dim)))).inert(!self.dialog_fade.live).into()
     }
 
     fn avatar<'a>(&self, side: f32, letter: f32) -> Element<'a, Message> {
@@ -6126,6 +6172,12 @@ impl App {
         }
         items = items.push(item(ui::INFO, "Сведения о треке", Message::DialogOpen(Dialog::TrackInfo(track.clone()))));
         count += 2.0;
+        // Жалоба — форма Яндекса, как в окне оригинала, только в браузере.
+        if !track.ugc {
+            let theme = if ui::is_light() { "white" } else { "black" };
+            items = items.push(item(ui::INFO, "Сообщить о проблеме", Message::OpenUrl(format!("{YANDEX}/complaint?contentId={}&theme={theme}&lang=ru", track.id))));
+            count += 1.0;
+        }
         popup(items.into(), x, y, MENU_WIDTH, count * MENU_ITEM, alpha, live)
     }
 

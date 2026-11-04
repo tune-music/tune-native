@@ -756,6 +756,8 @@ pub struct Album {
     pub genre: Option<String>,
     /// Предупреждения под шапкой, например «Исполнитель признан иноагентом».
     pub disclaimer: Vec<String>,
+    /// Окно перед страницей, как в оригинале: «Не буду слушать» или открыть.
+    pub modal: Option<Modal>,
     pub year: Option<u64>,
     pub artists: Vec<(String, String)>,
     pub cover: Option<String>,
@@ -900,6 +902,8 @@ pub struct Artist {
     pub bandlink: Option<ArtistLink>,
     /// Предупреждения под шапкой, например «Исполнитель признан иноагентом».
     pub disclaimer: Vec<String>,
+    /// Окно перед страницей, как в оригинале: «Не буду слушать» или открыть.
+    pub modal: Option<Modal>,
     /// Альбом, который скоро выйдет: подпись карточки — дата выхода.
     pub upcoming: Option<Card>,
 }
@@ -943,6 +947,7 @@ fn parse_album(v: &Value) -> Option<Album> {
         version: v["version"].as_str().unwrap_or_default().trim().to_string(),
         genre: v["genre"].as_str().filter(|genre| !genre.is_empty()).map(str::to_string),
         disclaimer: Vec::new(),
+        modal: None,
         labels: v["labels"].as_array().into_iter().flatten().filter_map(|label| Some((id_text(&label["id"]), label["name"].as_str().or(label.as_str())?.to_string()))).collect(),
         released: v["releaseDate"].as_str().and_then(release_date),
         versions: parse_cards(&v["duplicates"], version_card),
@@ -1022,6 +1027,7 @@ fn parse_artist(v: &Value) -> Option<Artist> {
         familiar_collection: Vec::new(),
         familiar_wave: Vec::new(),
         disclaimer: Vec::new(),
+        modal: None,
         upcoming: None,
         release: v["lastReleases"].as_array().and_then(|list| list.first()).and_then(album_card),
         playlists: v["playlists"].as_array().into_iter().flatten().filter_map(parse_home_playlist).collect(),
@@ -1082,6 +1088,7 @@ pub fn album(id: &str, token: &str) -> Result<(Album, Vec<Track>), String> {
     }
     let mut album = parse_album(v).ok_or("Яндекс не прислал альбом")?;
     album.disclaimer = disclaimer("albums", id, &v["disclaimers"], token);
+    album.modal = modal(&v["disclaimers"], token);
     album.volumes = disks.iter().map(Vec::len).filter(|&size| size > 0).collect();
     Ok((album, disks.into_iter().flatten().collect()))
 }
@@ -1094,6 +1101,7 @@ pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
     }
     let mut artist = parse_artist(result(&v)).ok_or_else(|| "Яндекс не прислал исполнителя".to_string())?;
     artist.disclaimer = disclaimer("artists", id, &result(&v)["artist"]["disclaimers"], token);
+    artist.modal = modal(&result(&v)["artist"]["disclaimers"], token);
     // Предстоящего релиза чаще всего нет: тогда Яндекс отвечает 404.
     if let Ok(v) = get(&format!("artists/{id}/blocks/artist-upcoming-release"), &[], token) {
         artist.upcoming = upcoming_card(&result(&v)["release"]);
@@ -1187,6 +1195,29 @@ fn disclaimer(kind: &str, id: &str, marks: &Value, token: &str) -> Vec<String> {
     }
     let Ok(v) = get(&format!("{kind}/{id}/disclaimer"), &[], token) else { return Vec::new() };
     parse_disclaimer(result(&v))
+}
+
+/// Предупреждение во весь экран перед страницей: заголовок, текст и ссылка «Подробнее».
+#[derive(Clone, Debug, PartialEq)]
+pub struct Modal {
+    pub title: String,
+    pub description: String,
+    pub details: Option<(String, String)>,
+}
+
+/// Пометка `modal:<номер>` ссылается на словарь предупреждений Яндекса (`disclaimers`).
+fn modal(marks: &Value, token: &str) -> Option<Modal> {
+    let id = marks.as_array()?.iter().filter_map(Value::as_str).find_map(|mark| mark.strip_prefix("modal:"))?.to_string();
+    let v = get("disclaimers", &[], token).ok()?;
+    let list = v.as_array().or(result(&v).as_array())?;
+    list.iter().find(|item| item["id"].as_str() == Some(id.as_str())).and_then(parse_modal)
+}
+
+fn parse_modal(v: &Value) -> Option<Modal> {
+    let title = v["title"].as_str()?.trim().to_string();
+    let description = v["description"].as_str().unwrap_or_default().replace("\r\n", "\n").trim().to_string();
+    let details = v["details"]["url"].as_str().filter(|url| url.starts_with("https://")).map(|url| (v["details"]["text"].as_str().unwrap_or("Подробнее").to_string(), url.to_string()));
+    Some(Modal { title, description, details })
 }
 
 fn parse_disclaimer(v: &Value) -> Vec<String> {
@@ -2566,6 +2597,14 @@ mod tests {
         let v = serde_json::json!({"album": {"id": 7, "title": "Скоро"}, "artists": [], "releaseDate": "2026-12-05T00:00:00+03:00"});
         let card = upcoming_card(&v).unwrap();
         assert_eq!((card.id.as_str(), card.subtitle.as_str()), ("7", "Выйдет 5 декабря 2026"));
+    }
+
+    #[test]
+    fn modal_notice() {
+        let v = json!({"description": "Строка\r\nвторая\r\n", "details": {"text": "Подробнее", "url": "https://yandex.ru/legal/"}, "id": "1", "title": "Заголовок", "type": "modal"});
+        let modal = parse_modal(&v).unwrap();
+        assert_eq!((modal.title.as_str(), modal.description.as_str()), ("Заголовок", "Строка\nвторая"));
+        assert_eq!(modal.details, Some(("Подробнее".to_string(), "https://yandex.ru/legal/".to_string())));
     }
 
     #[test]
