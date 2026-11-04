@@ -445,6 +445,8 @@ enum Dialog {
     DownloadLikes,
     /// Мастер первого запуска: выбрать любимых исполнителей.
     Wizard,
+    /// Название и исполнитель своего загруженного трека.
+    EditTrack(Track),
 }
 
 /// Мастер первого запуска: жанры, исполнители каждого жанра и выбранные.
@@ -704,6 +706,10 @@ struct App {
     menu_lists: bool,
     dialog: Option<Dialog>,
     dialog_text: String,
+    /// Второе поле окна: исполнитель загруженного трека.
+    dialog_artist: String,
+    /// Сколько файлов сейчас загружается в плейлисты.
+    uploading: usize,
     history_tracks: Vec<Track>,
     /// Дни и места, откуда слушали: строки `history_tracks` по порядку.
     history_blocks: Vec<api::HistoryBlock>,
@@ -966,6 +972,13 @@ enum Message {
     LikedPages(Result<(Vec<Card>, Vec<Card>, Vec<Card>), String>),
     Presaves(Result<Vec<Card>, String>),
     TopArtists(Result<Vec<Card>, String>),
+    /// «Загрузить трек» в свой плейлист: окно выбора файлов.
+    UploadPick(Playlist),
+    UploadChosen(Playlist, Vec<std::path::PathBuf>),
+    /// Загрузка закончилась: сколько загружено, сколько ещё обрабатывается, первая ошибка.
+    UploadDone(Playlist, usize, (usize, usize, Option<String>)),
+    DialogArtist(String),
+    TrackEdited(Result<(), String>),
     /// Предсохранить альбом или снять предсохранение.
     Presave(Card),
     /// Ссылку или ярлык открыли, когда программа уже работала.
@@ -1263,6 +1276,8 @@ impl App {
             menu_lists: false,
             dialog: None,
             dialog_text: String::new(),
+            dialog_artist: String::new(),
+            uploading: 0,
             history_tracks: Vec::new(),
             history_blocks: Vec::new(),
             history_loading: false,
@@ -2052,6 +2067,7 @@ impl App {
                     items.push((ui::EDIT, "Переименовать".to_string(), Message::DialogOpen(Dialog::Rename(list.clone())), false));
                     items.push((ui::NOTES, "Изменить описание".to_string(), Message::DialogOpen(Dialog::Describe(list.clone())), false));
                     items.push((ui::IMAGE, if list.cover.is_some() { "Изменить обложку" } else { "Добавить обложку" }.to_string(), Message::CoverPick(list.clone()), false));
+                    items.push((ui::PLUS, "Загрузить трек".to_string(), Message::UploadPick(list.clone()), false));
                     if let Some(meta) = &self.list_meta {
                         let private = meta.2 == "private";
                         items.push((if private { ui::GLOBE } else { ui::LOCK }, if private { "Сделать публичным" } else { "Сделать приватным" }.to_string(), Message::Visibility(list.clone()), false));
@@ -3800,6 +3816,40 @@ impl App {
                 return self.fetch_card_covers(std::iter::empty(), self.top_artists.iter(), &[]);
             }
             Message::TopArtists(Err(e)) => eprintln!("топ месяца не загрузился: {e}"),
+            Message::UploadPick(list) => {
+                self.page_menu = None;
+                let owner = self.hwnd;
+                return Task::perform(background(move || pick::audio(owner, "Загрузить трек")), move |paths| Message::UploadChosen(list.clone(), paths));
+            }
+            Message::UploadChosen(list, paths) => {
+                let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
+                if paths.is_empty() {
+                    return Task::none();
+                }
+                let count = paths.len();
+                self.uploading += count;
+                let kind = list.kind.clone();
+                return Task::perform(background(move || upload_all(&uid, &kind, &paths, &token)), move |report| Message::UploadDone(list.clone(), count, report));
+            }
+            Message::UploadDone(list, count, (uploaded, processing, error)) => {
+                self.uploading = self.uploading.saturating_sub(count);
+                let open = self.section == Section::Playlists && self.playlist.as_ref().is_some_and(|open| open.kind == list.kind && open.owner == list.owner);
+                let reload = if uploaded > 0 && open { self.handle(Message::ListReload) } else { Task::none() };
+                self.playlists_loading = false;
+                let lists = if uploaded > 0 { self.playlists_load() } else { Task::none() };
+                let said = match error {
+                    Some(e) => self.fail(e),
+                    None if processing > 0 => self.notify(format!("Треки обрабатываются и скоро появятся в плейлисте «{}»", list.title)),
+                    None => self.notify(format!("Загрузили все треки в плейлист «{}»", list.title)),
+                };
+                return Task::batch([reload, lists, said]);
+            }
+            Message::DialogArtist(value) => self.dialog_artist = value,
+            Message::TrackEdited(Ok(())) => {}
+            Message::TrackEdited(Err(e)) => {
+                eprintln!("трек не изменён: {e}");
+                return self.fail("Не удалось отредактировать трек".to_string());
+            }
             Message::Presave(card) => {
                 let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
                 let presaved = !self.presaved.iter().any(|c| c.id == card.id);
@@ -4367,6 +4417,11 @@ impl App {
                 self.dialog_text = match &dialog {
                     Dialog::Rename(list) => list.title.clone(),
                     Dialog::Describe(_) => self.list_meta.as_ref().map_or_else(String::new, |meta| meta.1.clone()),
+                    Dialog::EditTrack(track) => track.title.clone(),
+                    _ => String::new(),
+                };
+                self.dialog_artist = match &dialog {
+                    Dialog::EditTrack(track) => track.artists.clone(),
                     _ => String::new(),
                 };
                 if let Dialog::TrackInfo(track) = &dialog {
@@ -4405,7 +4460,7 @@ impl App {
             Message::DialogConfirm => {
                 let (Some(uid), Some(token), Some(dialog)) = (self.uid.clone(), self.token(), self.dialog.clone()) else { return Task::none() };
                 let title = self.dialog_text.trim().to_string();
-                if title.is_empty() && matches!(dialog, Dialog::Create | Dialog::Rename(_)) {
+                if title.is_empty() && matches!(dialog, Dialog::Create | Dialog::Rename(_) | Dialog::EditTrack(_)) {
                     return Task::none();
                 }
                 self.dialog = None;
@@ -4437,6 +4492,18 @@ impl App {
                         Task::batch([notice, back])
                     }
                     Dialog::RemoveTrack(track) => self.handle(Message::TrackRemove(track)),
+                    Dialog::EditTrack(track) => {
+                        let artist = self.dialog_artist.trim().to_string();
+                        // Новое имя сразу видно во всех списках, где лежит трек.
+                        for found in self.playlist_tracks.iter_mut().chain(self.queue.iter_mut()).chain(self.liked.iter_mut()).filter(|t| t.id == track.id) {
+                            found.title = title.clone();
+                            if !artist.is_empty() {
+                                found.artists = artist.clone();
+                            }
+                        }
+                        let _ = uid;
+                        Task::perform(background(move || api::change_uploaded(&track.id, &artist, &title, &token)), Message::TrackEdited)
+                    }
                 };
             }
             Message::PlaylistCreated(Ok(list)) => {
@@ -5331,6 +5398,10 @@ impl App {
             }
             page = page.push(container(line).width(Length::Fill).padding([10, 16]).style(ui::tile));
         }
+        if self.uploading > 0 {
+            let line = row![ui::icon(ui::PLUS, 20.0, ui::c().accent), text(format!("Загружаем {}: {}", if self.uploading == 1 { "трек" } else { "треки" }, self.uploading)).color(ui::c().text).width(Length::Fill)].spacing(12).align_y(Alignment::Center);
+            page = page.push(container(line).width(Length::Fill).padding([10, 16]).style(ui::tile));
+        }
         if self.download_now.is_some() && matches!(self.section, Section::Downloads | Section::Likes | Section::Playlists) {
             let at = (self.download_done + self.download_failed + 1).min(self.download_batch.max(1));
             let mut line = row![ui::icon(ui::DOWNLOAD, 20.0, ui::c().accent), text(format!("Скачиваем: {at} из {}", self.download_batch.max(at))).color(ui::c().text).width(Length::Fill)].spacing(12).align_y(Alignment::Center);
@@ -5417,11 +5488,15 @@ impl App {
             Dialog::Describe(_) => ("Описание плейлиста".to_string(), "Сохранить", false),
             Dialog::Delete(list) => (format!("Удалить плейлист «{}»?", list.title), "Удалить", true),
             Dialog::RemoveTrack(track) => (format!("Удалить «{}» из плейлиста?", track.title), "Удалить", true),
+            Dialog::EditTrack(_) => ("Редактировать трек".to_string(), "Сохранить", false),
         };
         let alpha = self.dialog_fade.shown();
         let mut body = column![text(title).size(20).font(ui::font_medium()).color(ui::c().text.scale_alpha(alpha))].spacing(16);
         if !danger {
             body = body.push(text_input(if matches!(dialog, Dialog::Describe(_)) { "Описание" } else { "Название" }, &self.dialog_text).id(DIALOG_INPUT).on_input(Message::DialogInput).on_submit(Message::DialogConfirm).padding([10, 16]).style(ui::input_faded(alpha)));
+        }
+        if matches!(dialog, Dialog::EditTrack(_)) {
+            body = body.push(text_input("Исполнитель", &self.dialog_artist).on_input(Message::DialogArtist).on_submit(Message::DialogConfirm).padding([10, 16]).style(ui::input_faded(alpha)));
         }
         let buttons = row![
             Space::new().width(Length::Fill),
@@ -5741,6 +5816,10 @@ impl App {
         let mut count = 6.0;
         if self.section == Section::Playlists && self.playlist.as_ref().is_some_and(|list| self.is_own(list)) {
             items = items.push(item(ui::DELETE, "Удалить из плейлиста", Message::DialogOpen(Dialog::RemoveTrack(track.clone()))));
+            count += 1.0;
+        }
+        if track.ugc {
+            items = items.push(item(ui::EDIT, "Редактировать", Message::DialogOpen(Dialog::EditTrack(track.clone()))));
             count += 1.0;
         }
         if track.album.is_some() {
@@ -9172,4 +9251,40 @@ fn view_missing<'a>() -> Element<'a, Message> {
     .spacing(8)
     .align_x(Alignment::Center);
     column![container(back_button()).padding(PAGE_HEADER_PAD), container(note).center(Length::Fill)].into()
+}
+
+/// Сколько раз и как часто спрашивать, обработал ли Яндекс загруженные треки, как в оригинале.
+const UPLOAD_CHECKS: usize = 25;
+const UPLOAD_CHECK_EVERY: Duration = Duration::from_secs(3);
+
+/// Загружает файлы по одному и ждёт, пока Яндекс их обработает.
+/// Вернёт, сколько загружено, сколько ещё обрабатывается, и первую ошибку.
+fn upload_all(uid: &str, kind: &str, paths: &[std::path::PathBuf], token: &str) -> (usize, usize, Option<String>) {
+    let mut sent = Vec::new();
+    let mut error = None;
+    for path in paths {
+        match api::upload_track(uid, kind, path, token) {
+            Ok(id) => sent.push(id),
+            Err(e) => {
+                eprintln!("не загрузился {}: {e}", path.display());
+                let stop = e == api::TOO_MANY_FILES;
+                error.get_or_insert(e);
+                // Сверх лимита пробовать остальные незачем.
+                if stop {
+                    break;
+                }
+            }
+        }
+    }
+    let mut waiting = sent.clone();
+    for _ in 0..UPLOAD_CHECKS {
+        if waiting.is_empty() {
+            break;
+        }
+        std::thread::sleep(UPLOAD_CHECK_EVERY);
+        if let Ok(ready) = api::uploaded_ready(&waiting, token) {
+            waiting.retain(|id| !ready.contains(id));
+        }
+    }
+    (sent.len(), waiting.len(), error)
 }

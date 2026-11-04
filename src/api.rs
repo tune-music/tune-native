@@ -59,6 +59,8 @@ pub struct Track {
     pub plus_only: bool,
     /// Громкость по EBU R128 из ответа о треке: интегральная в LUFS и истинный пик в dBTP.
     pub loudness: Option<(f32, f32)>,
+    /// Загружен самим пользователем: название и исполнителя можно править.
+    pub ugc: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -397,6 +399,7 @@ fn parse_track(v: &Value) -> Option<Track> {
     };
     let artists = v["artists"].as_array().into_iter().flatten().filter_map(|a| a["name"].as_str()).collect::<Vec<_>>().join(", ");
     Some(Track {
+        ugc: v["trackSource"].as_str() == Some("UGC"),
         id,
         title: v["title"].as_str()?.to_string(),
         artists,
@@ -1762,6 +1765,63 @@ pub fn upload_cover(uid: &str, kind: &str, bytes: Vec<u8>, mime: &str, token: &s
     }
     let v: Value = serde_json::from_str(&text).map_err(|_| "Яндекс прислал непонятный ответ".to_string())?;
     Ok(result(&v)["cover"]["uri"].as_str().map(str::to_string))
+}
+
+/// Загружает свой файл в свой плейлист, как «Загрузить трек» в оригинале. Вернёт номер трека:
+/// после загрузки Яндекс его ещё обрабатывает, готовность проверяет `uploaded_ready`.
+pub fn upload_track(uid: &str, kind: &str, path: &std::path::Path, token: &str) -> Result<String, String> {
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("track.mp3").to_string();
+    let bytes = std::fs::read(path).map_err(|e| format!("Не удалось прочитать «{name}»: {e}"))?;
+    let v = post(&format!("loader/upload-url?uid={uid}&playlist-id={uid}%3A{kind}&path={}", encode(&name)), "application/x-www-form-urlencoded", String::new(), token)?;
+    if v["result"].as_str() == Some("TOO_MANY_FILES") {
+        return Err(TOO_MANY_FILES.into());
+    }
+    let place = if v["post-target"].is_string() { &v } else { result(&v) };
+    let (Some(target), Some(id)) = (place["post-target"].as_str(), id_text(&place["ugc-track-id"])) else { return Err("Яндекс не дал загрузить трек".into()) };
+    if !target.starts_with("https://") {
+        return Err("Яндекс не дал загрузить трек".into());
+    }
+    let mime = match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+        Some("mp3") => "audio/mpeg",
+        Some("m4a" | "aac") => "audio/mp4",
+        Some("flac") => "audio/flac",
+        Some("ogg" | "opus") => "audio/ogg",
+        Some("wav") => "audio/wav",
+        _ => "application/octet-stream",
+    };
+    let boundary = format!("----tune{}", random_bits());
+    let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\nContent-Type: {mime}\r\n\r\n", name.replace('"', "%22")).into_bytes();
+    body.extend_from_slice(&bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    // Адрес уже подписан: заголовки входа оригинал сюда не шлёт. Большой файл идёт долго.
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(UPLOAD_TIMEOUT)).http_status_as_error(false).build().into();
+    let resp = agent
+        .post(target)
+        .header("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
+        .send(&body[..])
+        .map_err(|e| format!("Не удалось связаться с Яндексом: {e}"))?;
+    match resp.status().as_u16() {
+        200..300 => Ok(id),
+        413 => Err("Файл слишком большой для загрузки".into()),
+        status => Err(format!("Яндекс ответил {status}")),
+    }
+}
+
+/// Сколько ждать отправки одного файла.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+pub const TOO_MANY_FILES: &str = "Превышен лимит по количеству загруженных треков";
+
+/// Какие из загруженных треков Яндекс уже обработал и их можно слушать.
+pub fn uploaded_ready(ids: &[String], token: &str) -> Result<Vec<String>, String> {
+    let body = format!("track-ids={}&withProgress=true", ids.join("%2C"));
+    let v = post("tracks", "application/x-www-form-urlencoded", body, token)?;
+    Ok(v["result"].as_array().into_iter().flatten().filter(|track| track["state"].as_str() == Some("playable")).filter_map(|track| id_text(&track["id"])).collect())
+}
+
+/// Новые название и исполнитель своего загруженного трека.
+pub fn change_uploaded(id: &str, artist: &str, title: &str, token: &str) -> Result<(), String> {
+    let body = serde_json::json!({"artist": artist, "title": title}).to_string();
+    post(&format!("ugc/tracks/{}/change", encode(id)), "application/json", body, token).map(|_| ())
 }
 
 pub fn rename_playlist(uid: &str, kind: &str, title: &str, token: &str) -> Result<(), String> {
