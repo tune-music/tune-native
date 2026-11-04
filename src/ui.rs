@@ -368,6 +368,11 @@ pub fn word_card(_: &Theme) -> container::Style {
     }
 }
 
+/// Кнопка без какой-либо подложки: обложки колеса волны.
+pub fn bare(_: &Theme, _: button::Status) -> button::Style {
+    flat(None, c().text, 0.0)
+}
+
 /// Значок ИИ у карточки «Слов в волне».
 pub fn word_badge(_: &Theme) -> container::Style {
     container::Style { background: Some(Background::Color(Color { a: 0.16, ..c().accent })), border: border::rounded(8), ..container::Style::default() }

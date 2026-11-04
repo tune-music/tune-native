@@ -119,6 +119,8 @@ pub struct Settings {
     pub kids: bool,
     /// Карточки «Слов в волне» — короткие ИИ-факты о треке на экране волны.
     pub words: bool,
+    /// Колесо подсказок над Моей волной.
+    pub wheel: bool,
     /// Скорость подкастов и книг; музыка всегда играет как есть.
     pub speed: f32,
     pub look: Look,
@@ -145,6 +147,7 @@ fn parse(v: &Value) -> Settings {
         lite: v["lite"].as_bool().unwrap_or(false),
         kids: v["kids"].as_bool().unwrap_or(true),
         words: v["words"].as_bool().unwrap_or(true),
+        wheel: v["wheel"].as_bool().unwrap_or(true),
         speed: v["speed"].as_f64().map(|x| x as f32).filter(|x| SPEEDS.contains(x)).unwrap_or(1.0),
         look: Look::ALL.into_iter().find(|look| v["theme"].as_str() == Some(look.code())).unwrap_or(Look::Dark),
     }
@@ -175,7 +178,7 @@ pub fn save(settings: Settings) {
     };
     let eq = settings.eq;
     let equalizer = json!({ "enabled": eq.enabled, "preset": eq.preset, "preamp": eq.preamp, "gains": eq.gains });
-    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "words": settings.words, "speed": settings.speed, "theme": settings.look.code() });
+    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "words": settings.words, "wheel": settings.wheel, "speed": settings.speed, "theme": settings.look.code() });
     let dir = api::data_dir();
     if fs::create_dir_all(&dir).is_ok() {
         let _ = fs::write(dir.join("settings.json"), value.to_string());
@@ -189,9 +192,9 @@ mod tests {
     #[test]
     fn reads_saved_and_broken_values() {
         let saved = parse(&json!({ "volume": 0.25, "muted": true, "repeat": "one", "shuffle": true, "quality": "lossless", "normalize": true }));
-        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default(), crossfade: true, normalize: true, lite: false, kids: true, words: true, speed: 1.0, look: Look::Dark });
+        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default(), crossfade: true, normalize: true, lite: false, kids: true, words: true, wheel: true, speed: 1.0, look: Look::Dark });
         let empty = parse(&Value::Null);
-        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default(), crossfade: true, normalize: false, lite: false, kids: true, words: true, speed: 1.0, look: Look::Dark });
+        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default(), crossfade: true, normalize: false, lite: false, kids: true, words: true, wheel: true, speed: 1.0, look: Look::Dark });
         assert!(!parse(&json!({ "crossfade": false })).crossfade);
         assert!(!parse(&json!({ "kids": false })).kids);
         assert!(!parse(&json!({ "words": false })).words);

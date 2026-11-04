@@ -24,6 +24,7 @@ mod equalizer;
 mod settings;
 mod ui;
 mod vibe;
+mod wheel;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -36,7 +37,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use iced::futures::channel::{mpsc, oneshot};
 use iced::widget::text::Wrapping;
 use iced::keyboard;
-use iced::widget::{button, canvas, column, container, image, mouse_area, operation, pick_list, row, scrollable, stack, text, text_input, tooltip, vertical_slider, Id, Space};
+use iced::widget::{button, canvas, column, container, image, mouse_area, operation, pick_list, pin, responsive, row, scrollable, stack, text, text_input, tooltip, vertical_slider, Id, Space};
 use anim::{hover_line, reveal, smooth, Fade};
 use glow::{glow, shine};
 use iced::{event, mouse, time, window, Alignment, Event, Element, Length, Padding, Size, Subscription, Task};
@@ -168,14 +169,10 @@ const DIALOG_WIDTH: f32 = 400.0;
 const INFO_MARGIN: f32 = 80.0;
 /// Сколько последних треков показать в истории.
 const HISTORY_LIMIT: usize = 200;
-/// Колесо волны: обложка, ширина подсказки, высота подписи и сколько подсказок видно сразу.
-const WHEEL_SIDE: f32 = 64.0;
-const WHEEL_CELL: f32 = 92.0;
-const WHEEL_NAME: f32 = 32.0;
-const WHEEL_GAP: f32 = 6.0;
+/// Сколько подсказок колеса видно сразу: о них Яндекс узнаёт как о показанных.
 const WHEEL_SEEN: usize = 8;
-/// Сколько высоты экрана волны занимает колесо вместе с отступом.
-const WHEEL_HEIGHT: f32 = 150.0;
+/// Ширина подписи ближней подсказки колеса.
+const WHEEL_LABEL: f32 = 320.0;
 /// Обложки подсказок колеса.
 const WHEEL_COVER: &str = "wheel:";
 /// К скольким трекам волны вперёд просить карточки «Слов в волне».
@@ -931,6 +928,11 @@ struct App {
     wheel_key: Option<Vec<String>>,
     /// Отзывы о колесе: уйдут со следующим запросом колеса.
     wheel_feedbacks: Vec<serde_json::Value>,
+    /// Поворот колеса в шагах подсказок и куда оно доворачивается.
+    wheel_turn: f32,
+    wheel_target: f32,
+    /// Показывать ли колесо волны.
+    wheel_on: bool,
     /// «Слова в волне»: карточка к треку по его номеру.
     words: HashMap<String, api::WordCard>,
     /// Треки, о карточках которых уже спросили.
@@ -1177,6 +1179,9 @@ enum Message {
     WheelLoaded(Vec<String>, Result<(String, Vec<api::WheelItem>), String>),
     /// Нажата подсказка колеса по её месту.
     WheelPick(usize),
+    /// Повернуть колесо на столько шагов.
+    WheelSpin(f32),
+    WheelToggle,
     /// Открыть или свернуть рассказ к карточке трека.
     WordOpen(String),
     WordBigLoaded(String, Result<api::WordBig, String>),
@@ -1493,6 +1498,9 @@ impl App {
             wheel: None,
             wheel_key: None,
             wheel_feedbacks: Vec::new(),
+            wheel_turn: 0.0,
+            wheel_target: 0.0,
+            wheel_on: saved.wheel,
             words: HashMap::new(),
             words_asked: HashSet::new(),
             words_viewed: Vec::new(),
@@ -1593,7 +1601,7 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.eq_fade.busy() || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy()
+        self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.eq_fade.busy() || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy() || self.wheel_turn != self.wheel_target
     }
 
     /// Сколько места занимает основная часть окна.
@@ -1738,7 +1746,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, words: self.words_on, speed: self.speed, look: self.look });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -2058,7 +2066,7 @@ impl App {
     /// Экран волны показывает обложку крупно.
     /// Колесо к играющей волне: грузится, когда открыт экран волны, и заново при смене волны.
     fn wheel_load(&mut self) -> Task<Message> {
-        if self.section != Section::Wave || self.offline {
+        if self.section != Section::Wave || self.offline || !self.wheel_on {
             return Task::none();
         }
         let seeds = if self.wave_queue { self.wave_base.clone() } else { vec![api::MY_WAVE.to_string()] };
@@ -2072,35 +2080,71 @@ impl App {
         Task::perform(background(move || api::wheel(&seeds, &feedbacks, &token)), move |r| Message::WheelLoaded(key.clone(), r))
     }
 
-    /// Колесо волны: круглые обложки подсказок с названиями, играющая отмечена кольцом.
+    /// Колесо волны: кольцо подсказок, уходящее вглубь, со следом на «полу» и подписью ближней.
     fn view_wheel(&self) -> Option<Element<'_, Message>> {
-        let (_, items) = self.wheel.as_ref().filter(|(_, items)| !items.is_empty())?;
-        let cells = items.iter().enumerate().map(|(at, item)| {
-            let active = self.wave_queue && matches!(&item.action, api::WheelAction::Wave(seeds) if *seeds == self.wave_base);
-            let back = item.color.as_deref().and_then(ui::hex_color).unwrap_or(ui::c().tile);
+        if !self.wheel_on || self.wheel.as_ref().is_none_or(|(_, items)| items.is_empty()) {
+            return None;
+        }
+        let layer = responsive(move |size| self.wheel_layer(size.width));
+        Some(container(layer).width(Length::Fill).height(wheel::AREA).into())
+    }
+
+    fn wheel_layer(&self, width: f32) -> Element<'_, Message> {
+        let Some((_, items)) = self.wheel.as_ref().filter(|(_, items)| !items.is_empty()) else { return Space::new().into() };
+        let count = items.len();
+        let turn = self.wheel_turn;
+        let front = (turn.round() as i64).rem_euclid(count as i64) as usize;
+        // Пока колесо крутится, подпись и отсвет приглушены: ближняя ещё не встала на место.
+        let settled = (1.0 - 2.0 * (turn - turn.round()).abs()).clamp(0.0, 1.0);
+        let tint = |item: &api::WheelItem| item.color.as_deref().and_then(ui::hex_color).unwrap_or(ui::c().accent);
+        let floor = canvas(wheel::Floor { glow: tint(&items[front]), settled }).width(Length::Fill).height(Length::Fill);
+        let mut layer = stack![floor];
+        let mut order: Vec<(usize, wheel::Spot)> = (0..count).map(|at| (at, wheel::spot(wheel::offset(at, turn, count), width))).filter(|(_, spot)| spot.shown > 0.0).collect();
+        // Дальние рисуются первыми: ближние закрывают их.
+        order.sort_by(|a, b| a.1.depth.total_cmp(&b.1.depth));
+        for (at, spot) in order {
+            let item = &items[at];
+            let side = spot.side;
+            let near = spot.depth.powf(1.4);
+            let alpha = (0.22 + 0.78 * near) * spot.shown;
+            let playing = self.wave_queue && matches!(&item.action, api::WheelAction::Wave(seeds) if *seeds == self.wave_base);
             let picture: Element<'_, Message> = match self.covers.get(&format!("{WHEEL_COVER}{}", item.id)) {
-                Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle)).width(WHEEL_SIDE).height(WHEEL_SIDE).border_radius(WHEEL_SIDE / 2.0).into(),
-                None => Space::new().width(WHEEL_SIDE).height(WHEEL_SIDE).into(),
+                Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle) * alpha).width(side).height(side).border_radius(side / 2.0).into(),
+                None => Space::new().width(side).height(side).into(),
             };
-            let ring = if active { ui::c().accent } else { iced::Color::TRANSPARENT };
-            let circle = container(container(picture).style(move |_| container::Style::default().background(back).border(iced::border::rounded(WHEEL_SIDE / 2.0))))
-                .padding(3)
-                .style(move |_| container::Style::default().border(iced::Border { color: ring, width: 2.0, radius: (WHEEL_SIDE / 2.0 + 3.0).into() }));
-            let name = text(item.title.as_str()).size(12).color(if active { ui::c().strong } else { ui::c().text }).width(WHEEL_CELL).align_x(Alignment::Center).wrapping(Wrapping::WordOrGlyph);
-            let body = column![circle, container(name).height(WHEEL_NAME).clip(true)].spacing(6).align_x(Alignment::Center);
-            let cell = glow(button(body).padding(4).style(ui::card).on_press(Message::WheelPick(at)), 12.0);
-            if item.subtitle.is_empty() {
-                return cell;
-            }
-            let tip = container(text(item.subtitle.as_str()).size(13).color(ui::c().text)).padding([6, 10]).style(ui::tip);
-            tooltip(cell, tip, tooltip::Position::Top).gap(6).delay(HINT_DELAY).into()
-        });
-        let width = items.len() as f32 * (WHEEL_CELL + 8.0 + WHEEL_GAP);
-        let room = (self.main_width() - 80.0).max(WHEEL_CELL * 2.0);
-        let strip = scrollable(row(cells).spacing(WHEEL_GAP).padding(Padding::ZERO.bottom(10)))
-            .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(4).scroller_width(4)))
-            .width(width.min(room));
-        Some(strip.into())
+            let back = tint(item).scale_alpha(alpha);
+            // Ближняя светится своим цветом; в lite-версии без свечения.
+            let glow = if self.lite { iced::Color::TRANSPARENT } else { iced::Color { a: 0.7 * spot.depth.powf(8.0) * settled.max(0.3), ..tint(item) } };
+            let ring = if playing { ui::c().accent } else { iced::Color::TRANSPARENT };
+            let disc = container(picture).width(side).height(side).style(move |_| container::Style {
+                background: Some(back.into()),
+                border: iced::Border { color: ring, width: if playing { 3.0 } else { 0.0 }, radius: (side / 2.0).into() },
+                shadow: iced::Shadow { color: glow, offset: iced::Vector::new(0.0, 6.0 * spot.depth), blur_radius: 48.0 * spot.depth.powf(2.0) },
+                ..container::Style::default()
+            });
+            let disc = button(disc).padding(0).style(ui::bare).on_press(Message::WheelPick(at));
+            layer = layer.push(pin(disc).x(spot.x - side / 2.0).y(spot.y - side / 2.0));
+        }
+        let item = &items[front];
+        let mut label = column![text(item.title.as_str()).size(18).font(ui::font_medium()).color(ui::c().strong.scale_alpha(settled)).width(WHEEL_LABEL).align_x(Alignment::Center).wrapping(Wrapping::WordOrGlyph)].spacing(2).align_x(Alignment::Center);
+        if !item.subtitle.is_empty() {
+            label = label.push(text(item.subtitle.as_str()).size(12).color(ui::c().muted.scale_alpha(settled)).width(WHEEL_LABEL).align_x(Alignment::Center));
+        }
+        layer = layer.push(pin(label).x(width / 2.0 - WHEEL_LABEL / 2.0).y(wheel::front_bottom() + 12.0));
+        let arrow = |icon, step: f32| shine(button(container(ui::icon(icon, 20.0, ui::c().text)).center(20)).padding(9).style(ui::secondary).on_press(Message::WheelSpin(step)), 20.0);
+        let reach = wheel::radius_x(width) + wheel::FRONT * 0.5;
+        let y = wheel::front_bottom() - wheel::FRONT * 0.5 - 19.0;
+        layer = layer.push(pin(arrow(ui::LEFT, -1.0)).x((width / 2.0 - reach - 56.0).max(0.0)).y(y));
+        layer = layer.push(pin(arrow(ui::RIGHT, 1.0)).x((width / 2.0 + reach + 18.0).min(width - 40.0)).y(y));
+        mouse_area(layer)
+            .on_scroll(|delta| {
+                let y = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => y,
+                    mouse::ScrollDelta::Pixels { y, .. } => y / 40.0,
+                };
+                Message::WheelSpin(if y.abs() < 0.25 { 0.0 } else { -y.signum() })
+            })
+            .into()
     }
 
     /// Просит карточки «Слов в волне» к ближайшим трекам волны, как оригинал.
@@ -2141,7 +2185,7 @@ impl App {
                 let story = scrollable(container(text(&big.text).size(15).line_height(1.45).color(ui::c().text).wrapping(Wrapping::WordOrGlyph)).padding(Padding::ZERO.right(14))).height(Length::Shrink);
                 // Рассказ занимает то, что осталось от окна, чтобы кнопки под ним не сжимались.
                 let (_, window) = *WINDOW.lock().unwrap();
-                let wheel = if self.wheel.as_ref().is_some_and(|(_, items)| !items.is_empty()) { WHEEL_HEIGHT } else { 0.0 };
+                let wheel = if self.wheel_on && self.wheel.as_ref().is_some_and(|(_, items)| !items.is_empty()) { wheel::AREA } else { 0.0 };
                 let room = (window - WORD_PAGE_REST - wheel).clamp(WORD_STORY_MIN, WORD_STORY_HEIGHT);
                 body = body.push(container(story).max_height(room).width(Length::Fill));
             }
@@ -3194,6 +3238,12 @@ impl App {
             self.dialog_fade.step(elapsed);
             self.full_fade.step(elapsed);
             self.vibe_step(elapsed);
+            if self.wheel_turn != self.wheel_target {
+                self.wheel_turn += (self.wheel_target - self.wheel_turn) * (1.0 - (-elapsed * wheel::SPEED).exp());
+                if (self.wheel_target - self.wheel_turn).abs() < 0.001 {
+                    self.wheel_turn = self.wheel_target;
+                }
+            }
             // Палитра меняется на середине появления плеера, когда он уже закрывает почти всё.
             ui::set_full_dark(self.full_fade.item.is_some() && self.full_fade.shown() >= 0.5);
             if self.full_fade.item.is_some() {
@@ -4643,6 +4693,10 @@ impl App {
                             self.wheel_feedbacks.push(api::wheel_feedback(&id, "VIEW", item, position));
                         }
                         let jobs = items.iter().filter_map(|item| Some((format!("{WHEEL_COVER}{}", item.id), item.cover.clone()?))).collect();
+                        // Ближней встаёт играющая волна, иначе первая подсказка.
+                        let start = items.iter().position(|item| self.wave_queue && matches!(&item.action, api::WheelAction::Wave(seeds) if *seeds == self.wave_base)).unwrap_or(0) as f32;
+                        self.wheel_turn = start;
+                        self.wheel_target = start;
                         self.wheel = Some((id, items));
                         return self.fetch_cover_jobs(jobs, "200x200");
                     }
@@ -4652,8 +4706,25 @@ impl App {
                     }
                 }
             }
+            Message::WheelSpin(step) => {
+                if step != 0.0 {
+                    self.wheel_target = self.wheel_target.round() + step;
+                }
+            }
+            Message::WheelToggle => {
+                self.wheel_on = !self.wheel_on;
+                self.save_settings();
+                self.wheel_key = None;
+                return self.wheel_load();
+            }
             Message::WheelPick(at) => {
-                let Some((id, item)) = self.wheel.as_ref().and_then(|(id, items)| Some((id.clone(), items.get(at)?.clone()))) else { return Task::none() };
+                let Some((id, item, count)) = self.wheel.as_ref().and_then(|(id, items)| Some((id.clone(), items.get(at)?.clone(), items.len()))) else { return Task::none() };
+                // Дальняя подсказка сначала подъезжает вперёд; ближняя включается.
+                let step = wheel::offset(at, self.wheel_target, count);
+                if step.abs() > 0.5 {
+                    self.wheel_target = (self.wheel_target + step).round();
+                    return Task::none();
+                }
                 self.wheel_feedbacks.push(api::wheel_feedback(&id, "CLICK", &item, at));
                 return match item.action {
                     api::WheelAction::Wave(seeds) => self.update(Message::WaveStartSeeds(seeds, Some(item.title))),
@@ -6858,15 +6929,18 @@ impl App {
         ]
         .spacing(8)
         .align_x(Alignment::Center);
+        // Колесо стоит над названием волны.
         let body = match self.view_wheel() {
-            Some(wheel) => body.push(Space::new().height(20)).push(wheel),
+            Some(wheel) => column![wheel, body].align_x(Alignment::Center),
             None => body,
         };
         let body = match self.view_word() {
             Some(word) => body.push(Space::new().height(20)).push(word),
             None => body,
         };
-        container(body).center(Length::Fill).into()
+        // Не влезает в окно — экран прокручивается, а не сжимает карточки; влезает — стоит посередине.
+        let page = scrollable(container(body).center_x(Length::Fill).padding([16, 0])).height(Length::Shrink);
+        container(page).center(Length::Fill).into()
     }
 
     /// Большой плеер на всё окно: обложка, название, перемотка и кнопки.
@@ -7115,6 +7189,14 @@ impl App {
         .align_y(Alignment::Center);
         let words = glow(button(words).width(Length::Fill).padding(8).style(ui::row).on_press(Message::WordsToggle), 8.0);
 
+        let wheel = row![
+            column![text("Колесо волны").color(ui::c().text), text("Подсказки волн по настроению, жанру и артистам над Моей волной").size(13).color(ui::c().muted)].spacing(2).width(Length::Fill),
+            view_switch(Some(self.wheel_on)),
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center);
+        let wheel = glow(button(wheel).width(Length::Fill).padding(8).style(ui::row).on_press(Message::WheelToggle), 8.0);
+
         let looks = Look::ALL.into_iter().fold(row![].spacing(8), |line, look| line.push(choice(look.label(), look == self.look, Message::LookSet(look))));
         let page = column![
             text("Настройки").size(36).font(ui::font_headline()).color(ui::c().text),
@@ -7123,7 +7205,7 @@ impl App {
             self.view_equalizer(),
             cross,
             normalize,
-            column![title("Рекомендации"), ai, words, kids].spacing(8),
+            column![title("Рекомендации"), ai, wheel, words, kids].spacing(8),
             self.view_stored(),
             view_hotkeys(),
             column![title("Аккаунт"), row![link("Управление аккаунтом", Message::DialogOpen(Dialog::Account)), link("Выйти", Message::DialogOpen(Dialog::Logout))].spacing(8)].spacing(12),
