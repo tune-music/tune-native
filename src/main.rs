@@ -168,6 +168,16 @@ const DIALOG_WIDTH: f32 = 400.0;
 const INFO_MARGIN: f32 = 80.0;
 /// Сколько последних треков показать в истории.
 const HISTORY_LIMIT: usize = 200;
+/// Колесо волны: обложка, ширина подсказки, высота подписи и сколько подсказок видно сразу.
+const WHEEL_SIDE: f32 = 64.0;
+const WHEEL_CELL: f32 = 92.0;
+const WHEEL_NAME: f32 = 32.0;
+const WHEEL_GAP: f32 = 6.0;
+const WHEEL_SEEN: usize = 8;
+/// Сколько высоты экрана волны занимает колесо вместе с отступом.
+const WHEEL_HEIGHT: f32 = 150.0;
+/// Обложки подсказок колеса.
+const WHEEL_COVER: &str = "wheel:";
 /// К скольким трекам волны вперёд просить карточки «Слов в волне».
 const WORDS_AHEAD: usize = 10;
 /// Ширина карточки «Слов в волне» и высота рассказа, дальше он прокручивается.
@@ -915,6 +925,12 @@ struct App {
     wave_queue: bool,
     wave_loading: bool,
     wave_fetching: bool,
+    /// Колесо волны: номер колеса у Яндекса и подсказки.
+    wheel: Option<(String, Vec<api::WheelItem>)>,
+    /// Для какой волны колесо загружено или грузится.
+    wheel_key: Option<Vec<String>>,
+    /// Отзывы о колесе: уйдут со следующим запросом колеса.
+    wheel_feedbacks: Vec<serde_json::Value>,
     /// «Слова в волне»: карточка к треку по его номеру.
     words: HashMap<String, api::WordCard>,
     /// Треки, о карточках которых уже спросили.
@@ -1158,6 +1174,9 @@ enum Message {
     WaveStarted(bool, Vec<String>, Option<String>, Result<Wave, String>),
     WaveMore(Result<Vec<Track>, String>),
     WordsLoaded(Vec<String>, Result<Vec<(String, api::WordCard)>, String>),
+    WheelLoaded(Vec<String>, Result<(String, Vec<api::WheelItem>), String>),
+    /// Нажата подсказка колеса по её месту.
+    WheelPick(usize),
     /// Открыть или свернуть рассказ к карточке трека.
     WordOpen(String),
     WordBigLoaded(String, Result<api::WordBig, String>),
@@ -1471,6 +1490,9 @@ impl App {
             wave_queue: false,
             wave_loading: false,
             wave_fetching: false,
+            wheel: None,
+            wheel_key: None,
+            wheel_feedbacks: Vec::new(),
             words: HashMap::new(),
             words_asked: HashSet::new(),
             words_viewed: Vec::new(),
@@ -2034,6 +2056,53 @@ impl App {
     }
 
     /// Экран волны показывает обложку крупно.
+    /// Колесо к играющей волне: грузится, когда открыт экран волны, и заново при смене волны.
+    fn wheel_load(&mut self) -> Task<Message> {
+        if self.section != Section::Wave || self.offline {
+            return Task::none();
+        }
+        let seeds = if self.wave_queue { self.wave_base.clone() } else { vec![api::MY_WAVE.to_string()] };
+        if self.wheel_key.as_ref() == Some(&seeds) {
+            return Task::none();
+        }
+        let Some(token) = self.token() else { return Task::none() };
+        self.wheel_key = Some(seeds.clone());
+        let feedbacks = std::mem::take(&mut self.wheel_feedbacks);
+        let key = seeds.clone();
+        Task::perform(background(move || api::wheel(&seeds, &feedbacks, &token)), move |r| Message::WheelLoaded(key.clone(), r))
+    }
+
+    /// Колесо волны: круглые обложки подсказок с названиями, играющая отмечена кольцом.
+    fn view_wheel(&self) -> Option<Element<'_, Message>> {
+        let (_, items) = self.wheel.as_ref().filter(|(_, items)| !items.is_empty())?;
+        let cells = items.iter().enumerate().map(|(at, item)| {
+            let active = self.wave_queue && matches!(&item.action, api::WheelAction::Wave(seeds) if *seeds == self.wave_base);
+            let back = item.color.as_deref().and_then(ui::hex_color).unwrap_or(ui::c().tile);
+            let picture: Element<'_, Message> = match self.covers.get(&format!("{WHEEL_COVER}{}", item.id)) {
+                Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle)).width(WHEEL_SIDE).height(WHEEL_SIDE).border_radius(WHEEL_SIDE / 2.0).into(),
+                None => Space::new().width(WHEEL_SIDE).height(WHEEL_SIDE).into(),
+            };
+            let ring = if active { ui::c().accent } else { iced::Color::TRANSPARENT };
+            let circle = container(container(picture).style(move |_| container::Style::default().background(back).border(iced::border::rounded(WHEEL_SIDE / 2.0))))
+                .padding(3)
+                .style(move |_| container::Style::default().border(iced::Border { color: ring, width: 2.0, radius: (WHEEL_SIDE / 2.0 + 3.0).into() }));
+            let name = text(item.title.as_str()).size(12).color(if active { ui::c().strong } else { ui::c().text }).width(WHEEL_CELL).align_x(Alignment::Center).wrapping(Wrapping::WordOrGlyph);
+            let body = column![circle, container(name).height(WHEEL_NAME).clip(true)].spacing(6).align_x(Alignment::Center);
+            let cell = glow(button(body).padding(4).style(ui::card).on_press(Message::WheelPick(at)), 12.0);
+            if item.subtitle.is_empty() {
+                return cell;
+            }
+            let tip = container(text(item.subtitle.as_str()).size(13).color(ui::c().text)).padding([6, 10]).style(ui::tip);
+            tooltip(cell, tip, tooltip::Position::Top).gap(6).delay(HINT_DELAY).into()
+        });
+        let width = items.len() as f32 * (WHEEL_CELL + 8.0 + WHEEL_GAP);
+        let room = (self.main_width() - 80.0).max(WHEEL_CELL * 2.0);
+        let strip = scrollable(row(cells).spacing(WHEEL_GAP).padding(Padding::ZERO.bottom(10)))
+            .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(4).scroller_width(4)))
+            .width(width.min(room));
+        Some(strip.into())
+    }
+
     /// Просит карточки «Слов в волне» к ближайшим трекам волны, как оригинал.
     fn words_load(&mut self, from: usize) -> Task<Message> {
         if !self.wave_queue || self.offline || !self.words_on {
@@ -2072,7 +2141,8 @@ impl App {
                 let story = scrollable(container(text(&big.text).size(15).line_height(1.45).color(ui::c().text).wrapping(Wrapping::WordOrGlyph)).padding(Padding::ZERO.right(14))).height(Length::Shrink);
                 // Рассказ занимает то, что осталось от окна, чтобы кнопки под ним не сжимались.
                 let (_, window) = *WINDOW.lock().unwrap();
-                let room = (window - WORD_PAGE_REST).clamp(WORD_STORY_MIN, WORD_STORY_HEIGHT);
+                let wheel = if self.wheel.as_ref().is_some_and(|(_, items)| !items.is_empty()) { WHEEL_HEIGHT } else { 0.0 };
+                let room = (window - WORD_PAGE_REST - wheel).clamp(WORD_STORY_MIN, WORD_STORY_HEIGHT);
                 body = body.push(container(story).max_height(room).width(Length::Fill));
             }
             None => {}
@@ -3893,6 +3963,7 @@ impl App {
                     }
                     Section::Playlists if self.playlists.is_empty() => self.playlists_load(),
                     Section::Search => operation::focus(Id::new(SEARCH_INPUT)),
+                    Section::Wave => self.wheel_load(),
                     Section::Discography => self.discography_load(0),
                     Section::Settings if self.ai_less.is_none() => {
                         let Some(token) = self.token() else { return Task::none() };
@@ -4561,6 +4632,44 @@ impl App {
                 self.seeking = Some(time);
                 return self.update(Message::SeekDone);
             }
+            Message::WheelLoaded(key, result) => {
+                if self.wheel_key.as_ref() != Some(&key) {
+                    return Task::none();
+                }
+                match result {
+                    Ok((id, items)) => {
+                        // Подсказки на экране сразу видны: о них Яндекс узнает со следующим колесом.
+                        for (position, item) in items.iter().enumerate().take(WHEEL_SEEN) {
+                            self.wheel_feedbacks.push(api::wheel_feedback(&id, "VIEW", item, position));
+                        }
+                        let jobs = items.iter().filter_map(|item| Some((format!("{WHEEL_COVER}{}", item.id), item.cover.clone()?))).collect();
+                        self.wheel = Some((id, items));
+                        return self.fetch_cover_jobs(jobs, "200x200");
+                    }
+                    Err(e) => {
+                        eprintln!("колесо волны: {e}");
+                        self.wheel_key = None;
+                    }
+                }
+            }
+            Message::WheelPick(at) => {
+                let Some((id, item)) = self.wheel.as_ref().and_then(|(id, items)| Some((id.clone(), items.get(at)?.clone()))) else { return Task::none() };
+                self.wheel_feedbacks.push(api::wheel_feedback(&id, "CLICK", &item, at));
+                return match item.action {
+                    api::WheelAction::Wave(seeds) => self.update(Message::WaveStartSeeds(seeds, Some(item.title))),
+                    api::WheelAction::Album(album) => self.update(Message::AlbumOpen(album, item.title)),
+                    // Подсказка, которая ничего не включает: отзывы уходят сразу, как у оригинала.
+                    api::WheelAction::Setting => {
+                        let feedbacks = std::mem::take(&mut self.wheel_feedbacks);
+                        if let Some(token) = self.token() {
+                            std::thread::spawn(move || {
+                                let _ = api::wheel_feedbacks(&feedbacks, &token);
+                            });
+                        }
+                        self.update(Message::DialogOpen(Dialog::WaveTune))
+                    }
+                };
+            }
             Message::WordsLoaded(asked, result) => match result {
                 Ok(cards) => {
                     self.words.extend(cards);
@@ -4676,7 +4785,7 @@ impl App {
                         if matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded | Preview::Lyrics)) {
                             self.preview = None;
                         }
-                        let words = self.words_load(0);
+                        let words = Task::batch([self.words_load(0), self.wheel_load()]);
                         if autoplay {
                             return Task::batch([covers, words, self.play(0)]);
                         }
@@ -6749,8 +6858,12 @@ impl App {
         ]
         .spacing(8)
         .align_x(Alignment::Center);
+        let body = match self.view_wheel() {
+            Some(wheel) => body.push(Space::new().height(20)).push(wheel),
+            None => body,
+        };
         let body = match self.view_word() {
-            Some(word) => body.push(Space::new().height(28)).push(word),
+            Some(word) => body.push(Space::new().height(20)).push(word),
             None => body,
         };
         container(body).center(Length::Fill).into()
@@ -8998,9 +9111,15 @@ fn smoke_get(request: &str) -> Result<(), String> {
     let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
     // `raw:` в начале — весь ответ как есть, для разбора другими средствами.
     let (raw, request) = request.strip_prefix("raw:").map_or((false, request), |rest| (true, rest));
-    let (path, query) = request.split_once('?').unwrap_or((request, ""));
-    let pairs: Vec<(&str, &str)> = query.split('&').filter(|p| !p.is_empty()).map(|p| p.split_once('=').unwrap_or((p, ""))).collect();
-    let v = api::probe(path, &pairs, &token)?;
+    // `post:путь {json}` — POST с телом вместо GET.
+    let v = if let Some(rest) = request.strip_prefix("post:") {
+        let (path, body) = rest.split_once(' ').unwrap_or((rest, "{}"));
+        api::probe_post(path, body, &token)?
+    } else {
+        let (path, query) = request.split_once('?').unwrap_or((request, ""));
+        let pairs: Vec<(&str, &str)> = query.split('&').filter(|p| !p.is_empty()).map(|p| p.split_once('=').unwrap_or((p, ""))).collect();
+        api::probe(path, &pairs, &token)?
+    };
     if raw {
         println!("{v}");
         return Ok(());

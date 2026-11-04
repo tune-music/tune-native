@@ -344,7 +344,7 @@ fn fetch(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, Strin
 
 fn post(path: &str, content_type: &str, body: String, token: &str) -> Result<Value, String> {
     // Отзывы волны и отчёты о прослушивании ничего из сохранённого не меняют.
-    if !path.starts_with("rotor") && !path.starts_with("words") && !path.starts_with("plays") && !path.starts_with("availability") && !path.starts_with("streams/progress/sync") {
+    if !path.starts_with("rotor") && !path.starts_with("words") && !path.starts_with("wheel") && !path.starts_with("plays") && !path.starts_with("availability") && !path.starts_with("streams/progress/sync") {
         forget_cache();
     }
     let resp = agent()
@@ -2251,6 +2251,72 @@ fn wave_seeds(v: &Value) -> Vec<String> {
     v["acceptedSeeds"].as_array().into_iter().flatten().filter_map(|seed| Some(format!("{}:{}", seed["type"].as_str()?, seed["value"].as_str()?))).collect()
 }
 
+/// Подсказка колеса волны: другая волна, альбом или «Настроить Мою волну».
+#[derive(Clone, Debug, PartialEq)]
+pub struct WheelItem {
+    /// Тип и номер, как их ждёт Яндекс в отзывах: `WAVE` и `mood:sad`.
+    pub kind: String,
+    pub id: String,
+    pub action: WheelAction,
+    pub title: String,
+    pub subtitle: String,
+    pub cover: Option<String>,
+    /// Цвет подложки обложки, `#00B2CC`.
+    pub color: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum WheelAction {
+    Wave(Vec<String>),
+    Album(String),
+    Setting,
+}
+
+/// Колесо волны, как в оригинале: подсказки к тому, что играет. Отзывы о прошлом колесе
+/// (что показали и что нажали) уходят вместе с запросом. Ответ — номер колеса и подсказки.
+pub fn wheel(seeds: &[String], feedbacks: &[Value], token: &str) -> Result<(String, Vec<WheelItem>), String> {
+    let body = json!({ "context": { "type": "WAVE", "data": { "seeds": seeds } }, "feedbacks": feedbacks }).to_string();
+    let v = post("wheel/new", "application/json", body, token)?;
+    let v = result(&v);
+    let id = v["wheelId"].as_str().ok_or("Яндекс не прислал колесо волны")?.to_string();
+    Ok((id, v["items"].as_array().into_iter().flatten().filter_map(parse_wheel_item).collect()))
+}
+
+pub fn wheel_feedbacks(feedbacks: &[Value], token: &str) -> Result<(), String> {
+    post("wheel/feedbacks", "application/json", json!({ "feedbacks": feedbacks }).to_string(), token).map(|_| ())
+}
+
+/// «Волна на двоих» и прочие ссылки пока не поддерживаются: такие подсказки пропускаются.
+fn parse_wheel_item(v: &Value) -> Option<WheelItem> {
+    let kind = v["type"].as_str()?.to_string();
+    let id = id_text(&v["id"])?;
+    let data = &v["data"];
+    let (action, title, subtitle, cover, color) = match kind.as_str() {
+        "WAVE" => {
+            let seeds: Vec<String> = data["wave"]["seeds"].as_array()?.iter().filter_map(|seed| seed.as_str().map(str::to_string)).collect();
+            if seeds.is_empty() {
+                return None;
+            }
+            let cover = &data["agent"]["cover"];
+            (WheelAction::Wave(seeds), data["wave"]["name"].as_str()?, data["wave"]["description"].as_str().unwrap_or_default().to_string(), cover["uri"].as_str(), cover["color"].as_str())
+        }
+        "ALBUM" => {
+            let album = &data["album"];
+            let artists = parse_artist_list(&data["artists"]).into_iter().map(|(name, _)| name).collect::<Vec<_>>().join(", ");
+            (WheelAction::Album(id_text(&album["id"])?), album["title"].as_str()?, artists, album["cover"]["uri"].as_str(), album["cover"]["color"].as_str())
+        }
+        "SETTING" => (WheelAction::Setting, data["title"].as_str()?, String::new(), data["cover"]["uri"].as_str(), None),
+        _ => return None,
+    };
+    Some(WheelItem { kind, id, action, title: title.to_string(), subtitle, cover: cover.map(str::to_string), color: color.map(str::to_string) })
+}
+
+/// Отзыв о подсказке колеса: `VIEW` — показали, `CLICK` — нажали.
+pub fn wheel_feedback(wheel: &str, event: &str, item: &WheelItem, position: usize) -> Value {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |time| time.as_millis() as u64);
+    json!({ "wheelId": wheel, "timestamp": now, "eventType": event, "item": { "type": item.kind, "id": item.id }, "position": position })
+}
+
 /// Карточка «Слов в волне»: короткий факт о треке и, если есть, рассказ подробнее.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WordCard {
@@ -2524,6 +2590,11 @@ pub fn now_stamp() -> String {
 
 /// Можно ли сейчас слушать треки: номер трека и ответ.
 /// Сырой ответ на запрос чтения: для проверки, что отдаёт сервер.
+/// Отладочный POST с телом JSON: только для `--smoke-get post:…`.
+pub fn probe_post(path: &str, body: &str, token: &str) -> Result<Value, String> {
+    post(path, "application/json", body.to_string(), token)
+}
+
 pub fn probe(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, String> {
     fetch(path, query, token)
 }
@@ -2662,6 +2733,18 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_items() {
+        let wave = json!({"type": "WAVE", "id": "mood:sad", "data": {"agent": {"cover": {"color": "#00B2CC", "uri": "avatars/x/%%"}}, "wave": {"description": "Моя волна по настроению", "name": "Прожить эту грусть", "seeds": ["mood:sad"]}}});
+        let item = parse_wheel_item(&wave).unwrap();
+        assert_eq!((item.action.clone(), item.title.as_str(), item.color.as_deref()), (WheelAction::Wave(vec!["mood:sad".into()]), "Прожить эту грусть", Some("#00B2CC")));
+        let album = json!({"type": "ALBUM", "id": 44474459, "data": {"album": {"id": 44474459, "title": "planett", "cover": {"uri": "a/%%"}}, "artists": [{"id": 1, "name": "brokendaddy?"}]}});
+        assert_eq!(parse_wheel_item(&album).unwrap().action, WheelAction::Album("44474459".into()));
+        assert!(parse_wheel_item(&json!({"type": "PROMO_LINK", "id": "waveForTwo", "data": {}})).is_none());
+        let feedback = wheel_feedback("w", "CLICK", &item, 2);
+        assert_eq!((feedback["item"]["type"].as_str(), feedback["position"].as_u64()), (Some("WAVE"), Some(2)));
+    }
 
     #[test]
     fn word_cards() {
