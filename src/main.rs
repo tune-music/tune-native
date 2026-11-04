@@ -752,6 +752,8 @@ struct App {
     dislikes_artists: bool,
     /// В «Знакомо вам» открыта вкладка Моей волны.
     familiar_wave: bool,
+    /// «Знакомо вам» раскрыто целиком, а не первые пять треков.
+    familiar_all: bool,
     searching: bool,
     search_id: u64,
     uid: Option<String>,
@@ -1066,6 +1068,8 @@ enum Message {
     ClientInstalled(Result<(), String>),
     /// «Знакомо вам» на странице исполнителя: вкладка (в волне ли) и запуск трека из неё.
     FamiliarTab(bool),
+    /// «Показать все» / «Свернуть» у «Знакомо вам».
+    FamiliarAll(bool),
     FamiliarPlay(usize),
     /// Дизлайк исполнителя на открытой странице или его снятие.
     ArtistDislike,
@@ -1351,6 +1355,7 @@ impl App {
             disliked_artists: Vec::new(),
             dislikes_artists: false,
             familiar_wave: false,
+            familiar_all: false,
             searching: false,
             search_id: 0,
             uid: None,
@@ -1728,7 +1733,8 @@ impl App {
 
     fn artist_familiar_covers(&self) -> Task<Message> {
         let Some(artist) = &self.artist else { return Task::none() };
-        let jobs = self.familiar_tracks(artist).iter().take(FAMILIAR_SHOWN).filter_map(|t| Some((t.id.clone(), t.cover.clone()?))).collect();
+        let shown = if self.familiar_all { usize::MAX } else { FAMILIAR_SHOWN };
+        let jobs = self.familiar_tracks(artist).iter().take(shown).filter_map(|t| Some((t.id.clone(), t.cover.clone()?))).collect();
         self.fetch_cover_jobs(jobs, "100x100")
     }
 
@@ -3993,6 +3999,10 @@ impl App {
                 self.familiar_wave = wave;
                 return self.artist_familiar_covers();
             }
+            Message::FamiliarAll(all) => {
+                self.familiar_all = all;
+                return self.artist_familiar_covers();
+            }
             Message::FamiliarPlay(index) => {
                 let Some(artist) = &self.artist else { return Task::none() };
                 let tracks = self.familiar_tracks(artist).to_vec();
@@ -4248,6 +4258,7 @@ impl App {
                         let photos = artist.photos.iter().enumerate().map(|(at, uri)| (format!("{PHOTO_COVER}{}:{at}", artist.id), uri.clone()));
                         let jobs = main.into_iter().chain(artists).chain(albums).chain(release).chain(lists).chain(videos).chain(photos).collect();
                         self.familiar_wave = artist.familiar_collection.is_empty();
+                        self.familiar_all = false;
                         if let Some(modal) = artist.modal.clone().filter(|_| !self.unsafe_ok.contains(&format!("artist:{}", artist.id))) {
                             self.dialog = Some(Dialog::Unsafe(format!("artist:{}", artist.id), "К артисту", modal));
                         }
@@ -7526,9 +7537,15 @@ impl App {
             if !artist.familiar_wave.is_empty() {
                 chips = chips.push(chip(format!("Слушали в Моей волне · {}", artist.familiar_wave.len()), true));
             }
-            let rows = self.familiar_tracks(artist).iter().take(FAMILIAR_SHOWN).enumerate();
+            let tracks = self.familiar_tracks(artist);
+            let shown = if self.familiar_all { tracks.len() } else { FAMILIAR_SHOWN };
             page = page.push(Space::new().height(8)).push(block("Знакомо вам")).push(chips.wrap());
-            page = page.push(rows.fold(column![], |list, (index, track)| list.push(self.view_track_row(Message::FamiliarPlay(index), track))));
+            page = page.push(tracks.iter().take(shown).enumerate().fold(column![], |list, (index, track)| list.push(self.view_track_row(Message::FamiliarPlay(index), track))));
+            // Остальные треки вкладки раскрываются здесь же, как «Популярные треки» в оригинале.
+            if tracks.len() > FAMILIAR_SHOWN {
+                let label = if self.familiar_all { "Свернуть".to_string() } else { format!("Показать все {}", tracks.len()) };
+                page = page.push(shine(button(text(label).color(ui::c().text)).padding([7, 16]).style(ui::secondary).on_press(Message::FamiliarAll(!self.familiar_all)), 18.0));
+            }
         }
         if !artist.albums.is_empty() {
             let albums = self.shelf("artist:albums", "Альбомы", Some(Message::DiscographyOpen(false)), artist.albums.len(), |shown| self.album_cards(&artist.albums[shown], ALBUM_COVER, false, open_album));
