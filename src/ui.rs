@@ -356,6 +356,34 @@ pub fn menu_item(_: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// Карточка «Слов в волне»: тёплый отсвет акцента из угла переходит в обычную плитку.
+pub fn word_card(_: &Theme) -> container::Style {
+    let glow = Color { a: if is_light() { 0.28 } else { 0.12 }, ..c().accent };
+    let gradient = iced::gradient::Linear::new(iced::Radians(2.2)).add_stop(0.0, glow).add_stop(0.55, c().tile).add_stop(1.0, c().tile);
+    container::Style {
+        background: Some(Background::Gradient(gradient.into())),
+        text_color: Some(c().text),
+        border: Border { color: c().control, width: 1.0, radius: 18.0.into() },
+        ..container::Style::default()
+    }
+}
+
+/// Значок ИИ у карточки «Слов в волне».
+pub fn word_badge(_: &Theme) -> container::Style {
+    container::Style { background: Some(Background::Color(Color { a: 0.16, ..c().accent })), border: border::rounded(8), ..container::Style::default() }
+}
+
+/// Оценка карточки «Слов в волне»: выбранная — акцентом.
+pub fn word_rate(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| match (active, status) {
+        (true, button::Status::Pressed) => flat(Some(c().accent_hover), c().on_accent, 18.0),
+        (true, _) => flat(Some(c().accent), c().on_accent, 18.0),
+        (false, button::Status::Pressed) => flat(Some(c().control_pressed), c().text, 18.0),
+        (false, button::Status::Hovered) => flat(Some(c().control_hover), c().text, 18.0),
+        (false, _) => flat(Some(c().control), c().text, 18.0),
+    }
+}
+
 /// Фильтр поиска.
 pub fn chip(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, status| match (active, status) {

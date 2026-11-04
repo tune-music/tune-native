@@ -886,6 +886,8 @@ struct App {
     vibe_levels: [f32; 3],
     /// Показывать пункт «Детям» в боковой панели.
     kids: bool,
+    /// Показывать ли карточки «Слов в волне».
+    words_on: bool,
     /// Скорость подкастов и книг.
     speed: f32,
     look: Look,
@@ -1248,6 +1250,7 @@ enum Message {
     CrossfadeToggle,
     NormalizeToggle,
     LiteToggle,
+    WordsToggle,
     /// Проверка связи без сети и её итог.
     OnlineCheck,
     OnlineChecked(Result<(), String>),
@@ -1490,6 +1493,7 @@ impl App {
             vibe_speed: 0.0,
             vibe_levels: [0.0; 3],
             kids: saved.kids,
+            words_on: saved.words,
             speed: saved.speed,
             look: saved.look,
             cross_out: None,
@@ -1709,7 +1713,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, speed: self.speed, look: self.look });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, words: self.words_on, speed: self.speed, look: self.look });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -2029,7 +2033,7 @@ impl App {
     /// Экран волны показывает обложку крупно.
     /// Просит карточки «Слов в волне» к ближайшим трекам волны, как оригинал.
     fn words_load(&mut self, from: usize) -> Task<Message> {
-        if !self.wave_queue || self.offline {
+        if !self.wave_queue || self.offline || !self.words_on {
             return Task::none();
         }
         let Some(token) = self.token() else { return Task::none() };
@@ -2046,33 +2050,54 @@ impl App {
 
     /// Карточка играющего трека волны: факт, рассказ подробнее и оценка.
     fn view_word(&self) -> Option<Element<'_, Message>> {
+        if !self.words_on {
+            return None;
+        }
         let track = self.current_track().filter(|_| self.wave_queue)?;
         let card = self.words.get(&track.id)?;
-        let width = (self.main_width() - 80.0).clamp(240.0, WORD_WIDTH);
+        let width = (self.main_width() - 80.0).clamp(260.0, WORD_WIDTH);
         let open = self.word_open.as_ref().filter(|(id, _)| *id == card.id);
-        let mut body = column![text(&card.text).size(16).color(ui::c().text).wrapping(Wrapping::WordOrGlyph)].spacing(10);
+        let badge = container(row![ui::icon(ui::WAVE, 14.0, ui::c().accent), text("Слова в волне").size(12).font(ui::font_medium()).color(ui::c().accent)].spacing(6).align_y(Alignment::Center)).padding([4, 10]).style(ui::word_badge);
+        let header = row![badge, Space::new().width(Length::Fill), text("ИИ").size(12).color(ui::c().faint)].align_y(Alignment::Center);
+        let mut body = column![header, text(&card.text).size(19).font(ui::font_medium()).color(ui::c().strong).wrapping(Wrapping::WordOrGlyph)].spacing(14);
         match open {
             Some((_, None)) => {
                 let phrase = WORD_LOADING[card.id.bytes().map(usize::from).sum::<usize>() % WORD_LOADING.len()];
                 body = body.push(text(format!("{phrase}…")).size(14).color(ui::c().muted));
             }
             Some((_, Some(big))) => {
-                let story = scrollable(text(&big.text).size(14).color(ui::c().muted).wrapping(Wrapping::WordOrGlyph)).height(Length::Shrink);
-                body = body.push(container(story).max_height(WORD_STORY_HEIGHT));
-                if let Some((title, url)) = &big.action {
-                    body = body.push(hover_line(text(title.as_str()).size(14), ui::c().accent, ui::c().strong, Message::OpenUrl(url.clone())));
-                }
+                let story = scrollable(text(&big.text).size(15).line_height(1.45).color(ui::c().text).wrapping(Wrapping::WordOrGlyph)).height(Length::Shrink);
+                // Рассказ отбит тонкой полосой акцента слева, как цитата.
+                let bar = container(Space::new().width(3).height(Length::Fill)).style(|_| container::Style::default().background(ui::c().accent).border(iced::border::rounded(2)));
+                body = body.push(container(row![bar, container(story).max_height(WORD_STORY_HEIGHT).width(Length::Fill)].spacing(14).height(Length::Shrink)).max_height(WORD_STORY_HEIGHT));
             }
-            None if card.big.is_some() => body = body.push(text("Подробнее").size(13).color(ui::c().accent)),
             None => {}
         }
-        let rate = |label: &'static str, state: &'static str| {
-            let active = card.feedback == state;
-            shine(button(text(label).size(13).color(if active { ui::c().on_accent } else { ui::c().text })).padding([6, 14]).style(ui::chip(active)).on_press(Message::WordRate(track.id.clone(), state)), 16.0)
+        let pill = |icon, label: &'static str, active: bool, press: Message| {
+            let tint = if active { ui::c().on_accent } else { ui::c().text };
+            shine(button(row![ui::icon(icon, 16.0, tint), text(label).size(13).color(tint)].spacing(6).align_y(Alignment::Center)).padding([7, 14]).style(ui::word_rate(active)).on_press(press), 18.0)
         };
-        let story = button(body).padding(0).style(ui::ghost).on_press_maybe(card.big.as_ref().map(|_| Message::WordOpen(track.id.clone())));
-        let content = column![story, row![rate("Больше такого", "like"), rate("Мимо", "dislike")].spacing(8)].spacing(14);
-        Some(container(content).padding(18).width(width).style(ui::tile).into())
+        let liked = card.feedback == "like";
+        let disliked = card.feedback == "dislike";
+        let mut actions = row![
+            pill(if liked { ui::HEART } else { ui::HEART_OUTLINE }, "Больше такого", liked, Message::WordRate(track.id.clone(), "like")),
+            pill(ui::DISLIKE, "Мимо", disliked, Message::WordRate(track.id.clone(), "dislike")),
+            Space::new().width(Length::Fill),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        if let Some(Some((title, url))) = open.map(|(_, big)| big.as_ref().and_then(|big| big.action.clone())) {
+            actions = actions.push(hover_line(row![text(title).size(13), ui::icon(ui::RIGHT, 14.0, ui::c().accent)].spacing(2).align_y(Alignment::Center), ui::c().accent, ui::c().strong, Message::OpenUrl(url)));
+        } else if card.big.is_some() {
+            let label = if open.is_some() { "Свернуть" } else { "Подробнее" };
+            actions = actions.push(hover_line(row![text(label).size(13), ui::icon(if open.is_some() { ui::COLLAPSE } else { ui::RIGHT }, 14.0, ui::c().accent)].spacing(2).align_y(Alignment::Center), ui::c().accent, ui::c().strong, Message::WordOpen(track.id.clone())));
+        }
+        if open.is_some_and(|(_, big)| big.as_ref().is_some_and(|big| big.action.is_some())) {
+            // Под рассказом свернуть можно и отдельно от ссылки на Алису.
+            body = body.push(hover_line(row![text("Свернуть").size(13), ui::icon(ui::COLLAPSE, 14.0, ui::c().muted)].spacing(2).align_y(Alignment::Center), ui::c().muted, ui::c().strong, Message::WordOpen(track.id.clone())));
+        }
+        let content = column![body, actions].spacing(18);
+        Some(container(content).padding([20, 22]).width(width).style(ui::word_card).into())
     }
 
     fn fetch_wave_covers(&self, tracks: &[Track]) -> Task<Message> {
@@ -5378,6 +5403,11 @@ impl App {
                 self.crossfade = !self.crossfade;
                 self.save_settings();
             }
+            Message::WordsToggle => {
+                self.words_on = !self.words_on;
+                self.save_settings();
+                return self.words_load(self.current.unwrap_or(0));
+            }
             Message::LiteToggle => {
                 self.lite = !self.lite;
                 self.save_settings();
@@ -6960,6 +6990,14 @@ impl App {
         .align_y(Alignment::Center);
         let kids = glow(button(kids).width(Length::Fill).padding(8).style(ui::row).on_press(Message::KidsToggle), 8.0);
 
+        let words = row![
+            column![text("Слова в волне").color(ui::c().text), text("Короткие факты о треках от ИИ на экране Моей волны").size(13).color(ui::c().muted)].spacing(2).width(Length::Fill),
+            view_switch(Some(self.words_on)),
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center);
+        let words = glow(button(words).width(Length::Fill).padding(8).style(ui::row).on_press(Message::WordsToggle), 8.0);
+
         let looks = Look::ALL.into_iter().fold(row![].spacing(8), |line, look| line.push(choice(look.label(), look == self.look, Message::LookSet(look))));
         let page = column![
             text("Настройки").size(36).font(ui::font_headline()).color(ui::c().text),
@@ -6968,7 +7006,7 @@ impl App {
             self.view_equalizer(),
             cross,
             normalize,
-            column![title("Рекомендации"), ai, kids].spacing(8),
+            column![title("Рекомендации"), ai, words, kids].spacing(8),
             self.view_stored(),
             view_hotkeys(),
             column![title("Аккаунт"), row![link("Управление аккаунтом", Message::DialogOpen(Dialog::Account)), link("Выйти", Message::DialogOpen(Dialog::Logout))].spacing(8)].spacing(12),
