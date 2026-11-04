@@ -670,6 +670,8 @@ struct App {
     /// Уже полученные вкладки текущего запроса: возврат на них не ждёт сети.
     search_cache: HashMap<(String, SearchTab), Found>,
     liked_albums: Vec<Card>,
+    /// Предсохранённые альбомы, которые ещё не вышли.
+    presaved: Vec<Card>,
     liked_artists: Vec<Card>,
     /// Исполнители с дизлайком и открыта ли их вкладка на странице дизлайков.
     disliked_artists: Vec<Card>,
@@ -949,6 +951,9 @@ enum Message {
     HomePlay(usize, usize),
     HomeOpen(HomeItem),
     LikedPages(Result<(Vec<Card>, Vec<Card>, Vec<Card>), String>),
+    Presaves(Result<Vec<Card>, String>),
+    /// Предсохранить альбом или снять предсохранение.
+    Presave(Card),
     /// Ссылку или ярлык открыли, когда программа уже работала.
     LinkFromOutside(String),
     /// Скачан клиент Яндекс Музыки, из которого берутся шрифты и значки.
@@ -1220,6 +1225,7 @@ impl App {
             searched: false,
             search_cache: HashMap::new(),
             liked_albums: Vec::new(),
+            presaved: Vec::new(),
             liked_artists: Vec::new(),
             disliked_artists: Vec::new(),
             dislikes_artists: false,
@@ -1735,6 +1741,7 @@ impl App {
         self.found = Found::default();
         self.searched = false;
         self.liked_albums.clear();
+        self.presaved.clear();
         self.liked_artists.clear();
         self.queue.clear();
         self.liked.clear();
@@ -2474,7 +2481,9 @@ impl App {
         let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
         let (list_uid, list_token) = (uid.clone(), token.clone());
         let lists = Task::perform(background(move || api::liked_playlists(&list_uid, &list_token)), Message::LikedLists);
-        Task::batch([lists, Task::perform(background(move || api::liked_pages(&uid, &token)), Message::LikedPages)])
+        let (presave_uid, presave_token) = (uid.clone(), token.clone());
+        let presaves = Task::perform(background(move || api::presaves(&presave_uid, &presave_token)), Message::Presaves);
+        Task::batch([lists, presaves, Task::perform(background(move || api::liked_pages(&uid, &token)), Message::LikedPages)])
     }
 
     /// Включает новый список вместо очереди.
@@ -3723,6 +3732,21 @@ impl App {
             }
             // Коллекция покажется без этих блоков; музыке это не мешает.
             Message::LikedPages(Err(_)) => {}
+            Message::Presaves(Ok(albums)) => {
+                self.presaved = albums;
+                return self.fetch_card_covers(self.presaved.iter(), std::iter::empty(), &[]);
+            }
+            Message::Presaves(Err(e)) => eprintln!("предсохранения не загрузились: {e}"),
+            Message::Presave(card) => {
+                let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
+                let presaved = !self.presaved.iter().any(|c| c.id == card.id);
+                if presaved {
+                    self.presaved.insert(0, card.clone());
+                } else {
+                    self.presaved.retain(|c| c.id != card.id);
+                }
+                return Task::perform(background(move || api::set_presaved(&uid, &card.id, presaved, &token)), Message::PageLikeSaved);
+            }
             Message::EpisodesOrder(old_first) => {
                 self.episodes_old_first = old_first;
                 self.playlist_tracks = self.episodes_arranged();
@@ -3899,7 +3923,7 @@ impl App {
                         let albums = artist.albums.iter().chain(&artist.also).filter_map(|c| Some((format!("{ALBUM_COVER}{}", c.id), c.cover.clone()?)));
                         let artists = artist.similar.iter().filter_map(|c| Some((format!("{ARTIST_COVER}{}", c.id), c.cover.clone()?)));
                         let main = artist.cover.clone().map(|uri| (format!("{ARTIST_COVER}{}", artist.id), uri));
-                        let release = artist.release.iter().filter_map(|c| Some((format!("{ALBUM_COVER}{}", c.id), c.cover.clone()?)));
+                        let release = artist.release.iter().chain(&artist.upcoming).filter_map(|c| Some((format!("{ALBUM_COVER}{}", c.id), c.cover.clone()?)));
                         let lists = artist.playlists.iter().filter_map(|item| Some((home_item_key(item), home_item_cover(item)?)));
                         let videos = artist.videos.iter().filter_map(|video| Some((format!("{VIDEO_COVER}{}", video.id), video.cover.clone()?)));
                         let photos = artist.photos.iter().enumerate().map(|(at, uri)| (format!("{PHOTO_COVER}{}:{at}", artist.id), uri.clone()));
@@ -6368,6 +6392,10 @@ impl App {
             let lists = self.shelf("collection:liked", "Понравившиеся плейлисты", all, self.liked_lists.len(), |shown| self.playlist_cards(&self.liked_lists[shown]));
             page = page.push(Space::new().height(8)).push(lists);
         }
+        if !self.presaved.is_empty() {
+            let soon = self.shelf("collection:presaved", "Предстоящие релизы", None, self.presaved.len(), |shown| self.upcoming_cards(&self.presaved[shown]));
+            page = page.push(Space::new().height(8)).push(soon);
+        }
         if !self.liked_albums.is_empty() {
             let albums = self.shelf("collection:albums", "Альбомы", Some(Message::Open(Section::Albums)), self.liked_albums.len(), |shown| self.album_cards(&self.liked_albums[shown], ALBUM_COVER, false, open_album));
             page = page.push(Space::new().height(8)).push(albums);
@@ -6905,6 +6933,16 @@ impl App {
         cards.iter().map(|card| self.card(&format!("{prefix}{}", card.id), round, None, card.title.clone(), card.subtitle.clone(), open(card))).collect()
     }
 
+    /// Карточки ещё не вышедших альбомов с кнопкой предсохранения под каждой.
+    fn upcoming_cards<'a>(&self, cards: &[Card]) -> Vec<Element<'a, Message>> {
+        cards.iter().map(|card| {
+            let saved = self.presaved.iter().any(|c| c.id == card.id);
+            let label = if saved { "Предсохранено" } else { "Предсохранить" };
+            let toggle = shine(button(text(label).size(13)).padding([6, 14]).style(if saved { ui::secondary } else { ui::accent }).on_press(Message::Presave(card.clone())), 16.0);
+            column![self.card(&format!("{ALBUM_COVER}{}", card.id), false, None, card.title.clone(), card.subtitle.clone(), open_album(card)), toggle].spacing(6).into()
+        }).collect()
+    }
+
     fn home_cards<'a>(&self, items: &'a [HomeItem]) -> Vec<Element<'a, Message>> {
         items.iter().map(|item| self.view_home_item(item)).collect()
     }
@@ -6931,6 +6969,10 @@ impl App {
         let header = self.page_header("Исполнитель", artist.name.clone(), format!("{ARTIST_COVER}{}", artist.id), true, None, about, actions);
         let mut page = column![with_disclaimer(header, &artist.disclaimer)].spacing(12).padding(Padding::ZERO.right(SCROLLBAR));
         // Порядок блоков как в оригинале: новый релиз, популярное, знакомое, альбомы, плейлисты…
+        if let Some(upcoming) = &artist.upcoming {
+            let soon = self.shelf("artist:upcoming", "Скоро выйдет", None, 1, |_| self.upcoming_cards(std::slice::from_ref(upcoming)));
+            page = page.push(soon);
+        }
         if let Some(release) = &artist.release {
             let release = self.shelf("artist:release", "Новый релиз", None, 1, |_| self.album_cards(std::slice::from_ref(release), ALBUM_COVER, false, open_album));
             page = page.push(release);

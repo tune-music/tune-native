@@ -886,6 +886,8 @@ pub struct Artist {
     pub bandlink: Option<ArtistLink>,
     /// Предупреждения под шапкой, например «Исполнитель признан иноагентом».
     pub disclaimer: Vec<String>,
+    /// Альбом, который скоро выйдет: подпись карточки — дата выхода.
+    pub upcoming: Option<Card>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1006,6 +1008,7 @@ fn parse_artist(v: &Value) -> Option<Artist> {
         familiar_collection: Vec::new(),
         familiar_wave: Vec::new(),
         disclaimer: Vec::new(),
+        upcoming: None,
         release: v["lastReleases"].as_array().and_then(|list| list.first()).and_then(album_card),
         playlists: v["playlists"].as_array().into_iter().flatten().filter_map(parse_home_playlist).collect(),
         videos: v["videos"].as_array().into_iter().flatten().filter_map(|video| {
@@ -1067,6 +1070,10 @@ pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
     let v = get(&format!("artists/{id}/brief-info"), &[], token)?;
     let mut artist = parse_artist(result(&v)).ok_or_else(|| "Яндекс не прислал исполнителя".to_string())?;
     artist.disclaimer = disclaimer("artists", id, &result(&v)["artist"]["disclaimers"], token);
+    // Предстоящего релиза чаще всего нет: тогда Яндекс отвечает 404.
+    if let Ok(v) = get(&format!("artists/{id}/blocks/artist-upcoming-release"), &[], token) {
+        artist.upcoming = upcoming_card(&result(&v)["release"]);
+    }
     // Описание не главное: без него страница всё равно откроется.
     if let Ok(v) = get(&format!("artists/{id}/about-artist"), &[], token) {
         (artist.about, artist.links) = parse_about(result(&v));
@@ -1076,6 +1083,27 @@ pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
         (artist.familiar_collection, artist.familiar_wave) = parse_familiar(result(&v));
     }
     Ok(artist)
+}
+
+/// Предстоящий альбом: `{album, artists, releaseDate}`, в подписи — дата выхода.
+fn upcoming_card(v: &Value) -> Option<Card> {
+    let mut card = album_card(&v["album"]).or_else(|| album_card(v))?;
+    if let Some(date) = v["releaseDate"].as_str().or(v["album"]["releaseDate"].as_str()).and_then(release_date) {
+        card.subtitle = format!("Выйдет {date}");
+    }
+    Some(card)
+}
+
+/// Предсохранённые альбомы, которые ещё не вышли.
+pub fn presaves(uid: &str, token: &str) -> Result<Vec<Card>, String> {
+    let v = get(&format!("users/{uid}/presaves"), &[("includeReleased", "false"), ("includeUpcoming", "true")], token)?;
+    Ok(result(&v)["upcomingAlbums"].as_array().into_iter().flatten().filter_map(upcoming_card).collect())
+}
+
+/// Предсохранение: альбом сам попадёт в коллекцию, когда выйдет, как в оригинале.
+pub fn set_presaved(uid: &str, id: &str, presaved: bool, token: &str) -> Result<(), String> {
+    let path = if presaved { format!("users/{uid}/presaves/add?albumId={id}&likeAfterRelease=true") } else { format!("users/{uid}/presaves/remove?albumId={id}") };
+    post(&path, "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
 }
 
 /// Тексты предупреждений: просим их, только если пометки есть кроме `explicit`.
@@ -2314,6 +2342,13 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upcoming_release_card() {
+        let v = serde_json::json!({"album": {"id": 7, "title": "Скоро"}, "artists": [], "releaseDate": "2026-12-05T00:00:00+03:00"});
+        let card = upcoming_card(&v).unwrap();
+        assert_eq!((card.id.as_str(), card.subtitle.as_str()), ("7", "Выйдет 5 декабря 2026"));
+    }
 
     #[test]
     fn disclaimer_titles() {
