@@ -832,6 +832,8 @@ struct App {
     resume: Option<Duration>,
     /// Куда перемотать, как только трек запустится.
     resume_seek: Option<Duration>,
+    /// Новый трек волны-сета вступил переходом: сразу после старта он перематывается сюда.
+    mix_seek: Option<f32>,
     /// Какая очередь уже на диске и когда запоминали место.
     session_key: Option<u64>,
     session_at: Option<Instant>,
@@ -1282,6 +1284,7 @@ impl App {
             lyrics_back: 1.0,
             resume: None,
             resume_seek: None,
+            mix_seek: None,
             session_key: None,
             session_at: None,
             ai_less: None,
@@ -2204,6 +2207,13 @@ impl App {
                 resume = Some(Duration::from_secs_f32(place));
             }
         }
+        // В волне-сете трек начинается с начала сведения, как в оригинале: с перехода —
+        // перемоткой сразу после старта, иначе тем же путём, что продолжение с места.
+        let mix_start = self.fade_of(&track).filter(|_| self.wave_queue && is_mix(&self.wave_base) && restart.is_none() && resume.is_none()).map(|fade| fade.in_start).filter(|start| *start > 0.0);
+        self.mix_seek = mix_start.filter(|_| self.cross_out.is_some());
+        if self.cross_out.is_none() {
+            resume = resume.or(mix_start.map(Duration::from_secs_f32));
+        }
         // Прошлый трек закрывается, пока плеер ещё знает его место.
         if restart.is_none() {
             self.progress_save(self.change_reason == Some("finish"));
@@ -2218,7 +2228,7 @@ impl App {
         self.retry = None;
         self.sound = None;
         // Переход: играющий трек затихает сам, новый нарастает поверх него.
-        let generation = match (self.cross_out.take(), track.fade) {
+        let generation = match (self.cross_out.take(), self.fade_of(&track)) {
             (Some(out), Some(fade)) if restart.is_none() && resume.is_none() => player.crossfade(out, (fade.in_start, fade.in_stop)),
             _ => player.stop(),
         };
@@ -2258,6 +2268,11 @@ impl App {
         Task::batch([start, self.wave_refill()])
     }
 
+    /// Точки перехода трека: в волне-сете свои, плотнее обычных.
+    fn fade_of(&self, track: &Track) -> Option<api::Fade> {
+        if self.wave_queue && is_mix(&self.wave_base) { track.mix_fade.or(track.fade) } else { track.fade }
+    }
+
     /// Пора начинать переход к следующему треку: оба трека — музыка с точками перехода,
     /// трек играет и дошёл до начала затухания. Повтор одного трека переходом не идёт.
     fn cross_next(&self) -> Option<usize> {
@@ -2267,13 +2282,13 @@ impl App {
         if self.player.as_ref().is_none_or(Player::is_paused) {
             return None;
         }
-        let fade = self.current_track()?.fade?;
+        let fade = self.fade_of(self.current_track()?)?;
         let position = self.position.as_secs_f32();
         if position < fade.out_start || position >= fade.out_stop {
             return None;
         }
         let next = self.next_index().filter(|&next| Some(next) != self.current)?;
-        self.queue.get(next)?.fade.map(|_| next)
+        self.fade_of(self.queue.get(next)?).map(|_| next)
     }
 
     /// Незадолго до конца трека начинает качать следующий. Ошибка не важна: при запуске
@@ -4649,6 +4664,9 @@ impl App {
                     Ok(sound) => {
                         self.sound = Some(sound);
                         self.active = true;
+                        if let (Some(at), Some(player)) = (self.mix_seek.take(), &self.player) {
+                            let _ = player.seek(Duration::from_secs_f32(at));
+                        }
                         // У каждого трека своя громкость: выравнивание пересчитывается при смене.
                         self.apply_volume();
                         self.listen_tick = Some(Instant::now());
@@ -4738,7 +4756,7 @@ impl App {
                             self.feedback("trackFinished", Some(&track), Some(self.position.as_secs_f32()));
                         }
                         self.change_reason = Some("finish");
-                        self.cross_out = self.current_track().and_then(|track| track.fade).map(|fade| (fade.out_start, fade.out_stop));
+                        self.cross_out = self.current_track().and_then(|track| self.fade_of(track)).map(|fade| (fade.out_start, fade.out_stop));
                         return self.play(next);
                     }
                     let Some(p) = &self.player else { return Task::none() };
@@ -7094,6 +7112,12 @@ fn loudness_gain((integrated, peak): (f32, f32)) -> f32 {
     10f32.powf(db / 20.0)
 }
 
+/// Волна-сет из блока «Свели в AI-сет»: её зёрна `mix-by-mood:…`, `mix-by-genre:…`. В оригинале
+/// это волна типа `MIX`: треки сводятся по точкам `mixFade` и начинаются с их начала.
+fn is_mix(seeds: &[String]) -> bool {
+    seeds.iter().any(|seed| seed.starts_with("mix-"))
+}
+
 fn remembers_scroll(section: Section) -> bool {
     !matches!(section, Section::Lyrics | Section::Queue | Section::Wave)
 }
@@ -7701,6 +7725,42 @@ fn smoke_home() -> Result<(), String> {
     Ok(())
 }
 
+/// Волна-сет с главной: тип сессии и точки сведения первых треков.
+fn smoke_mix() -> Result<(), String> {
+    let token = api::load_token().ok_or("нет токена")?;
+    let home = api::landing("main", 0, &token)?;
+    let (block, seeds) = home
+        .blocks
+        .iter()
+        .find_map(|block| block.items.iter().find_map(|item| match item {
+            HomeItem::Wave { seeds, .. } if block.title.contains("AI") => Some((block.title.clone(), seeds.clone())),
+            _ => None,
+        }))
+        .ok_or("на главной нет блока с AI-сетами")?;
+    let wave = api::wave_new(&seeds, &token)?;
+    println!("{block}: {seeds:?}, сет {}", is_mix(&seeds));
+    for track in wave.tracks.iter().take(3) {
+        println!("{} — fade {:?}, mixFade {:?}", track.title, track.fade.map(|f| (f.in_start, f.out_start)), track.mix_fade.map(|f| (f.in_start, f.in_stop, f.out_start, f.out_stop)));
+    }
+    // Сведение как в окне: второй трек вступает переходом и сразу перематывается к началу сведения.
+    let [first, second, ..] = &wave.tracks[..] else { return Err("в сете меньше двух треков".into()) };
+    let (Some(out), Some(fade_in)) = (first.mix_fade, second.mix_fade) else { return Err("у треков нет mixFade".into()) };
+    let player = Player::new()?;
+    player.set_volume(0.0);
+    let generation = player.stop();
+    player.play(generation, &api::file_info(&first.id, Quality::Normal.code(), &token)?)?;
+    player.seek(Duration::from_secs_f32((out.out_start - 1.0).max(0.0)))?;
+    std::thread::sleep(Duration::from_secs(1));
+    let generation = player.crossfade((out.out_start, out.out_stop), (fade_in.in_start, fade_in.in_stop));
+    player.play(generation, &api::file_info(&second.id, Quality::Normal.code(), &token)?)?;
+    player.seek(Duration::from_secs_f32(fade_in.in_start))?;
+    for step in 0..=((out.out_stop - out.out_start + 1.0) * 2.0) as usize {
+        println!("{:4.1} с: старый звучит {}, новый на {:?}", step as f32 / 2.0, player.fading(), player.position());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Ok(())
+}
+
 /// Шлёт стартовый отчёт о прослушивании для трека, на котором остановилась прошлая очередь.
 fn smoke_plays() -> Result<(), String> {
     let token = api::load_token().ok_or("нет токена")?;
@@ -8084,7 +8144,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -8093,6 +8153,7 @@ fn main() -> iced::Result {
                 "--smoke-settings" => smoke_settings(),
                 "--smoke-plays" => smoke_plays(),
                 "--smoke-home" => smoke_home(),
+                "--smoke-mix" => smoke_mix(),
             "--smoke-crossfade" => smoke_crossfade(query),
             "--smoke-move" => smoke_move(query),
             "--smoke-cover" => smoke_cover(),

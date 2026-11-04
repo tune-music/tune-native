@@ -45,6 +45,8 @@ pub struct Track {
     pub unavailable: bool,
     /// Точки плавного перехода в секундах: нарастание и затухание. Есть только у музыки.
     pub fade: Option<Fade>,
+    /// Точки перехода для волны-сета: в ней треки сведены плотнее, чем обычно.
+    pub mix_fade: Option<Fade>,
     /// Выпуск подкаста или глава книги: Яндекс помнит, где остановились.
     pub remember: bool,
     /// Где остановились в прошлый раз, секунды.
@@ -411,6 +413,7 @@ fn parse_track(v: &Value) -> Option<Track> {
         loudness: v["r128"]["i"].as_f64().zip(v["r128"]["tp"].as_f64()).map(|(i, tp)| (i as f32, tp as f32)),
         // Как в оригинале: переход только между музыкальными треками, не подкастами и книгами.
         fade: Fade::parse(&v["fade"]).filter(|_| v["type"].as_str() == Some("music")),
+        mix_fade: Fade::parse(&v["mixFade"]).filter(|_| v["type"].as_str() == Some("music")),
         remember: v["rememberPosition"].as_bool() == Some(true),
         progress: v["streamProgress"]["endPositionSec"].as_f64().map(|x| x as f32),
         published: v["pubDate"].as_str().and_then(release_date),

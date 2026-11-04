@@ -44,6 +44,7 @@ pub fn track_value(track: &Track) -> Value {
         "plusOnly": track.plus_only,
         "loudness": track.loudness.map(|(integrated, peak)| [integrated, peak]),
         "fade": track.fade.map(|fade| json!({ "inStart": fade.in_start, "inStop": fade.in_stop, "outStart": fade.out_start, "outStop": fade.out_stop })),
+        "mixFade": track.mix_fade.map(|fade| json!({ "inStart": fade.in_start, "inStop": fade.in_stop, "outStart": fade.out_start, "outStop": fade.out_stop })),
     })
 }
 
@@ -62,6 +63,7 @@ pub fn track_from(v: &Value) -> Option<Track> {
         batch: None,
         unavailable: v["unavailable"].as_bool().unwrap_or(false),
         fade: api::Fade::parse(&v["fade"]),
+        mix_fade: api::Fade::parse(&v["mixFade"]),
         remember: v["remember"].as_bool().unwrap_or(false),
         progress: v["progress"].as_f64().map(|x| x as f32),
         published: v["published"].as_str().map(str::to_string),
@@ -171,6 +173,7 @@ mod tests {
             finished: false,
             plus_only: true,
             loudness: Some((-9.25, 1.5)),
+            mix_fade: None,
         }
     }
 
