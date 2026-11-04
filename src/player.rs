@@ -5,11 +5,13 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use aes::cipher::{KeyIvInit, StreamCipher};
-use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink};
+use rodio::mixer::MixerSource;
+use rodio::{ChannelCount, Decoder, DeviceSinkBuilder, MixerDeviceSink, SampleRate, Source};
 
 use crate::api::FileInfo;
 use crate::crossfade::{FadeOut, Faded};
@@ -20,6 +22,11 @@ type Ctr128 = ctr::Ctr128BE<aes::Aes128>;
 type Ctr256 = ctr::Ctr128BE<aes::Aes256>;
 
 const WAIT: Duration = Duration::from_millis(20);
+/// Столько ждём байтов от сервера, прежде чем считать связь оборванной.
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// Пауза между попытками продолжить загрузку или открыть устройство вывода; растёт до потолка.
+const RETRY: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(8);
 
 enum Cipher {
     None,
@@ -112,33 +119,83 @@ fn hint(codec: &str) -> &'static str {
     }
 }
 
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(20))).timeout_per_read(Some(READ_TIMEOUT)).build().into()
+}
+
+/// Тело файла с байта `from` и полная длина файла. Продолжение просится заголовком `Range`.
+fn request(agent: &ureq::Agent, url: &str, from: u64) -> Result<(impl Read + use<>, u64), String> {
+    let mut req = agent.get(url);
+    if from > 0 {
+        req = req.header("Range", format!("bytes={from}-"));
+    }
+    let resp = req.call().map_err(|e| format!("Не удалось получить файл трека: {e}"))?;
+    let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let len = if from > 0 {
+        // Ответ 206 с `Content-Range: bytes 100-999/1000`; без него сервер прислал бы файл с начала.
+        if resp.status() != 206 {
+            return Err("Сервер не продолжил загрузку с места обрыва".into());
+        }
+        header("content-range").and_then(|v| v.rsplit('/').next()?.parse().ok())
+    } else {
+        header("content-length").and_then(|v| v.parse().ok())
+    }
+    .ok_or("Сервер не сообщил размер файла")?;
+    Ok((resp.into_body().into_with_config().limit(1024 * 1024 * 1024).reader(), len))
+}
+
+/// Перекачивает тело в файл, расшифровывая на ходу. Связь может оборваться посреди файла:
+/// тогда загрузка продолжается с того же байта, пока не дойдёт до конца или её не отменят.
+/// `written` растёт по мере записи. Вернёт ошибку, только если продолжить нельзя совсем.
+fn pump(agent: &ureq::Agent, url: &str, mut body: Box<dyn Read>, len: u64, cipher: &mut Cipher, out: &mut File, written: &AtomicU64, cancelled: &AtomicBool) -> Result<(), String> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut retry = RETRY;
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let done = written.load(Ordering::Acquire);
+        match body.read(&mut buf) {
+            Ok(0) if done >= len => return Ok(()),
+            Ok(n) if n > 0 => {
+                // Поток CTR непрерывный, поэтому кусок любой длины расшифровывается на месте.
+                cipher.apply(&mut buf[..n]);
+                out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+                written.fetch_add(n as u64, Ordering::Release);
+                retry = RETRY;
+                continue;
+            }
+            // Тело кончилось раньше файла или чтение упало: связь оборвалась.
+            _ => {}
+        }
+        // Ждём сеть и просим остаток файла, пока не выйдет или трек не сменят.
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            std::thread::sleep(retry);
+            retry = (retry * 2).min(RETRY_MAX);
+            match request(agent, url, done) {
+                Ok((rest, _)) => {
+                    body = Box::new(rest);
+                    break;
+                }
+                Err(e) if e.starts_with("Сервер не продолжил") => return Err(e),
+                Err(_) => {}
+            }
+        }
+    }
+}
+
 /// Качает файл в фоне и возвращает его длину, когда известен ответ сервера.
 fn download(info: &FileInfo, path: &Path, progress: Arc<Progress>) -> Result<u64, String> {
     let mut cipher = Cipher::new(info.key.as_deref())?;
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(20))).build().into();
-    let resp = agent.get(&info.url).call().map_err(|e| format!("Не удалось получить файл трека: {e}"))?;
-    let len = resp
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok())
-        .ok_or("Сервер не сообщил размер файла")?;
+    let agent = agent();
+    let (body, len) = request(&agent, &info.url, 0)?;
     let mut out = File::create(path).map_err(|e| e.to_string())?;
+    let url = info.url.clone();
     std::thread::spawn(move || {
-        let mut body = resp.into_body().into_with_config().limit(1024 * 1024 * 1024).reader();
-        let mut buf = vec![0u8; 64 * 1024];
-        while !progress.cancelled.load(Ordering::Acquire) {
-            let Ok(n) = body.read(&mut buf) else { break };
-            if n == 0 {
-                break;
-            }
-            // Поток CTR непрерывный, поэтому кусок любой длины расшифровывается на месте.
-            cipher.apply(&mut buf[..n]);
-            if out.write_all(&buf[..n]).is_err() {
-                break;
-            }
-            progress.written.fetch_add(n as u64, Ordering::Release);
-        }
+        let _ = pump(&agent, &url, Box::new(body) as Box<dyn Read>, len, &mut cipher, &mut out, &progress.written, &progress.cancelled);
         progress.finished.store(true, Ordering::Release);
     });
     Ok(len)
@@ -147,22 +204,12 @@ fn download(info: &FileInfo, path: &Path, progress: Arc<Progress>) -> Result<u64
 /// Качает файл целиком и расшифровывает: так сохраняются скачанные треки. Блокирует поток.
 pub fn save_file(info: &FileInfo, path: &Path) -> Result<u64, String> {
     let mut cipher = Cipher::new(info.key.as_deref())?;
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(20))).build().into();
-    let resp = agent.get(&info.url).call().map_err(|e| format!("Не удалось получить файл трека: {e}"))?;
-    let mut body = resp.into_body().into_with_config().limit(1024 * 1024 * 1024).reader();
+    let agent = agent();
+    let (body, len) = request(&agent, &info.url, 0)?;
     let mut out = File::create(path).map_err(|e| e.to_string())?;
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut total = 0;
-    loop {
-        let n = body.read(&mut buf).map_err(|e| format!("Загрузка оборвалась: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        cipher.apply(&mut buf[..n]);
-        out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-        total += n as u64;
-    }
-    Ok(total)
+    let written = AtomicU64::new(0);
+    pump(&agent, &info.url, Box::new(body) as Box<dyn Read>, len, &mut cipher, &mut out, &written, &AtomicBool::new(false))?;
+    Ok(written.into_inner())
 }
 
 /// Следующий трек, который уже начал качаться.
@@ -205,7 +252,9 @@ pub struct Player {
     /// Скорость и место играющего трека: при ускорении счётчик вывода отстаёт от трека.
     speed: Speed,
     clock: Arc<Mutex<Option<Clock>>>,
-    _device: Arc<SendDevice>,
+    _device: Arc<Mutex<Option<SendDevice>>>,
+    /// Сигнал, что устройство пропало и его надо открыть заново.
+    device_lost: Sender<()>,
 }
 
 /// Устройство только держим живым и из других потоков не трогаем.
@@ -213,11 +262,97 @@ struct SendDevice(#[allow(dead_code)] MixerDeviceSink);
 unsafe impl Send for SendDevice {}
 unsafe impl Sync for SendDevice {}
 
+/// Звук плеера на пути к устройству. Оба вывода играют в свой микшер, а устройство только
+/// забирает отсюда сэмплы: при смене устройства новое подхватывает тот же звук с того же места.
+#[derive(Clone)]
+struct Relay {
+    source: Arc<Mutex<MixerSource>>,
+    channels: ChannelCount,
+    rate: SampleRate,
+}
+
+impl Iterator for Relay {
+    type Item = rodio::Sample;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Пустой микшер кончается, а устройство выкинуло бы его навсегда: вместо конца тишина.
+        Some(self.source.lock().unwrap().next().unwrap_or(0.0))
+    }
+}
+
+impl Source for Relay {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> ChannelCount {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> SampleRate {
+        self.rate
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// Открывает устройство вывода по умолчанию. Если оно пропадёт, `lost` получит сигнал.
+fn open_device(lost: Sender<()>) -> Result<MixerDeviceSink, String> {
+    let on_error = move |e: rodio::cpal::Error| {
+        // Смену устройства по умолчанию Windows проводит сама и только сообщает о ней.
+        if matches!(e.kind(), rodio::cpal::ErrorKind::DeviceNotAvailable | rodio::cpal::ErrorKind::StreamInvalidated) {
+            let _ = lost.send(());
+        }
+    };
+    let mut device = DeviceSinkBuilder::from_default_device()
+        .map_err(|e| format!("Нет устройства вывода звука: {e}"))?
+        .with_error_callback(on_error)
+        .open_sink_or_fallback()
+        .map_err(|e| format!("Нет устройства вывода звука: {e}"))?;
+    device.log_on_drop(false);
+    Ok(device)
+}
+
+/// Ждёт, пока устройство пропадёт, и открывает новое, как только оно появится; звук продолжается
+/// с того же места. Кончается вместе с плеером.
+fn watch_device(slot: Weak<Mutex<Option<SendDevice>>>, relay: Relay, lost: mpsc::Receiver<()>, signal: Sender<()>) {
+    std::thread::spawn(move || loop {
+        match lost.recv_timeout(RETRY_MAX) {
+            Ok(()) => {}
+            Err(RecvTimeoutError::Timeout) if slot.strong_count() > 0 => continue,
+            Err(_) => return,
+        }
+        let mut retry = RETRY;
+        loop {
+            let Some(slot) = slot.upgrade() else { return };
+            // Старый поток закрываем раньше, чем открываем новый: звук не должен уйти в оба.
+            slot.lock().unwrap().take();
+            while lost.try_recv().is_ok() {}
+            if let Ok(device) = open_device(signal.clone()) {
+                device.mixer().add(relay.clone());
+                *slot.lock().unwrap() = Some(SendDevice(device));
+                break;
+            }
+            drop(slot);
+            std::thread::sleep(retry);
+            retry = (retry * 2).min(RETRY_MAX);
+        }
+    });
+}
+
 impl Player {
     pub fn new() -> Result<Self, String> {
-        let mut device = DeviceSinkBuilder::open_default_sink().map_err(|e| format!("Нет устройства вывода звука: {e}"))?;
-        device.log_on_drop(false);
-        let outputs = [rodio::Player::connect_new(device.mixer()), rodio::Player::connect_new(device.mixer())];
+        let (signal, lost) = mpsc::channel();
+        let device = open_device(signal.clone())?;
+        let (channels, rate) = (device.config().channel_count(), device.config().sample_rate());
+        let (mixer, source) = rodio::mixer::mixer(channels, rate);
+        let relay = Relay { source: Arc::new(Mutex::new(source)), channels, rate };
+        device.mixer().add(relay.clone());
+        let outputs = [rodio::Player::connect_new(&mixer), rodio::Player::connect_new(&mixer)];
+        let slot = Arc::new(Mutex::new(Some(SendDevice(device))));
+        watch_device(Arc::downgrade(&slot), relay, lost, signal.clone());
         Ok(Self {
             outputs: Arc::new(outputs),
             active: Arc::default(),
@@ -232,7 +367,8 @@ impl Player {
             eq: Shared::default(),
             speed: Speed::default(),
             clock: Arc::default(),
-            _device: Arc::new(SendDevice(device)),
+            _device: slot,
+            device_lost: signal,
         })
     }
 
@@ -369,6 +505,11 @@ impl Player {
         Ok(())
     }
 
+    /// Открывает устройство вывода заново, как после его пропажи. Нужно только для проверки.
+    pub fn reopen_device(&self) {
+        let _ = self.device_lost.send(());
+    }
+
     pub fn hold_next(&self, hold: bool) {
         self.hold.store(hold, Ordering::Release);
     }
@@ -456,6 +597,47 @@ mod tests {
         progress.cancelled.store(true, Ordering::Release);
         assert_eq!(reader.read(&mut buf).unwrap(), 0);
         drop(reader);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn download_resumes_after_drop() {
+        use std::io::BufRead;
+        use std::net::TcpListener;
+        let data: Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/track", listener.local_addr().unwrap());
+        let served = data.clone();
+        let server = std::thread::spawn(move || {
+            let mut ranges = Vec::new();
+            // Первый ответ обрывается на 400-м байте, второй отдаёт остаток по `Range`.
+            for cut in [Some(400), None] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut lines = io::BufReader::new(stream.try_clone().unwrap()).lines();
+                let range = lines.by_ref().map_while(|l| l.ok()).take_while(|l| !l.is_empty()).find_map(|l| l.to_ascii_lowercase().strip_prefix("range: bytes=").map(|r| r.trim_end_matches('-').parse::<usize>().unwrap()));
+                ranges.push(range);
+                let from = range.unwrap_or(0);
+                let head = match range {
+                    Some(_) => format!("HTTP/1.1 206 Partial Content
+Content-Length: {}
+Content-Range: bytes {from}-999/1000
+
+", 1000 - from),
+                    None => "HTTP/1.1 200 OK
+Content-Length: 1000
+
+".to_string(),
+                };
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(&served[from..cut.unwrap_or(1000)]).unwrap();
+            }
+            ranges
+        });
+        let path = std::env::temp_dir().join(format!("tune-native-resume-{}", std::process::id()));
+        let info = FileInfo { url, key: None, codec: "mp3".into(), bitrate: 0, quality: String::new() };
+        assert_eq!(save_file(&info, &path).unwrap(), 1000);
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        assert_eq!(server.join().unwrap(), [None, Some(400)]);
         std::fs::remove_file(path).unwrap();
     }
 

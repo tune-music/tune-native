@@ -7662,6 +7662,26 @@ fn smoke(query: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Проверка смены устройства: посреди трека устройство открывается заново, как после пропажи,
+/// и трек играет дальше с того же места.
+fn smoke_device(query: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let track = api::search(query, &token)?.into_iter().next().ok_or("Ничего не найдено")?;
+    let info = api::file_info(&track.id, Quality::Normal.code(), &token)?;
+    let player = Player::new()?;
+    player.set_volume(0.05);
+    let generation = player.stop();
+    player.play(generation, &info)?;
+    std::thread::sleep(Duration::from_secs(3));
+    println!("До смены: {:?}", player.position());
+    player.reopen_device();
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_secs(1));
+        println!("После смены: {:?}, пауза {}, пусто {}", player.position(), player.is_paused(), player.is_empty());
+    }
+    Ok(())
+}
+
 /// Проверка волн: что сервер отдаёт на каждое зерно и сколько треков совпало с Моей волной.
 fn smoke_wave(seeds: &str) -> Result<(), String> {
     let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
@@ -8144,7 +8164,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -8162,6 +8182,7 @@ fn main() -> iced::Result {
             "--smoke-artist-dislike" => smoke_artist_dislike(query),
             "--smoke-download" => smoke_download(query),
             "--smoke-offline" => smoke_offline(query),
+            "--smoke-device" => smoke_device(query),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
