@@ -116,7 +116,8 @@ const LIKES_PAGE: usize = 100;
 const WAVE_MARGIN: usize = 2;
 const WAVE_HISTORY: usize = 50;
 /// Сколько сбойных треков подряд пропустить, прежде чем остановиться: сеть могла пропасть.
-const MAX_FAILURES: u32 = 3;
+/// Сколько сбойных треков подряд пропускается, как в оригинале (`ErrorAutoSkipPlugin`).
+const MAX_FAILURES: u32 = 10;
 /// Высота строки трека. Одинаковая у всех: по ней считается, какие строки видны.
 const ROW: f32 = 58.0;
 /// Выравнивание громкости: цель в LUFS, как у большинства стримингов, и потолок пика в dBTP.
@@ -2376,6 +2377,7 @@ impl App {
     /// Включает новый список вместо очереди.
     fn play_list(&mut self, tracks: Vec<Track>, title: String, index: usize) -> Task<Message> {
         self.queue = tracks;
+        self.failures = 0;
         self.wave = None;
         self.wave_pending = None;
         self.wave_queue = false;
@@ -4723,12 +4725,14 @@ impl App {
                     }
                     Err(e) => {
                         self.unhold = false;
+                        let skip = skippable(&e);
                         let task = self.fail(e);
                         self.failures += 1;
-                        if let (Screen::Main(_), true, Some(i)) = (&self.screen, self.failures < MAX_FAILURES, self.current.filter(|i| i + 1 < self.queue.len())) {
-                            // Трек мог быть недоступен: ошибку показываем, а музыка идёт дальше.
+                        if let (Screen::Main(_), true, Some(next)) = (&self.screen, skip && self.failures <= MAX_FAILURES, self.next_index()) {
+                            // Трек недоступен или сломан: ошибку показываем, а музыка идёт дальше.
+                            // Без сети или при сбое Яндекса дальше было бы то же самое, поэтому стоим.
                             let error = self.error.clone();
-                            let next = self.play(i + 1);
+                            let next = self.play(next);
                             self.error = error;
                             return next;
                         }
@@ -7154,6 +7158,19 @@ fn loudness_gain((integrated, peak): (f32, f32)) -> f32 {
     10f32.powf(db / 20.0)
 }
 
+/// Сбой трека, после которого музыка идёт дальше, как в оригинале: Яндекс ответил 4xx на
+/// сам трек (кроме входа и «слишком часто»), файла нет или его не прочитать. Сеть и 5xx — нет.
+fn skippable(error: &str) -> bool {
+    let status = ["ответил ", "http status: "].iter().find_map(|mark| {
+        let at = error.find(mark)? + mark.len();
+        error.get(at..at + 3)?.parse::<u16>().ok()
+    });
+    match status {
+        Some(code) => (400..500).contains(&code) && code != 401 && code != 429,
+        None => error.starts_with("Не удалось прочитать файл трека") || error == "Яндекс не дал файл трека",
+    }
+}
+
 /// Волна-сет из блока «Свели в AI-сет»: её зёрна `mix-by-mood:…`, `mix-by-genre:…`. В оригинале
 /// это волна типа `MIX`: треки сводятся по точкам `mixFade` и начинаются с их начала.
 fn is_mix(seeds: &[String]) -> bool {
@@ -8340,6 +8357,17 @@ mod lyrics_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skips_only_track_errors() {
+        assert!(skippable("Яндекс ответил 404: not-found"));
+        assert!(skippable("Не удалось получить файл трека: http status: 410"));
+        assert!(skippable("Не удалось прочитать файл трека: unsupported"));
+        assert!(skippable("Яндекс не дал файл трека"));
+        assert!(!skippable("Яндекс ответил 503: ошибка"));
+        assert!(!skippable("Не удалось получить файл трека: http status: 429"));
+        assert!(!skippable("Не удалось связаться с Яндексом: timeout"));
+    }
 
     #[test]
     fn history_days_read_like_original() {
