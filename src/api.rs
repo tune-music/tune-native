@@ -1105,6 +1105,10 @@ pub enum HomeItem {
     /// Микс: подборка плейлистов по тегу, например «Осенняя».
     Mix { tag: String, title: String, cover: Option<String> },
     History { subtitle: String, cover: Option<String> },
+    /// Другая страница из блоков: «Жанры», жанр, настроение. У пунктов списка жанров обложки нет.
+    Landing { page: String, title: String, cover: Option<String> },
+    /// Подборка редакции (`/post/<id>`): альбомы, плейлисты и исполнители под одним названием.
+    Post { id: String, title: String, cover: Option<String> },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1114,10 +1118,14 @@ pub struct HomeBlock {
     pub tracks: Vec<Track>,
     /// Вкладки внутри блока («топ», «настроение»…) с их карточками; `items` — выбранная.
     pub tabs: Vec<(String, Vec<HomeItem>)>,
+    /// Куда ведёт «Все»: полный список жанра (`/genre/<id>/albums`) или страница из блоков.
+    pub more: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Home {
+    /// Название страницы у Яндекса: «Жанры», «Русский рок».
+    pub title: String,
     pub tabs: Vec<String>,
     pub blocks: Vec<HomeBlock>,
 }
@@ -1167,6 +1175,15 @@ fn parse_home_item(v: &Value) -> Option<HomeItem> {
     if let Some(page) = data["action"]["weblink"].as_str().and_then(|link| link.strip_prefix("/landing/")).map(|page| page.trim_matches('/')).filter(|page| page.starts_with("category_")) {
         return Some(HomeItem::Mix { tag: format!("{CATEGORY}{page}"), title: data["title"].as_str()?.to_string(), cover: data["covers"][0]["uri"].as_str().map(str::to_string) });
     }
+    // Остальные страницы из блоков: «Жанры», «Настроения» в миксах и пункты списка жанров.
+    let link = data["action"]["weblink"].as_str().or(data["viewAllAction"]["weblink"].as_str()).unwrap_or_default();
+    let cover = || data["covers"][0]["uri"].as_str().map(str::to_string);
+    if let Some(page) = link.strip_prefix("/landing/").map(|page| page.trim_matches('/')).filter(|page| !page.is_empty()) {
+        return Some(HomeItem::Landing { page: page.to_string(), title: data["title"].as_str()?.to_string(), cover: cover() });
+    }
+    if let Some(id) = link.strip_prefix("/post/").map(|id| id.trim_matches('/')).filter(|id| !id.is_empty()) {
+        return Some(HomeItem::Post { id: id.to_string(), title: data["title"].as_str()?.to_string(), cover: cover() });
+    }
     // В похожем волна лежит глубже: название и зёрна в wave, обложка в agent.
     let wave = &data["wave"];
     let seeds: Vec<String> = data["seeds"].as_array().or(wave["seeds"].as_array())?.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
@@ -1208,6 +1225,8 @@ fn item_key(item: &HomeItem) -> String {
         HomeItem::Mix { tag, .. } => format!("mix:{tag}"),
         HomeItem::Likes { .. } => "likes".to_string(),
         HomeItem::History { .. } => "history".to_string(),
+        HomeItem::Landing { page, .. } => format!("landing:{page}"),
+        HomeItem::Post { id, .. } => format!("post:{id}"),
     }
 }
 
@@ -1275,6 +1294,10 @@ pub enum Link {
     Search(String),
     /// Микс по тегу или категория книг и подкастов.
     Tag(String),
+    /// Страница из блоков: «Жанры», жанр (`/genre/rock` — это `tag_rock`).
+    Landing(String),
+    /// Подборка редакции.
+    Post(String),
 }
 
 /// Разбирает ссылку на music.yandex.*, ссылку протокола `yandexmusic://` и внутреннюю ссылку
@@ -1301,6 +1324,9 @@ pub fn parse_link(text: &str) -> Option<Link> {
         [] | ["home"] => page(&["home"]),
         ["search", ..] => Some(query_text(query).filter(|q| !q.is_empty()).map_or(Link::Page("search".to_string()), Link::Search)),
         ["tag", tag, ..] => Some(Link::Tag(tag.to_string())),
+        ["landing", landing, ..] => Some(Link::Landing(landing.to_string())),
+        ["genre", genre, ..] => Some(Link::Landing(format!("tag_{genre}"))),
+        ["post", post, ..] => Some(Link::Post(post.to_string())),
         ["non-music", "category", category, ..] => Some(Link::Tag(format!("{CATEGORY}{category}"))),
         [first @ ("collection" | "non-music" | "kids" | "chart"), ..] => page(&parts[..parts.len().min(if *first == "collection" { 2 } else { 1 })]),
         ["album", album, ..] => number(album).map(Link::Album),
@@ -1365,6 +1391,10 @@ fn parse_home_block(title: &str, v: &Value) -> HomeBlock {
     let mut items = Vec::new();
     items.extend(v["newReleases"].as_array().into_iter().flatten().filter_map(parse_release));
     items.extend(v["items"].as_array().into_iter().flatten().filter_map(parse_home_item));
+    // Волна жанра приходит одна, без списка.
+    if v["seeds"].is_array() {
+        items.extend(parse_home_item(v));
+    }
     let tabs: Vec<(String, Vec<HomeItem>)> = ["waves", "inStyleTabs"]
         .iter()
         .flat_map(|group| v[*group].as_array().into_iter().flatten())
@@ -1404,7 +1434,7 @@ fn parse_home_block(title: &str, v: &Value) -> HomeBlock {
     }
     let list = v["tracks"].as_array().or(chart["tracks"].as_array());
     let tracks = list.into_iter().flatten().filter_map(|t| parse_track(if t["track"].is_object() { &t["track"] } else { t })).collect();
-    HomeBlock { title: title.to_string(), items, tracks, tabs }
+    HomeBlock { title: title.to_string(), items, tracks, tabs, more: None }
 }
 
 /// Страница из блоков: главная (`main`) или книги и подкасты (`non_music`). Скелет страницы
@@ -1417,23 +1447,29 @@ pub fn landing(skeleton: &str, tab: usize, token: &str) -> Result<Home, String> 
     let blocks = skeleton["blocks"].as_array().cloned().unwrap_or_default();
     let tabs = blocks.iter().map(|block| &block["data"]["tabs"]).find(|tabs| tabs.is_array()).unwrap_or(&Value::Null);
     let names = tabs.as_array().into_iter().flatten().filter_map(|t| t["title"].as_str().map(str::to_string)).collect();
-    let sources: Vec<(String, String)> = tabs[tab]["blocks"]
+    let sources: Vec<(String, String, Option<String>)> = tabs[tab]["blocks"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|b| Some((b["data"]["title"].as_str().unwrap_or_default().to_string(), b["data"]["source"]["uri"].as_str()?.trim_start_matches('/').to_string())))
+        .filter_map(|b| {
+            let data = &b["data"];
+            let more = data["viewAllAction"]["weblink"].as_str().map(str::to_string);
+            Some((data["title"].as_str().unwrap_or_default().to_string(), data["source"]["uri"].as_str()?.trim_start_matches('/').to_string(), more))
+        })
         .collect();
     let mut blocks = Vec::new();
     for part in sources.chunks(HOME_PARALLEL) {
         let handles: Vec<_> = part
             .iter()
             .cloned()
-            .map(|(title, uri)| {
+            .map(|(title, uri, more)| {
                 let token = token.to_string();
-                std::thread::spawn(move || get(&uri, &[], &token).ok().map(|v| parse_home_block(&title, result(&v))))
+                std::thread::spawn(move || get(&uri, &[], &token).ok().map(|v| HomeBlock { more, ..parse_home_block(&title, result(&v)) }))
             })
             .collect();
-        blocks.extend(handles.into_iter().filter_map(|h| h.join().ok().flatten()).filter(|b| (!b.title.is_empty() || b.items.iter().all(HomeItem::is_shortcut)) && (!b.items.is_empty() || !b.tracks.is_empty())));
+        // Без названия показываем только то, что понятно и так: карточки разделов, волну жанра, список жанров.
+        let plain = |item: &HomeItem| item.is_shortcut() || matches!(item, HomeItem::Wave { .. } | HomeItem::Landing { cover: None, .. });
+        blocks.extend(handles.into_iter().filter_map(|h| h.join().ok().flatten()).filter(|b| (!b.title.is_empty() || b.items.iter().all(plain)) && (!b.items.is_empty() || !b.tracks.is_empty())));
     }
     if skeleton_id == "non_music" {
         let podcasts = tabs[tab]["id"].as_str() == Some("podcasts");
@@ -1441,7 +1477,30 @@ pub fn landing(skeleton: &str, tab: usize, token: &str) -> Result<Home, String> 
         shelf.append(&mut blocks);
         blocks = shelf;
     }
-    Ok(Home { tabs: names, blocks })
+    Ok(Home { title: skeleton["title"].as_str().unwrap_or_default().to_string(), tabs: names, blocks })
+}
+
+/// Полный список жанра для «Все»: альбомы, плейлисты или исполнители, сначала популярные.
+pub fn genre_list(genre: &str, kind: &str, token: &str) -> Result<Vec<HomeItem>, String> {
+    let path = format!("metatags/{}/{kind}", encode(genre));
+    let v = get(&path, &[("offset", "0"), ("limit", "100"), ("sortBy", "popular"), ("period", "week"), ("tracksPerArtist", "0")], token)?;
+    let v = result(&v);
+    let items = v[kind].as_array().into_iter().flatten();
+    Ok(match kind {
+        "albums" => items.filter_map(album_card).map(HomeItem::Album).collect(),
+        "artists" => items.filter_map(|a| artist_card(if a["artist"].is_object() { &a["artist"] } else { a })).map(HomeItem::Artist).collect(),
+        _ => items.filter_map(parse_home_playlist).collect(),
+    })
+}
+
+/// Подборка редакции (`feed/promotions/<id>`): название и карточки.
+pub fn editorial_post(id: &str, token: &str) -> Result<HomeBlock, String> {
+    let v = get(&format!("feed/promotions/{}", encode(id)), &[], token)?;
+    let v = result(&v);
+    let mut items: Vec<HomeItem> = v["albums"].as_array().into_iter().flatten().filter_map(album_card).map(HomeItem::Album).collect();
+    items.extend(v["playlists"].as_array().into_iter().flatten().filter_map(|p| parse_home_playlist(if p["playlist"].is_object() { &p["playlist"] } else { p })));
+    items.extend(v["artists"].as_array().into_iter().flatten().filter_map(artist_card).map(HomeItem::Artist));
+    Ok(HomeBlock { title: v["title"].as_str().unwrap_or_default().to_string(), items, ..HomeBlock::default() })
 }
 
 /// Где остановились в выпуске подкаста или главе книги. Так же место видят другие устройства.
@@ -2002,6 +2061,11 @@ pub fn now_stamp() -> String {
 }
 
 /// Можно ли сейчас слушать треки: номер трека и ответ.
+/// Сырой ответ на запрос чтения: для проверки, что отдаёт сервер.
+pub fn probe(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, String> {
+    fetch(path, query, token)
+}
+
 /// Что оригинал вставляет после трека (`after-track`): спрашивает он только рекламу.
 pub fn after_track(from: &str, types: &str, prev: &str, next: &str, token: &str) -> Result<Value, String> {
     get("after-track", &[("from", from), ("types", types), ("prevTrackId", prev), ("nextTrackId", next)], token)
@@ -2356,6 +2420,9 @@ mod tests {
         assert_eq!(link("https://music.yandex.kz/artist/3121/tracks"), Some(Link::Artist("3121".to_string())));
         assert_eq!(link("https://music.yandex.ru/users/music-blog/playlists/2131"), Some(Link::Playlist("music-blog".to_string(), "2131".to_string())));
         assert_eq!(link("https://music.yandex.ru/playlists/lk.ab-cd"), Some(Link::PlaylistUuid("ab-cd".to_string())));
+        assert_eq!(link("https://music.yandex.ru/genre/rusrock/albums"), Some(Link::Landing("tag_rusrock".to_string())));
+        assert_eq!(link("yandexmusic://landing/music_genres"), Some(Link::Landing("music_genres".to_string())));
+        assert_eq!(link("https://music.yandex.ru/post/5d776caa24c49852264d102d"), Some(Link::Post("5d776caa24c49852264d102d".to_string())));
         let page = |path: &str| Some(Link::Page(path.to_string()));
         assert_eq!(link("https://music.yandex.ru/home"), page("home"));
         assert_eq!(link("https://music.yandex.ru"), page("home"));

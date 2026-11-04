@@ -368,6 +368,8 @@ enum Section {
     Tag,
     /// Все карточки блока, открытые из «Показать все».
     Block,
+    /// Другая страница из блоков: «Жанры», жанр, настроение.
+    Landing,
 }
 
 /// Карусель, у которой есть «Показать все».
@@ -505,11 +507,14 @@ struct Place {
     playlist: Option<Playlist>,
     artist: Option<Artist>,
     block: Option<HomeBlock>,
+    landing: Option<(String, String)>,
 }
 
 /// Запуск с готовым разделом: первый трек показывается в плеере, но не играет.
 #[derive(Clone)]
 enum Preview {
+    /// Страница из блоков по её адресу у Яндекса: `landing:music_genres`.
+    Landing(String),
     Dislikes,
     History,
     /// История, прокрученная до доли высоты: середина или конец.
@@ -609,7 +614,11 @@ struct App {
     /// Чья страница из блоков сейчас загружена: главная или книги и подкасты.
     home_page: Section,
     /// Последняя открытая вкладка главной и книг с подкастами.
-    landing_tabs: [usize; 3],
+    landing_tabs: [usize; 4],
+    /// Открытая страница из блоков вне разделов: её адрес у Яндекса и название.
+    landing: Option<(String, String)>,
+    /// Скелет, чьи блоки сейчас в `home`.
+    home_skeleton: String,
     /// Меню «…» страницы плейлиста, альбома или исполнителя открыто в этой точке.
     page_menu: Option<(f32, f32)>,
     page_menu_fade: Fade<(f32, f32)>,
@@ -899,7 +908,11 @@ enum Message {
     FilterLoaded(u64, Result<Vec<Track>, String>),
     SearchTabSet(SearchTab),
     ListOpen(Playlist),
-    HomeLoaded(Section, usize, Result<Home, String>),
+    HomeLoaded(String, usize, Result<Home, String>),
+    /// «Все» у блока, который ведёт дальше: на полный список жанра или другую страницу.
+    HomeMore(usize),
+    /// Полный список жанра или подборка редакции: название и карточки.
+    CardsLoaded(String, Result<Vec<HomeItem>, String>),
     HomeTab(usize),
     /// Карусель листается на ряд вперёд или назад; число — сколько в ней карточек.
     ShelfPage(String, bool, usize),
@@ -1152,7 +1165,9 @@ impl App {
             home_tab: 0,
             home_loading: false,
             home_page: Section::Home,
-            landing_tabs: [0; 3],
+            landing_tabs: [0; 4],
+            landing: None,
+            home_skeleton: String::new(),
             progress: HashMap::new(),
             progress_at: None,
             drag: None,
@@ -1750,6 +1765,8 @@ impl App {
                 Task::batch([open, self.search_run()])
             }
             api::Link::Tag(tag) => self.handle(Message::HomeOpen(HomeItem::Mix { title: String::new(), tag, cover: None })),
+            api::Link::Landing(page) => self.landing_open(page, String::new()),
+            api::Link::Post(id) => self.handle(Message::HomeOpen(HomeItem::Post { id, title: "Подборка редакции".to_string(), cover: None })),
             link => Task::perform(background(move || api::link_playlist(&link, &token)), Message::LinkPlaylist),
         }
     }
@@ -2449,12 +2466,43 @@ impl App {
         self.home_block_tabs.clear();
         self.home.blocks.clear();
         self.error = None;
-        let skeleton = landing_skeleton(page);
-        Task::perform(background(move || api::landing(skeleton, tab, &token)), move |r| Message::HomeLoaded(page, tab, r))
+        let skeleton = self.skeleton_of(page);
+        self.home_skeleton = skeleton.clone();
+        let wanted = skeleton.clone();
+        Task::perform(background(move || api::landing(&skeleton, tab, &token)), move |r| Message::HomeLoaded(wanted.clone(), tab, r))
+    }
+
+    fn skeleton_of(&self, page: Section) -> String {
+        match (page, &self.landing) {
+            (Section::Landing, Some((skeleton, _))) => skeleton.clone(),
+            _ => landing_skeleton(page).to_string(),
+        }
+    }
+
+    /// Открывает страницу из блоков поверх текущей, с возвратом назад.
+    fn landing_open(&mut self, page: String, title: String) -> Task<Message> {
+        self.player_full = false;
+        self.remember();
+        self.landing = Some((page, title));
+        self.section = Section::Landing;
+        self.error = None;
+        self.retry = None;
+        self.landing_tabs[landing_index(Section::Landing)] = 0;
+        self.home_load(Section::Landing, 0)
+    }
+
+    /// Открывает готовые карточки отдельной страницей, как «Показать все».
+    fn block_open(&mut self, title: String, items: Vec<HomeItem>) {
+        self.player_full = false;
+        self.remember();
+        self.block = Some(HomeBlock { title, items, ..HomeBlock::default() });
+        self.section = Section::Block;
+        self.error = None;
+        self.retry = None;
     }
 
     fn here(&self) -> Place {
-        Place { section: self.section, playlist: self.playlist.clone(), artist: self.artist.clone(), block: self.block.clone() }
+        Place { section: self.section, playlist: self.playlist.clone(), artist: self.artist.clone(), block: self.block.clone(), landing: self.landing.clone() }
     }
 
     fn remember(&mut self) {
@@ -2479,6 +2527,12 @@ impl App {
         self.section = place.section;
         self.artist = place.artist;
         self.block = place.block;
+        self.landing = place.landing;
+        // Страницы из блоков делят одно место: вернувшись на другую, грузим её заново.
+        if matches!(place.section, Section::Home | Section::Books | Section::Kids | Section::Landing) && self.home_skeleton != self.skeleton_of(place.section) {
+            let tab = self.landing_tabs[landing_index(place.section)];
+            return self.home_load(place.section, tab);
+        }
         self.shelf_pages.retain(|key, _| key.starts_with(HOME_SHELF));
         self.artist_loading = None;
         if place.section == Section::Playlists {
@@ -2613,7 +2667,7 @@ impl App {
             Section::Likes | Section::Collection => &self.liked,
             Section::Playlists => &self.playlist_tracks,
             Section::Artist => self.artist.as_ref().map_or(&[], |a| a.popular.as_slice()),
-            Section::Albums | Section::Artists | Section::Home | Section::Books | Section::Kids | Section::Discography | Section::Tag | Section::Block => &[],
+            Section::Albums | Section::Artists | Section::Home | Section::Books | Section::Kids | Section::Landing | Section::Discography | Section::Tag | Section::Block => &[],
             // На странице очереди список — то, что будет после играющего трека.
             Section::History => &self.history_tracks,
             Section::Dislikes => &self.disliked_list,
@@ -2739,7 +2793,7 @@ impl App {
             }
         }
         if place == self.list_place() {
-            let tabbed = matches!(self.section, Section::Search | Section::Home | Section::Books | Section::Kids);
+            let tabbed = matches!(self.section, Section::Search | Section::Home | Section::Books | Section::Kids | Section::Landing);
             if tabbed && (self.search_tab, self.home_tab) != tab {
                 // Другая вкладка проявляется на месте, без сдвига: шапка и кнопки не трогаются.
                 self.area_veil = 1.0;
@@ -2801,7 +2855,7 @@ impl App {
     fn area_loading(&self) -> bool {
         match self.section {
             Section::Search => self.searching,
-            Section::Home | Section::Books | Section::Kids => self.home_loading,
+            Section::Home | Section::Books | Section::Kids | Section::Landing => self.home_loading,
             _ => false,
         }
     }
@@ -2815,7 +2869,7 @@ impl App {
     fn page_ready(&self) -> bool {
         match self.section {
             Section::Likes | Section::Playlists if self.filtering() => true,
-            Section::Home | Section::Books | Section::Kids => self.home_page == self.section && !self.home.blocks.is_empty(),
+            Section::Home | Section::Books | Section::Kids | Section::Landing => self.home_page == self.section && !self.home.blocks.is_empty(),
             Section::Wave => self.current_track().is_some(),
             Section::Collection | Section::Settings => true,
             Section::Lyrics => self.lyrics.as_ref().is_some_and(|(id, _)| self.current_track().is_some_and(|track| track.id == *id)),
@@ -2970,6 +3024,10 @@ impl App {
                     Some(Preview::Artist(id)) => {
                         self.preview = None;
                         self.update(Message::ArtistOpen(id))
+                    }
+                    Some(Preview::Landing(page)) => {
+                        self.preview = None;
+                        self.landing_open(page.clone(), page)
                     }
                     // Подсказка снимается, когда исполнитель загрузится.
                     Some(Preview::ArtistAbout(id) | Preview::Discography(id) | Preview::ArtistMenu(id) | Preview::ArtistFamiliar(id)) => self.update(Message::ArtistOpen(id)),
@@ -3380,12 +3438,18 @@ impl App {
                 }
             }
             Message::ListOpen(playlist) => return self.open_list(playlist),
-            Message::HomeLoaded(page, tab, result) => {
+            Message::HomeLoaded(skeleton, tab, result) => {
                 // Пока грузилось, могли выбрать другую вкладку или другую страницу.
-                if tab == self.home_tab && page == self.home_page {
+                if tab == self.home_tab && skeleton == self.home_skeleton {
                     self.home_loading = false;
                     match result {
-                        Ok(home) => self.home = home,
+                        Ok(home) => {
+                            // Название страницы из блоков — у самого Яндекса, а не у карточки, что на неё вела.
+                            if let (Some((_, title)), false) = (self.landing.as_mut().filter(|_| self.home_page == Section::Landing), home.title.is_empty()) {
+                                *title = home.title.clone();
+                            }
+                            self.home = home;
+                        }
                         Err(e) => return self.fail_retry(e, Message::HomeTab(tab)),
                     }
                 }
@@ -3403,6 +3467,35 @@ impl App {
                 let step = self.cards_in_row();
                 let from = self.shelf_pages.entry(key).or_insert(0);
                 *from = if forward { (*from + step).min(total.saturating_sub(step)) } else { from.saturating_sub(step) };
+            }
+            Message::HomeMore(index) => {
+                let Some(block) = self.home.blocks.get(index) else { return Task::none() };
+                let (title, more) = (block.title.clone(), block.more.clone().unwrap_or_default());
+                if let Some(page) = more.strip_prefix("/landing/") {
+                    return self.landing_open(page.trim_matches('/').to_string(), title);
+                }
+                // `/genre/<жанр>/<что>`: полный список, сначала популярные.
+                let parts: Vec<&str> = more.trim_matches('/').split('/').collect();
+                if let (["genre", genre, kind], Some(token)) = (parts.as_slice(), self.token()) {
+                    let (genre, kind) = (genre.to_string(), kind.to_string());
+                    self.block_open(title.clone(), Vec::new());
+                    return Task::perform(background(move || api::genre_list(&genre, &kind, &token)), move |r| Message::CardsLoaded(title.clone(), r));
+                }
+                return self.update(Message::ShowAll(Shelf::Home(index)));
+            }
+            Message::CardsLoaded(title, result) => {
+                // Пока грузилось, могли уйти на другую страницу.
+                if self.section != Section::Block || self.block.as_ref().is_none_or(|block| block.title != title) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(items) if items.is_empty() => return self.fail("Здесь пока пусто".to_string()),
+                    Ok(items) => {
+                        self.block = Some(HomeBlock { title, items, ..HomeBlock::default() });
+                        return self.visible_covers();
+                    }
+                    Err(e) => return self.fail(e),
+                }
             }
             Message::ShowAll(shelf) => {
                 let (title, items) = match shelf {
@@ -3453,6 +3546,13 @@ impl App {
                     return Task::batch([open, Task::perform(background(load), move |result| Message::TagLoaded(wanted.clone(), result))]);
                 }
                 HomeItem::History { .. } => return self.update(Message::Open(Section::History)),
+                HomeItem::Landing { page, title, .. } => return self.landing_open(page, title),
+                HomeItem::Post { id, title, .. } => {
+                    let Some(token) = self.token() else { return Task::none() };
+                    self.block_open(title.clone(), Vec::new());
+                    let load = move || api::editorial_post(&id, &token).map(|post| post.items);
+                    return Task::perform(background(load), move |r| Message::CardsLoaded(title.clone(), r));
+                }
             },
             Message::LinkFromOutside(text) => {
                 if let Some(hwnd) = self.hwnd {
@@ -4975,7 +5075,7 @@ impl App {
 
     fn view_main(&self) -> Element<'_, Message> {
         let page: Element<'_, Message> = match self.section {
-            Section::Home | Section::Books | Section::Kids => self.view_home(),
+            Section::Home | Section::Books | Section::Kids | Section::Landing => self.view_home(),
             Section::Queue => self.view_queue(),
             Section::Lyrics => self.view_lyrics(),
             Section::Settings => self.view_settings(),
@@ -6415,7 +6515,10 @@ impl App {
         if self.home_loading && self.home.tabs.is_empty() {
             tabs = SKELETON_TABS.iter().fold(tabs, |tabs, &width| tabs.push(container(Space::new()).width(width).height(SKELETON_TAB).style(skeleton_round(SKELETON_TAB / 2.0))));
         }
-        let title = landing_title(self.section);
+        let title = match (&self.landing, self.section) {
+            (Some((_, title)), Section::Landing) => title.as_str(),
+            _ => landing_title(self.section),
+        };
         let mut page = column![text(title).size(36).font(ui::font_headline()).color(ui::c().text).wrapping(Wrapping::None)].spacing(16).height(Length::Fill);
         // Одна вкладка («Детям») только повторила бы заголовок.
         if self.home.tabs.len() != 1 {
@@ -6425,8 +6528,17 @@ impl App {
             return page.push(self.area(if self.home_loading { skeleton_home(self.cards_in_row(), self.card_side()) } else { placeholder("Пока здесь пусто", None) })).into();
         }
         let blocks = self.home.blocks.iter().enumerate().fold(column![].spacing(12).padding(Padding::ZERO.right(SCROLLBAR)), |blocks, (index, block)| {
+            // Список страниц без обложек, как «Все жанры», — кнопками в несколько строк.
+            if !block.items.is_empty() && block.items.iter().all(|item| matches!(item, HomeItem::Landing { cover: None, .. })) {
+                let chips = block.items.iter().fold(row![].spacing(8), |chips, item| {
+                    let HomeItem::Landing { title, .. } = item else { return chips };
+                    chips.push(shine(button(text(title.as_str())).padding([9, 18]).style(ui::secondary).on_press(Message::HomeOpen(item.clone())), 20.0))
+                });
+                return blocks.push(chips.wrap().vertical_spacing(8)).push(Space::new().height(8));
+            }
             let shown = self.home_shown(index, block);
-            let all = self.more_than_row(block.items.len(), Message::ShowAll(Shelf::Home(index)));
+            // Блок, который ведёт дальше, показывает «Все» всегда: там больше, чем в карусели.
+            let all = if block.more.is_some() { Some(Message::HomeMore(index)) } else { self.more_than_row(block.items.len(), Message::ShowAll(Shelf::Home(index))) };
             let head = self.shelf_head(&format!("{HOME_SHELF}{index}"), &block.title, all, block.items.len());
             let mut body = if block.title.is_empty() { column![] } else { column![head] }.spacing(8);
             if !block.tabs.is_empty() {
@@ -6457,6 +6569,8 @@ impl App {
             HomeItem::Mix { title, tag, .. } => (title, if tag.starts_with(api::CATEGORY) { "Категория" } else { "Микс" }.to_string(), false),
             HomeItem::Likes { count, .. } => ("Мне нравится", format!("{count} {}", tracks_word(*count as usize)), false),
             HomeItem::History { subtitle, .. } => ("История", if subtitle.is_empty() { "Недавно прослушанное".to_string() } else { subtitle.clone() }, false),
+            HomeItem::Landing { title, .. } => (title, "Подборка".to_string(), false),
+            HomeItem::Post { title, .. } => (title, "Подборка редакции".to_string(), false),
         };
         let color = match item {
             HomeItem::Wave { color, .. } => color.as_deref().and_then(ui::hex_color),
@@ -7090,7 +7204,7 @@ fn drop_index(from: usize, at: usize, below: bool) -> Option<usize> {
 
 /// Страница из блоков: главная и книги с подкастами устроены одинаково.
 fn is_landing(section: Section) -> bool {
-    matches!(section, Section::Home | Section::Books | Section::Kids)
+    matches!(section, Section::Home | Section::Books | Section::Kids | Section::Landing)
 }
 
 /// Номер страницы из блоков для запоминания её вкладки.
@@ -7098,6 +7212,7 @@ fn landing_index(section: Section) -> usize {
     match section {
         Section::Books => 1,
         Section::Kids => 2,
+        Section::Landing => 3,
         _ => 0,
     }
 }
@@ -7308,6 +7423,8 @@ fn home_item_key(item: &HomeItem) -> String {
         HomeItem::Likes { .. } => format!("{WAVE_CARD}:likes"),
         HomeItem::Mix { tag, .. } => format!("{WAVE_CARD}:mix:{tag}"),
         HomeItem::History { .. } => format!("{WAVE_CARD}:history"),
+        HomeItem::Landing { page, .. } => format!("{WAVE_CARD}:landing:{page}"),
+        HomeItem::Post { id, .. } => format!("{WAVE_CARD}:post:{id}"),
     }
 }
 
@@ -7315,7 +7432,7 @@ fn home_item_cover(item: &HomeItem) -> Option<String> {
     match item {
         HomeItem::Album(card) | HomeItem::Artist(card) => card.cover.clone(),
         HomeItem::Playlist(list) => list.cover.clone(),
-        HomeItem::Wave { cover, .. } | HomeItem::Likes { cover, .. } | HomeItem::History { cover, .. } | HomeItem::Mix { cover, .. } => cover.clone(),
+        HomeItem::Wave { cover, .. } | HomeItem::Likes { cover, .. } | HomeItem::History { cover, .. } | HomeItem::Mix { cover, .. } | HomeItem::Landing { cover, .. } | HomeItem::Post { cover, .. } => cover.clone(),
     }
 }
 
@@ -7786,6 +7903,70 @@ fn smoke(query: &str) -> Result<(), String> {
     player.seek(Duration::from_secs(30))?;
     std::thread::sleep(Duration::from_secs(2));
     println!("Позиция после перемотки на 30 с: {:?}", player.position());
+    Ok(())
+}
+
+/// Каталог жанра и подборка редакции: сколько карточек приходит в полных списках.
+fn smoke_catalog(genre: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    for kind in ["albums", "playlists", "artists"] {
+        let items = api::genre_list(genre, kind, &token)?;
+        println!("{genre}/{kind}: {} карточек", items.len());
+    }
+    let mixes = api::landing("main", 1, &token)?;
+    let posts: Vec<_> = mixes.blocks.iter().flat_map(|b| &b.items).filter_map(|item| match item {
+        HomeItem::Post { id, title, .. } => Some((id.clone(), title.clone())),
+        _ => None,
+    }).collect();
+    let landings = mixes.blocks.iter().flat_map(|b| &b.items).filter(|item| matches!(item, HomeItem::Landing { .. })).count();
+    println!("в «Трендах»: подборок редакции {}, страниц из блоков {landings}", posts.len());
+    for (id, title) in posts {
+        let post = api::editorial_post(&id, &token)?;
+        println!("  {title}: «{}», карточек {}", post.title, post.items.len());
+    }
+    Ok(())
+}
+
+/// Строение ответа на запрос чтения: ключи, типы и начало строк, массивы — по первому элементу.
+fn smoke_get(request: &str) -> Result<(), String> {
+    const NL: char = 10 as char;
+    fn shape(v: &serde_json::Value, depth: usize, out: &mut String) {
+        let pad = "  ".repeat(depth);
+        match v {
+            serde_json::Value::Object(map) if depth < 7 => {
+                for (key, value) in map {
+                    out.push_str(&format!("{pad}{key}:"));
+                    match value {
+                        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                            out.push(NL);
+                            shape(value, depth + 1, out);
+                        }
+                        other => out.push_str(&format!(" {}{NL}", other.to_string().chars().take(90).collect::<String>())),
+                    }
+                }
+            }
+            serde_json::Value::Array(items) if depth < 7 => {
+                out.push_str(&format!("{pad}[{} шт.]{NL}", items.len()));
+                if let Some(first) = items.first() {
+                    shape(first, depth + 1, out);
+                }
+            }
+            other => out.push_str(&format!("{pad}{}{NL}", other.to_string().chars().take(90).collect::<String>())),
+        }
+    }
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    // `raw:` в начале — весь ответ как есть, для разбора другими средствами.
+    let (raw, request) = request.strip_prefix("raw:").map_or((false, request), |rest| (true, rest));
+    let (path, query) = request.split_once('?').unwrap_or((request, ""));
+    let pairs: Vec<(&str, &str)> = query.split('&').filter(|p| !p.is_empty()).map(|p| p.split_once('=').unwrap_or((p, ""))).collect();
+    let v = api::probe(path, &pairs, &token)?;
+    if raw {
+        println!("{v}");
+        return Ok(());
+    }
+    let mut out = String::new();
+    shape(&v, 0, &mut out);
+    print!("{out}");
     Ok(())
 }
 
@@ -8347,7 +8528,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -8368,6 +8549,8 @@ fn main() -> iced::Result {
             "--smoke-device" => smoke_device(query),
             "--smoke-after" => smoke_after(query),
             "--smoke-format" => smoke_format(query),
+            "--smoke-get" => smoke_get(query),
+            "--smoke-catalog" => smoke_catalog(query),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
@@ -8418,6 +8601,7 @@ fn main() -> iced::Result {
             }
             what if what.starts_with("album:") => Preview::Album(what[6..].to_string()),
             what if what.starts_with("artist:") => Preview::Artist(what[7..].to_string()),
+            what if what.starts_with("landing:") => Preview::Landing(what[8..].to_string()),
             what if what.starts_with("artist-familiar:") => Preview::ArtistFamiliar(what[16..].to_string()),
             what if what.starts_with("artist-menu:") => Preview::ArtistMenu(what[12..].to_string()),
             "disliked-artists" => Preview::DislikedArtists,
