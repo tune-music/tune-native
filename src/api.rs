@@ -2289,7 +2289,18 @@ fn now() -> String {
 }
 
 /// Что волна узнаёт о вкусе: запуск, начало, конец, пропуск, лайк.
-pub fn wave_feedback(session: &str, kind: &str, track: Option<&Track>, played: Option<f32>, token: &str) -> Result<(), String> {
+pub fn wave_feedback(session: &str, body: &Value, token: &str) -> Result<(), String> {
+    post(&format!("rotor/session/{session}/feedback/"), "application/json", body.to_string(), token).map(|_| ())
+}
+
+/// Отложенные без сети отзывы пачкой, как у оригинала: по каждой сессии волны её затравки и отзывы.
+pub fn wave_feedbacks(sessions: &[(String, Vec<String>, Vec<Value>)], token: &str) -> Result<(), String> {
+    let sessions: Vec<Value> = sessions.iter().map(|(session, seeds, feedbacks)| json!({"sessionId": session, "seeds": seeds, "feedbacks": feedbacks})).collect();
+    post("rotor/sessions/feedbacks/", "application/json", json!({ "sessions": sessions }).to_string(), token).map(|_| ())
+}
+
+/// Отзыв волне с временем, когда он случился: отложенный уйдёт позже с тем же временем.
+pub fn feedback_body(kind: &str, track: Option<&Track>, played: Option<f32>) -> Value {
     let mut event = json!({ "type": kind, "timestamp": now() });
     let mut body = json!({ "from": FROM });
     match track {
@@ -2305,7 +2316,7 @@ pub fn wave_feedback(session: &str, kind: &str, track: Option<&Track>, played: O
         None => event["from"] = json!(FROM),
     }
     body["event"] = event;
-    post(&format!("rotor/session/{session}/feedback/"), "application/json", body.to_string(), token).map(|_| ())
+    body
 }
 
 /// Одно прослушивание трека для отчёта `plays`: по ним Яндекс ведёт историю и подбирает

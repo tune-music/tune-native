@@ -2063,11 +2063,21 @@ impl App {
     }
 
     /// Волне важно знать, что с треком стало. Ошибка здесь музыке не мешает.
+    /// Без сети отзыв откладывается на диск и уходит пачкой, когда связь вернётся.
     fn feedback(&self, kind: &'static str, track: Option<&Track>, played: Option<f32>) {
         let (Some(session), Some(token)) = (self.wave.clone(), self.token()) else { return };
-        let track = track.cloned();
+        let body = api::feedback_body(kind, track, played);
+        let seeds = self.wave_base.clone();
+        if self.offline {
+            offline::keep_feedback(&session, &seeds, body);
+            return;
+        }
         std::thread::spawn(move || {
-            let _ = api::wave_feedback(&session, kind, track.as_ref(), played, &token);
+            if let Err(e) = api::wave_feedback(&session, &body, &token) {
+                if api::network_error(&e) {
+                    offline::keep_feedback(&session, &seeds, body);
+                }
+            }
         });
     }
 
@@ -9249,7 +9259,7 @@ fn smoke_library(query: &str) -> Result<(), String> {
     println!("Загружено сведений: {}, порядок совпал: {}", page.len(), page.iter().zip(&ids).all(|(t, id)| t.id == *id));
     let wave = api::wave_new(&[api::MY_WAVE.to_string()], &token)?;
     println!("Волна: треков в первой пачке {}", wave.tracks.len());
-    println!("Обратная связь: {:?}", api::wave_feedback(&wave.session, "radioStarted", None, None, &token));
+    println!("Обратная связь: {:?}", api::wave_feedback(&wave.session, &api::feedback_body("radioStarted", None, None), &token));
     let shown: Vec<String> = wave.tracks.iter().map(Track::full_id).collect();
     println!("Следующая пачка: {:?}", api::wave_more(&wave.session, &shown, &token).map(|t| t.len()));
     let track = api::search(query, &token)?.into_iter().find(|t| !ids.contains(&t.id)).ok_or("Нет трека без лайка")?;

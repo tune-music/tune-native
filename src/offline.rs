@@ -16,6 +16,8 @@ const PLAYS: &str = "plays.json";
 const PLAYS_LIMIT: usize = 500;
 /// Аккаунт и лайки с прошлого запуска: без сети приложение открывается с ними.
 const ACCOUNT: &str = "account.json";
+/// Отзывы волне, которые не ушли без сети: сессия, затравки и сам отзыв.
+const FEEDBACKS: &str = "feedbacks.json";
 /// Файл отчётов меняют сразу несколько потоков.
 static PLAYS_LOCK: Mutex<()> = Mutex::new(());
 /// Обложка скачанного трека: того же размера, что в строках списков.
@@ -159,10 +161,59 @@ pub fn keep_plays(reports: Vec<Value>) {
     write_json(PLAYS, &Value::Array(list));
 }
 
+/// Откладывает отзыв волне, который не ушёл без сети.
+pub fn keep_feedback(session: &str, seeds: &[String], feedback: Value) {
+    let _guard = PLAYS_LOCK.lock().unwrap();
+    let mut list = read_json(FEEDBACKS).and_then(|v| v.as_array().cloned()).unwrap_or_default();
+    list.push(serde_json::json!({ "session": session, "seeds": seeds, "feedback": feedback }));
+    let extra = list.len().saturating_sub(PLAYS_LIMIT);
+    list.drain(..extra);
+    write_json(FEEDBACKS, &Value::Array(list));
+}
+
+/// Отзывы по сессиям в порядке, в каком они случились.
+fn group_feedbacks(list: &[Value]) -> Vec<(String, Vec<String>, Vec<Value>)> {
+    let mut sessions: Vec<(String, Vec<String>, Vec<Value>)> = Vec::new();
+    for item in list {
+        let Some(session) = item["session"].as_str() else { continue };
+        let seeds = item["seeds"].as_array().into_iter().flatten().filter_map(|seed| seed.as_str().map(str::to_string)).collect();
+        match sessions.iter_mut().find(|(known, _, _)| known == session) {
+            Some((_, _, feedbacks)) => feedbacks.push(item["feedback"].clone()),
+            None => sessions.push((session.to_string(), seeds, vec![item["feedback"].clone()])),
+        }
+    }
+    sessions
+}
+
+fn flush_feedbacks(token: &str) {
+    let list = {
+        let _guard = PLAYS_LOCK.lock().unwrap();
+        let list = read_json(FEEDBACKS).and_then(|v| v.as_array().cloned()).unwrap_or_default();
+        if !list.is_empty() {
+            let _ = fs::remove_file(api::data_dir().join(FEEDBACKS));
+        }
+        list
+    };
+    if list.is_empty() {
+        return;
+    }
+    if let Err(e) = api::wave_feedbacks(&group_feedbacks(&list), token) {
+        if api::network_error(&e) {
+            let _guard = PLAYS_LOCK.lock().unwrap();
+            let mut kept = read_json(FEEDBACKS).and_then(|v| v.as_array().cloned()).unwrap_or_default();
+            kept.splice(0..0, list);
+            write_json(FEEDBACKS, &Value::Array(kept));
+        } else {
+            eprintln!("отложенные отзывы волне не приняты: {e}");
+        }
+    }
+}
+
 /// Отправляет отложенные отчёты в фоне. Не дошли из-за сети — останутся до следующего раза;
 /// Яндекс отказал — выкидываются, иначе застрянут навсегда.
 pub fn flush_plays(token: String) {
     std::thread::spawn(move || {
+        flush_feedbacks(&token);
         let list = {
             let _guard = PLAYS_LOCK.lock().unwrap();
             let list = read_json(PLAYS).and_then(|v| v.as_array().cloned()).unwrap_or_default();
@@ -225,6 +276,15 @@ pub fn size_label(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feedbacks_group_by_session() {
+        let item = |session: &str, kind: &str| serde_json::json!({"session": session, "seeds": ["user:onyourwave"], "feedback": {"event": {"type": kind}}});
+        let groups = group_feedbacks(&[item("a", "trackStarted"), item("b", "radioStarted"), item("a", "skip")]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!((groups[0].0.as_str(), groups[0].2.len(), groups[0].1.as_slice()), ("a", 2, ["user:onyourwave".to_string()].as_slice()));
+        assert_eq!(groups[0].2[1]["event"]["type"], "skip");
+    }
 
     #[test]
     fn names_and_sizes_read_well() {
