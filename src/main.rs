@@ -6845,7 +6845,7 @@ impl App {
         let actions = actions.push(self.page_like(liked, Message::AlbumLike)).push(self.page_more());
         let links = artist_links(&album.artists, 16.0, ui::font(), ui::c().muted);
         let header = self.page_header("Альбом", playlist.title.clone(), format!("{ALBUM_COVER}{}", album.id), false, Some(links), about.join(" · "), actions);
-        self.view_list(Section::Playlists, Some(header))
+        self.view_list(Section::Playlists, Some(with_disclaimer(header, &album.disclaimer)))
     }
 
     /// Подкаст или аудиокнига: «Продолжить» с начатого выпуска, сезоны и порядок выпусков.
@@ -6928,7 +6928,8 @@ impl App {
         let liked = self.liked_artists.iter().any(|c| c.id == artist.id);
         let actions = actions.push(self.page_like(liked, Message::ArtistLike)).push(self.page_more());
         let block = |title| text(title).size(24).font(ui::font_headline()).color(ui::c().text);
-        let mut page = column![self.page_header("Исполнитель", artist.name.clone(), format!("{ARTIST_COVER}{}", artist.id), true, None, about, actions)].spacing(12).padding(Padding::ZERO.right(SCROLLBAR));
+        let header = self.page_header("Исполнитель", artist.name.clone(), format!("{ARTIST_COVER}{}", artist.id), true, None, about, actions);
+        let mut page = column![with_disclaimer(header, &artist.disclaimer)].spacing(12).padding(Padding::ZERO.right(SCROLLBAR));
         // Порядок блоков как в оригинале: новый релиз, популярное, знакомое, альбомы, плейлисты…
         if let Some(release) = &artist.release {
             let release = self.shelf("artist:release", "Новый релиз", None, 1, |_| self.album_cards(std::slice::from_ref(release), ALBUM_COVER, false, open_album));
@@ -9021,4 +9022,15 @@ mod tests {
         assert_eq!(one, [5]);
         shuffled::<u32>(&mut [], 0, 1);
     }
+}
+
+/// Предупреждения Яндекса под шапкой страницы, по строке на каждое.
+fn with_disclaimer<'a>(header: Element<'a, Message>, notices: &[String]) -> Element<'a, Message> {
+    if notices.is_empty() {
+        return header;
+    }
+    let lines = notices.iter().fold(column![].spacing(4).padding(Padding::ZERO.left(PAGE_HEADER_PAD)), |lines, notice| {
+        lines.push(row![ui::icon(ui::INFO, 14.0, ui::c().muted), text(notice.clone()).size(13).color(ui::c().muted)].spacing(6).align_y(iced::Alignment::Center))
+    });
+    column![header, lines].spacing(4).into()
 }

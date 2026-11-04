@@ -740,6 +740,8 @@ pub struct Album {
     pub title: String,
     /// Код жанра, например `rock`: по нему полка «Новые альбомы в жанре».
     pub genre: Option<String>,
+    /// Предупреждения под шапкой, например «Исполнитель признан иноагентом».
+    pub disclaimer: Vec<String>,
     pub year: Option<u64>,
     pub artists: Vec<(String, String)>,
     pub cover: Option<String>,
@@ -882,6 +884,8 @@ pub struct Artist {
     pub photos: Vec<String>,
     /// BandLink: «Плейлисты, где встречается» на других площадках.
     pub bandlink: Option<ArtistLink>,
+    /// Предупреждения под шапкой, например «Исполнитель признан иноагентом».
+    pub disclaimer: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -922,6 +926,7 @@ fn parse_album(v: &Value) -> Option<Album> {
         volumes: Vec::new(),
         version: v["version"].as_str().unwrap_or_default().trim().to_string(),
         genre: v["genre"].as_str().filter(|genre| !genre.is_empty()).map(str::to_string),
+        disclaimer: Vec::new(),
         labels: v["labels"].as_array().into_iter().flatten().filter_map(|label| Some((id_text(&label["id"]), label["name"].as_str().or(label.as_str())?.to_string()))).collect(),
         released: v["releaseDate"].as_str().and_then(release_date),
         versions: parse_cards(&v["duplicates"], version_card),
@@ -1000,6 +1005,7 @@ fn parse_artist(v: &Value) -> Option<Artist> {
         links: Vec::new(),
         familiar_collection: Vec::new(),
         familiar_wave: Vec::new(),
+        disclaimer: Vec::new(),
         release: v["lastReleases"].as_array().and_then(|list| list.first()).and_then(album_card),
         playlists: v["playlists"].as_array().into_iter().flatten().filter_map(parse_home_playlist).collect(),
         videos: v["videos"].as_array().into_iter().flatten().filter_map(|video| {
@@ -1052,6 +1058,7 @@ pub fn album(id: &str, token: &str) -> Result<(Album, Vec<Track>), String> {
         disks.iter_mut().for_each(|disk| disk.reverse());
     }
     let mut album = parse_album(v).ok_or("Яндекс не прислал альбом")?;
+    album.disclaimer = disclaimer("albums", id, &v["disclaimers"], token);
     album.volumes = disks.iter().map(Vec::len).filter(|&size| size > 0).collect();
     Ok((album, disks.into_iter().flatten().collect()))
 }
@@ -1059,6 +1066,7 @@ pub fn album(id: &str, token: &str) -> Result<(Album, Vec<Track>), String> {
 pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
     let v = get(&format!("artists/{id}/brief-info"), &[], token)?;
     let mut artist = parse_artist(result(&v)).ok_or_else(|| "Яндекс не прислал исполнителя".to_string())?;
+    artist.disclaimer = disclaimer("artists", id, &result(&v)["artist"]["disclaimers"], token);
     // Описание не главное: без него страница всё равно откроется.
     if let Ok(v) = get(&format!("artists/{id}/about-artist"), &[], token) {
         (artist.about, artist.links) = parse_about(result(&v));
@@ -1068,6 +1076,21 @@ pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
         (artist.familiar_collection, artist.familiar_wave) = parse_familiar(result(&v));
     }
     Ok(artist)
+}
+
+/// Тексты предупреждений: просим их, только если пометки есть кроме `explicit`.
+/// Ответ — объект вида `{"foreignAgent": {"title": "…"}}`, берём каждый заголовок.
+fn disclaimer(kind: &str, id: &str, marks: &Value, token: &str) -> Vec<String> {
+    let marked = marks.as_array().into_iter().flatten().any(|mark| mark.as_str().is_some_and(|mark| mark != "explicit"));
+    if !marked {
+        return Vec::new();
+    }
+    let Ok(v) = get(&format!("{kind}/{id}/disclaimer"), &[], token) else { return Vec::new() };
+    parse_disclaimer(result(&v))
+}
+
+fn parse_disclaimer(v: &Value) -> Vec<String> {
+    v.as_object().into_iter().flatten().filter_map(|(_, notice)| notice["title"].as_str()).map(str::trim).filter(|title| !title.is_empty()).map(str::to_string).collect()
 }
 
 /// Сколько знакомых треков просится в каждой части.
@@ -2291,6 +2314,12 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disclaimer_titles() {
+        let v = serde_json::json!({"foreignAgent": {"reason": "policy", "title": "ИСПОЛНИТЕЛЬ ПРИЗНАН ИНОАГЕНТОМ"}, "empty": {"title": " "}});
+        assert_eq!(parse_disclaimer(&v), vec!["ИСПОЛНИТЕЛЬ ПРИЗНАН ИНОАГЕНТОМ".to_string()]);
+    }
 
     #[test]
     fn listen_report_has_official_fields() {
