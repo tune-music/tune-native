@@ -502,15 +502,23 @@ fn short_date(stamp: &str) -> Option<String> {
 /// Номера треков из «Мне нравится», сначала новые.
 pub fn liked_ids(uid: &str, token: &str) -> Result<Vec<String>, String> {
     let v = get(&format!("users/{uid}/likes/tracks"), &[], token)?;
-    let tracks = result(&v)["library"]["tracks"].as_array().cloned().unwrap_or_default();
-    Ok(tracks
-        .iter()
-        .filter_map(|t| match &t["id"] {
-            Value::String(s) => Some(s.clone()),
-            Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        })
-        .collect())
+    Ok(parse_liked_ids(result(&v)))
+}
+
+fn parse_liked_ids(v: &Value) -> Vec<String> {
+    v["library"]["tracks"].as_array().into_iter().flatten().filter_map(|t| id_text(&t["id"])).collect()
+}
+
+/// Изменились ли «Мне нравится» с ревизии `revision`, например на другом устройстве.
+/// Без изменений Яндекс отвечает коротким `no-updates`, поэтому проверять можно часто.
+pub fn likes_since(uid: &str, revision: u64, token: &str) -> Result<Option<(Vec<String>, u64)>, String> {
+    let since = revision.to_string();
+    let v = get(&format!("users/{uid}/likes/tracks"), &[("if-modified-since-revision", &since)], token)?;
+    let v = result(&v);
+    if v.as_str() == Some("no-updates") {
+        return Ok(None);
+    }
+    Ok(Some((parse_liked_ids(v), v["library"]["revision"].as_u64().unwrap_or(revision))))
 }
 
 /// Сведения о треках в том же порядке, что и номера.
@@ -2352,6 +2360,12 @@ pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn liked_ids_parse() {
+        let v = serde_json::json!({"library": {"revision": 5, "tracks": [{"id": "1", "albumId": "2"}, {"id": 3}]}});
+        assert_eq!(parse_liked_ids(&v), vec!["1".to_string(), "3".to_string()]);
+    }
 
     #[test]
     fn upcoming_release_card() {

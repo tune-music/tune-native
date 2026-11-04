@@ -240,6 +240,10 @@ const EXPLICIT_RESERVE: f32 = 22.0;
 const PLUS_RESERVE: f32 = 46.0;
 /// Как часто без сети проверять, не вернулась ли она.
 const ONLINE_CHECK: Duration = Duration::from_secs(10);
+/// Как часто сверять «Мне нравится» с Яндексом: лайки с других устройств.
+const SYNC_EVERY: Duration = Duration::from_secs(30);
+/// Альбомы, исполнители и плейлисты ревизий не знают: их перечитываем реже, раз в столько сверок.
+const SYNC_PAGES_EVERY: u32 = 10;
 /// Место под «123 трека» после названия плейлиста.
 const PLAYLIST_COUNT_RESERVE: f32 = 110.0;
 /// Ширина колонки времени: у музыки «03:25», у выпусков «осталось 1:47:20».
@@ -684,6 +688,11 @@ struct App {
     liked_ids: Vec<String>,
     liked_set: HashSet<String>,
     disliked: HashSet<String>,
+    /// Ревизия «Мне нравится» у Яндекса; 0 — ещё не сверяли.
+    likes_revision: u64,
+    /// Сколько раз лайкали здесь: сверка, начатая до лайка, его не откатит.
+    likes_edits: u64,
+    sync_ticks: u32,
     /// Открытое меню трека и где его показать.
     menu: Option<(Track, f32, f32)>,
     /// В меню трека открыт список его исполнителей.
@@ -1063,6 +1072,10 @@ enum Message {
     AiLessSet(bool),
     AiLessSaved(Result<(), String>),
     PinsLoaded(Result<Vec<Pin>, String>),
+    /// Пора сверить коллекцию с Яндексом.
+    SyncTick,
+    /// Ответ сверки: число лайков здесь на момент запроса и новые номера с ревизией, если что-то менялось.
+    LikesSynced(u64, Result<Option<(Vec<String>, u64)>, String>),
     PlaylistLoaded(String, Result<Vec<Track>, String>),
     SimilarLoaded(String, Result<Vec<HomeItem>, String>),
     LinkTrack(Result<Vec<Track>, String>),
@@ -1236,6 +1249,9 @@ impl App {
             liked_ids: Vec::new(),
             liked_set: HashSet::new(),
             disliked: HashSet::new(),
+            likes_revision: 0,
+            likes_edits: 0,
+            sync_ticks: 0,
             menu: None,
             menu_artists: false,
             menu_lists: false,
@@ -2670,6 +2686,7 @@ impl App {
     }
 
     fn apply_like(&mut self, track: &Track, liked: bool) {
+        self.likes_edits += 1;
         if liked {
             self.liked_set.insert(track.id.clone());
             self.liked_ids.insert(0, track.id.clone());
@@ -3422,6 +3439,37 @@ impl App {
                 return Task::batch([opened, downloads]);
             }
             Message::Account(Err(e)) => return self.fail_retry(e, Message::AccountRetry),
+            Message::SyncTick => {
+                let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
+                self.sync_ticks += 1;
+                let pages = if self.sync_ticks % SYNC_PAGES_EVERY == 0 { self.liked_pages_load() } else { Task::none() };
+                let (revision, edits) = (self.likes_revision, self.likes_edits);
+                let likes = Task::perform(background(move || api::likes_since(&uid, revision, &token)), move |r| Message::LikesSynced(edits, r));
+                return Task::batch([pages, likes]);
+            }
+            Message::LikesSynced(edits, Ok(Some((ids, revision)))) => {
+                // Пока сверяли, лайкнули здесь или грузится страница списка: подождём следующей сверки.
+                if edits != self.likes_edits || self.likes_loading {
+                    return Task::none();
+                }
+                self.likes_revision = revision;
+                if ids == self.liked_ids {
+                    return Task::none();
+                }
+                if let Some(profile) = &self.profile {
+                    offline::save_account(profile, &ids, &self.disliked.iter().cloned().collect::<Vec<_>>());
+                }
+                self.liked_set = ids.iter().cloned().collect();
+                self.liked_ids = ids;
+                // Загруженный список «Мне нравится» собираем заново, с первой страницы.
+                if !self.liked.is_empty() || self.section == Section::Likes {
+                    self.liked.clear();
+                    self.likes_from = 0;
+                    return self.likes_more();
+                }
+            }
+            Message::LikesSynced(_, Ok(None)) => {}
+            Message::LikesSynced(_, Err(e)) => eprintln!("сверка лайков не удалась: {e}"),
             Message::OnlineCheck => {
                 let Some(token) = self.token().filter(|_| self.offline && !self.online_checking) else { return Task::none() };
                 self.online_checking = true;
@@ -5201,8 +5249,12 @@ impl App {
         };
         let frames = if self.animating() { window::frames().map(Message::Frame) } else { Subscription::none() };
         let online = if self.offline { time::every(ONLINE_CHECK).map(|_| Message::OnlineCheck) } else { Subscription::none() };
+        let sync = match &self.screen {
+            Screen::Main(_) if !self.offline && self.uid.is_some() => time::every(SYNC_EVERY).map(|_| Message::SyncTick),
+            _ => Subscription::none(),
+        };
         let look = if self.look == Look::System { time::every(SYSTEM_LOOK_CHECK).map(|_| Message::SystemLookCheck) } else { Subscription::none() };
-        Subscription::batch([ticks, frames, online, look]).pipe_media()
+        Subscription::batch([ticks, frames, online, look, sync]).pipe_media()
     }
 
     fn view(&self) -> Element<'_, Message> {
