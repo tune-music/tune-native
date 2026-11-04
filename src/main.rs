@@ -263,6 +263,9 @@ const PAGE_HEADER_PAD: f32 = 20.0;
 const PAGE_COVER: f32 = PAGE_HEADER - PAGE_HEADER_PAD * 2.0;
 const ALBUM_COVER: &str = "album:";
 const ARTIST_COVER: &str = "artist:";
+/// Обложки клипов и фотографии исполнителя.
+const VIDEO_COVER: &str = "video:";
+const PHOTO_COVER: &str = "photo:";
 /// За сколько до конца трека начать качать следующий.
 const PRELOAD_BEFORE: Duration = Duration::from_secs(30);
 /// Выпуски и книги: шаг кнопок перемотки, как часто место уходит Яндексу, и границы,
@@ -3896,7 +3899,11 @@ impl App {
                         let albums = artist.albums.iter().chain(&artist.also).filter_map(|c| Some((format!("{ALBUM_COVER}{}", c.id), c.cover.clone()?)));
                         let artists = artist.similar.iter().filter_map(|c| Some((format!("{ARTIST_COVER}{}", c.id), c.cover.clone()?)));
                         let main = artist.cover.clone().map(|uri| (format!("{ARTIST_COVER}{}", artist.id), uri));
-                        let jobs = main.into_iter().chain(artists).chain(albums).collect();
+                        let release = artist.release.iter().filter_map(|c| Some((format!("{ALBUM_COVER}{}", c.id), c.cover.clone()?)));
+                        let lists = artist.playlists.iter().filter_map(|item| Some((home_item_key(item), home_item_cover(item)?)));
+                        let videos = artist.videos.iter().filter_map(|video| Some((format!("{VIDEO_COVER}{}", video.id), video.cover.clone()?)));
+                        let photos = artist.photos.iter().enumerate().map(|(at, uri)| (format!("{PHOTO_COVER}{}:{at}", artist.id), uri.clone()));
+                        let jobs = main.into_iter().chain(artists).chain(albums).chain(release).chain(lists).chain(videos).chain(photos).collect();
                         self.familiar_wave = artist.familiar_collection.is_empty();
                         self.artist = Some(artist);
                         let covers = Task::batch([self.fetch_cover_jobs(jobs, "300x300"), self.artist_familiar_covers()]);
@@ -6922,6 +6929,11 @@ impl App {
         let actions = actions.push(self.page_like(liked, Message::ArtistLike)).push(self.page_more());
         let block = |title| text(title).size(24).font(ui::font_headline()).color(ui::c().text);
         let mut page = column![self.page_header("Исполнитель", artist.name.clone(), format!("{ARTIST_COVER}{}", artist.id), true, None, about, actions)].spacing(12).padding(Padding::ZERO.right(SCROLLBAR));
+        // Порядок блоков как в оригинале: новый релиз, популярное, знакомое, альбомы, плейлисты…
+        if let Some(release) = &artist.release {
+            let release = self.shelf("artist:release", "Новый релиз", None, 1, |_| self.album_cards(std::slice::from_ref(release), ALBUM_COVER, false, open_album));
+            page = page.push(release);
+        }
         if !artist.popular.is_empty() {
             page = page.push(block("Популярные треки"));
             page = page.push(artist.popular.iter().enumerate().fold(column![], |list, (index, track)| list.push(self.view_track(Section::Artist, index, track))));
@@ -6944,6 +6956,14 @@ impl App {
             let albums = self.shelf("artist:albums", "Альбомы", Some(Message::DiscographyOpen(false)), artist.albums.len(), |shown| self.album_cards(&artist.albums[shown], ALBUM_COVER, false, open_album));
             page = page.push(Space::new().height(8)).push(albums);
         }
+        if !artist.playlists.is_empty() {
+            let lists = self.shelf("artist:playlists", "Плейлисты", None, artist.playlists.len(), |shown| self.home_cards(&artist.playlists[shown]));
+            page = page.push(Space::new().height(8)).push(lists);
+        }
+        if let Some(link) = &artist.bandlink {
+            let label = column![text(&link.title).color(ui::c().text), text(&link.subtitle).size(12).color(ui::c().muted)];
+            page = page.push(shine(button(label).padding([8, 16]).style(ui::secondary).on_press(Message::OpenUrl(link.url.clone())), 20.0));
+        }
         if !artist.also.is_empty() {
             let also = self.shelf("artist:also", "Сборники", Some(Message::DiscographyOpen(true)), artist.also.len(), |shown| self.album_cards(&artist.also[shown], ALBUM_COVER, false, open_album));
             page = page.push(Space::new().height(8)).push(also);
@@ -6952,6 +6972,22 @@ impl App {
             let all = self.more_than_row(artist.similar.len(), Message::ShowAll(Shelf::Similar));
             let similar = self.shelf("artist:similar", "Похожие исполнители", all, artist.similar.len(), |shown| self.album_cards(&artist.similar[shown], ARTIST_COVER, true, open_artist));
             page = page.push(Space::new().height(8)).push(similar);
+        }
+        // Клипы открываются в браузере: видео плеер приложения не показывает.
+        if !artist.videos.is_empty() {
+            let videos = self.shelf("artist:videos", "Клипы", None, artist.videos.len(), |shown| {
+                artist.videos[shown].iter().map(|video| self.card(&format!("{VIDEO_COVER}{}", video.id), false, None, video.title.clone(), "Клип".to_string(), Message::OpenUrl(video.url.clone()))).collect()
+            });
+            page = page.push(Space::new().height(8)).push(videos);
+        }
+        if !artist.photos.is_empty() {
+            let photos = self.shelf("artist:photos", "Фото", None, artist.photos.len(), |shown| {
+                shown.map(|at| {
+                    let full = format!("https://{}", artist.photos[at].replace("%%", "orig"));
+                    self.card(&format!("{PHOTO_COVER}{}:{at}", artist.id), false, None, String::new(), String::new(), Message::OpenUrl(full))
+                }).collect()
+            });
+            page = page.push(Space::new().height(8)).push(photos);
         }
         if !artist.about.is_empty() || !artist.links.is_empty() {
             page = page.push(Space::new().height(8)).push(block("Об исполнителе"));

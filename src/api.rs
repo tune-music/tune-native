@@ -872,6 +872,24 @@ pub struct Artist {
     /// «Знакомо вам»: его треки в коллекции и те, что звучали в Моей волне.
     pub familiar_collection: Vec<Track>,
     pub familiar_wave: Vec<Track>,
+    /// «Новый релиз»: последний альбом или сингл.
+    pub release: Option<Card>,
+    /// Плейлисты исполнителя: «Лучшее», «В стиле».
+    pub playlists: Vec<HomeItem>,
+    /// Клипы: название, обложка и адрес плеера Яндекса.
+    pub videos: Vec<Video>,
+    /// Фотографии исполнителя.
+    pub photos: Vec<String>,
+    /// BandLink: «Плейлисты, где встречается» на других площадках.
+    pub bandlink: Option<ArtistLink>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Video {
+    pub id: String,
+    pub title: String,
+    pub cover: Option<String>,
+    pub url: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -982,6 +1000,22 @@ fn parse_artist(v: &Value) -> Option<Artist> {
         links: Vec::new(),
         familiar_collection: Vec::new(),
         familiar_wave: Vec::new(),
+        release: v["lastReleases"].as_array().and_then(|list| list.first()).and_then(album_card),
+        playlists: v["playlists"].as_array().into_iter().flatten().filter_map(parse_home_playlist).collect(),
+        videos: v["videos"].as_array().into_iter().flatten().filter_map(|video| {
+            let url = video["embedUrl"].as_str().filter(|url| url.starts_with("https://"))?;
+            Some(Video {
+                id: video["providerVideoId"].as_str().unwrap_or(url).to_string(),
+                title: video["title"].as_str()?.to_string(),
+                cover: video["cover"].as_str().map(|uri| uri.trim_start_matches("https://").to_string()),
+                url: url.to_string(),
+            })
+        }).collect(),
+        photos: v["allCovers"].as_array().into_iter().flatten().filter_map(|cover| cover["uri"].as_str().map(str::to_string)).collect(),
+        bandlink: Some(&v["bandlinkScannerLink"]).filter(|link| link.is_object()).and_then(|link| {
+            let url = link["url"].as_str().filter(|url| url.starts_with("https://"))?;
+            Some(ArtistLink { title: link["title"].as_str()?.to_string(), subtitle: "BandLink".to_string(), url: url.to_string() })
+        }),
     })
 }
 
