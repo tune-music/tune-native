@@ -77,10 +77,11 @@ pub struct Reveal<'a> {
     origin: (f32, f32),
     veil: Color,
     inert: bool,
+    clip: bool,
 }
 
 pub fn reveal<'a>(content: impl Into<Element<'a, Message>>) -> Reveal<'a> {
-    Reveal { content: content.into(), shift: Vector::ZERO, scale: 1.0, origin: (0.5, 0.5), veil: Color::TRANSPARENT, inert: false }
+    Reveal { content: content.into(), shift: Vector::ZERO, scale: 1.0, origin: (0.5, 0.5), veil: Color::TRANSPARENT, inert: false, clip: false }
 }
 
 impl<'a> Reveal<'a> {
@@ -97,6 +98,12 @@ impl<'a> Reveal<'a> {
 
     pub fn veil(mut self, veil: Color) -> Self {
         self.veil = veil;
+        self
+    }
+
+    /// Всё, что содержимое рисует, обрезается по его месту, даже сдвинутое и увеличенное.
+    pub fn clip(mut self) -> Self {
+        self.clip = true;
         self
     }
 
@@ -143,6 +150,21 @@ impl Widget<Message, Theme, Renderer> for Reveal<'_> {
 
     fn draw(&self, tree: &Tree, renderer: &mut Renderer, theme: &Theme, style: &renderer::Style, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle) {
         let bounds = layout.bounds();
+        if self.clip {
+            renderer.with_layer(bounds, |renderer| self.draw_moved(tree, renderer, theme, style, layout, cursor, viewport));
+        } else {
+            self.draw_moved(tree, renderer, theme, style, layout, cursor, viewport);
+        }
+    }
+
+    fn overlay<'b>(&'b mut self, tree: &'b mut Tree, layout: Layout<'b>, renderer: &Renderer, viewport: &Rectangle, translation: Vector) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(&mut tree.children[0], layout, renderer, viewport, translation)
+    }
+}
+
+impl Reveal<'_> {
+    fn draw_moved(&self, tree: &Tree, renderer: &mut Renderer, theme: &Theme, style: &renderer::Style, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle) {
+        let bounds = layout.bounds();
         if self.shift == Vector::ZERO && self.scale == 1.0 {
             self.content.as_widget().draw(&tree.children[0], renderer, theme, style, layout, cursor, viewport);
         } else {
@@ -156,10 +178,6 @@ impl Widget<Message, Theme, Renderer> for Reveal<'_> {
                 renderer.fill_quad(renderer::Quad { bounds, ..renderer::Quad::default() }, self.veil);
             });
         }
-    }
-
-    fn overlay<'b>(&'b mut self, tree: &'b mut Tree, layout: Layout<'b>, renderer: &Renderer, viewport: &Rectangle, translation: Vector) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        self.content.as_widget_mut().overlay(&mut tree.children[0], layout, renderer, viewport, translation)
     }
 }
 

@@ -633,6 +633,8 @@ struct Place {
 enum Preview {
     /// Волна с раскрытым колесом.
     WaveWheel,
+    /// Колесо застыло на полпути: видно, где обрезается движение.
+    WaveWheelHalf,
     /// Волна на треке с карточкой «Слов в волне» и открытым рассказом.
     WaveWords,
     /// Мастер первого запуска поверх главной, без отправки.
@@ -2193,7 +2195,8 @@ impl App {
 
     /// Просит карточки «Слов в волне» к ближайшим трекам волны, как оригинал.
     fn words_load(&mut self, from: usize) -> Task<Message> {
-        if !self.wave_queue || self.offline || !self.words_on {
+        // Карточки есть у любых треков каталога, не только у волны; у своих загруженных их нет.
+        if self.offline || !self.words_on {
             return Task::none();
         }
         let Some(token) = self.token() else { return Task::none() };
@@ -2213,7 +2216,7 @@ impl App {
         if !self.words_on {
             return None;
         }
-        let track = self.current_track().filter(|_| self.wave_queue)?;
+        let track = self.current_track()?;
         let card = self.words.get(&track.id)?;
         // Карточка проявляется на месте, которое для неё уже оставлено.
         let a = smooth_step(if self.word_for.as_ref() == Some(&card.id) { self.word_level } else { 0.0 });
@@ -2267,7 +2270,7 @@ impl App {
 
     /// Номер карточки играющего трека, если она должна быть видна.
     fn word_now(&self) -> Option<String> {
-        let track = self.current_track().filter(|_| self.words_on && self.wave_queue)?;
+        let track = self.current_track().filter(|_| self.words_on)?;
         self.words.get(&track.id).map(|card| card.id.clone())
     }
 
@@ -2794,7 +2797,7 @@ impl App {
         }
         // Карточка трека видна на экране волны: Яндексу скажем, что её уже показали.
         self.word_open = None;
-        if let Some(card) = self.words.get(&track.id).filter(|_| self.wave_queue) {
+        if let Some(card) = self.words.get(&track.id) {
             if !self.words_viewed.contains(&card.id) {
                 self.words_viewed.push(card.id.clone());
             }
@@ -3306,7 +3309,7 @@ impl App {
                 self.word_level = (self.word_level + elapsed / APPEAR).min(1.0);
             }
             let reveal = if self.wheel_open { 1.0 } else { 0.0 };
-            if self.wheel_reveal != reveal {
+            if self.wheel_reveal != reveal && !matches!(self.preview, Some(Preview::WaveWheelHalf)) {
                 let step = elapsed / wheel::REVEAL;
                 self.wheel_reveal = if reveal > self.wheel_reveal { (self.wheel_reveal + step).min(1.0) } else { (self.wheel_reveal - step).max(0.0) };
             }
@@ -3538,7 +3541,7 @@ impl App {
                 let words = self.words_load(self.current.unwrap_or(0));
                 let pins = Task::batch([pins, avatar, self.liked_pages_load(), wizard, self.wheel_load(), words]);
                 let page = match self.preview.clone() {
-                    Some(Preview::Wave | Preview::WaveSeek | Preview::WaveWords | Preview::WaveWheel) => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
+                    Some(Preview::Wave | Preview::WaveSeek | Preview::WaveWords | Preview::WaveWheel | Preview::WaveWheelHalf) => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
                     Some(Preview::Lyrics) => self.wave_load(vec!["artist:3121".to_string()], None, false),
                     Some(Preview::WaveTune) => {
                         self.preview = None;
@@ -4773,6 +4776,10 @@ impl App {
                         self.wheel_turn = start;
                         self.wheel_target = start;
                         self.wheel = Some((id, items));
+                        if matches!(self.preview, Some(Preview::WaveWheelHalf)) {
+                            self.wheel_open = true;
+                            self.wheel_reveal = 0.5;
+                        }
                         if matches!(self.preview, Some(Preview::WaveWheel)) {
                             self.preview = None;
                             self.wheel_open = true;
@@ -4922,7 +4929,7 @@ impl App {
                         return self.notify("Для этой волны у Яндекса нет треков".to_string());
                     }
                     // Пока грузилась фоновая волна, пользователь мог включить свой список.
-                    Ok(_) if !autoplay && self.current.is_some() && !matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded | Preview::Lyrics | Preview::WaveWords | Preview::WaveWheel)) => {}
+                    Ok(_) if !autoplay && self.current.is_some() && !matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded | Preview::Lyrics | Preview::WaveWords | Preview::WaveWheel | Preview::WaveWheelHalf)) => {}
                     Ok(wave) => {
                         if let Some(p) = &self.player {
                             p.stop();
@@ -7041,7 +7048,7 @@ impl App {
         // Место под карточку оставлено заранее, даже пока её нет: страница не прыгает.
         let body = match self.view_word() {
             Some(word) => body.push(Space::new().height(20)).push(word),
-            None if self.words_on && self.wave_queue => body.push(Space::new().height(20.0 + WORD_SLOT)),
+            None if self.words_on && self.current_track().is_some_and(|track| !track.ugc) => body.push(Space::new().height(20.0 + WORD_SLOT)),
             None => body,
         };
         // Не влезает в окно — экран прокручивается, а не сжимает карточки; влезает — стоит посередине.
@@ -7058,7 +7065,8 @@ impl App {
         // Колесо спускается сверху, страница волны уходит вниз.
         let page = reveal(page).shift(0.0, shown * height).scale(1.0 - 0.1 * shown, 0.5, 1.0).inert(shown > 0.0);
         let wheel = reveal(self.view_wheel()).shift(0.0, -(1.0 - shown) * height * 0.7).scale(0.9 + 0.1 * shown, 0.5, 0.5).inert(shown < 1.0);
-        container(stack![page, wheel]).width(Length::Fill).height(Length::Fill).clip(true).into()
+        // Обрезка слоем: страница и колесо при движении не заходят на плеер и боковую панель.
+        reveal(container(stack![page, wheel]).width(Length::Fill).height(Length::Fill)).clip().into()
     }
 
     /// Большой плеер на всё окно: обложка, название, перемотка и кнопки.
@@ -9996,6 +10004,7 @@ fn main() -> iced::Result {
             "wave" => Preview::Wave,
             "wave-words" => Preview::WaveWords,
             "wave-wheel" => Preview::WaveWheel,
+            "wave-wheel-half" => Preview::WaveWheelHalf,
             "home" => Preview::Home,
             "home-trends" => Preview::HomeTrends,
             "history" => Preview::History,
