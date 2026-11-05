@@ -175,6 +175,9 @@ const WHEEL_SEEN: usize = 8;
 const WHEEL_LABEL: f32 = 320.0;
 /// Обложки подсказок колеса.
 const WHEEL_COVER: &str = "wheel:";
+/// Размытые обложки подсказок колеса и сила размытия.
+const WHEEL_BLUR: &str = "wheel-blur:";
+const WHEEL_BLUR_SIGMA: f32 = 7.0;
 /// К скольким трекам волны вперёд просить карточки «Слов в волне».
 const WORDS_AHEAD: usize = 10;
 /// Ширина карточки «Слов в волне» и высота рассказа, дальше он прокручивается.
@@ -620,6 +623,8 @@ struct Place {
 /// Запуск с готовым разделом: первый трек показывается в плеере, но не играет.
 #[derive(Clone)]
 enum Preview {
+    /// Волна с раскрытым колесом.
+    WaveWheel,
     /// Волна на треке с карточкой «Слов в волне» и открытым рассказом.
     WaveWords,
     /// Мастер первого запуска поверх главной, без отправки.
@@ -933,6 +938,9 @@ struct App {
     wheel_target: f32,
     /// Показывать ли колесо волны.
     wheel_on: bool,
+    /// Раскрыто ли колесо и насколько оно уже выехало, от 0 до 1.
+    wheel_open: bool,
+    wheel_reveal: f32,
     /// «Слова в волне»: карточка к треку по его номеру.
     words: HashMap<String, api::WordCard>,
     /// Треки, о карточках которых уже спросили.
@@ -1182,6 +1190,8 @@ enum Message {
     /// Повернуть колесо на столько шагов.
     WheelSpin(f32),
     WheelToggle,
+    /// Раскрыть колесо или вернуться к волне.
+    WheelShow(bool),
     /// Открыть или свернуть рассказ к карточке трека.
     WordOpen(String),
     WordBigLoaded(String, Result<api::WordBig, String>),
@@ -1501,6 +1511,8 @@ impl App {
             wheel_turn: 0.0,
             wheel_target: 0.0,
             wheel_on: saved.wheel,
+            wheel_open: false,
+            wheel_reveal: 0.0,
             words: HashMap::new(),
             words_asked: HashSet::new(),
             words_viewed: Vec::new(),
@@ -1601,7 +1613,7 @@ impl App {
     }
 
     fn animating(&self) -> bool {
-        self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.eq_fade.busy() || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy() || self.wheel_turn != self.wheel_target
+        self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.eq_fade.busy() || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy() || self.wheel_turn != self.wheel_target || self.wheel_reveal != if self.wheel_open { 1.0 } else { 0.0 }
     }
 
     /// Сколько места занимает основная часть окна.
@@ -2080,62 +2092,70 @@ impl App {
         Task::perform(background(move || api::wheel(&seeds, &feedbacks, &token)), move |r| Message::WheelLoaded(key.clone(), r))
     }
 
-    /// Колесо волны: кольцо подсказок, уходящее вглубь, со следом на «полу» и подписью ближней.
-    fn view_wheel(&self) -> Option<Element<'_, Message>> {
-        if !self.wheel_on || self.wheel.as_ref().is_none_or(|(_, items)| items.is_empty()) {
-            return None;
-        }
-        let layer = responsive(move |size| self.wheel_layer(size.width));
-        Some(container(layer).width(Length::Fill).height(wheel::AREA).into())
+    /// Есть ли что показать в колесе.
+    fn wheel_ready(&self) -> bool {
+        self.wheel_on && self.wheel.as_ref().is_some_and(|(_, items)| !items.is_empty())
     }
 
-    fn wheel_layer(&self, width: f32) -> Element<'_, Message> {
+    /// Экран колеса: подсказки в ряд, подпись ближней и стрелка назад к волне.
+    fn view_wheel(&self) -> Element<'_, Message> {
+        responsive(move |size| self.wheel_layer(size.width, size.height)).into()
+    }
+
+    fn wheel_layer(&self, width: f32, height: f32) -> Element<'_, Message> {
         let Some((_, items)) = self.wheel.as_ref().filter(|(_, items)| !items.is_empty()) else { return Space::new().into() };
         let count = items.len();
         let turn = self.wheel_turn;
         let front = (turn.round() as i64).rem_euclid(count as i64) as usize;
-        // Пока колесо крутится, подпись и отсвет приглушены: ближняя ещё не встала на место.
+        // Пока колесо крутится, подпись приглушена: ближняя ещё не встала на место.
         let settled = (1.0 - 2.0 * (turn - turn.round()).abs()).clamp(0.0, 1.0);
-        let tint = |item: &api::WheelItem| item.color.as_deref().and_then(ui::hex_color).unwrap_or(ui::c().accent);
-        let floor = canvas(wheel::Floor { glow: tint(&items[front]), settled }).width(Length::Fill).height(Length::Fill);
-        let mut layer = stack![floor];
+        let middle = (height * 0.42).max(wheel::FRONT / 2.0 + 70.0);
+        let mut layer = stack![Space::new().width(Length::Fill).height(Length::Fill)];
         let mut order: Vec<(usize, wheel::Spot)> = (0..count).map(|at| (at, wheel::spot(wheel::offset(at, turn, count), width))).filter(|(_, spot)| spot.shown > 0.0).collect();
-        // Дальние рисуются первыми: ближние закрывают их.
-        order.sort_by(|a, b| a.1.depth.total_cmp(&b.1.depth));
+        // Дальние рисуются первыми: ближние ложатся поверх.
+        order.sort_by(|a, b| a.1.near.total_cmp(&b.1.near));
         for (at, spot) in order {
             let item = &items[at];
             let side = spot.side;
-            let near = spot.depth.powf(1.4);
-            let alpha = (0.22 + 0.78 * near) * spot.shown;
+            let radius = side / 2.0;
             let playing = self.wave_queue && matches!(&item.action, api::WheelAction::Wave(seeds) if *seeds == self.wave_base);
-            let picture: Element<'_, Message> = match self.covers.get(&format!("{WHEEL_COVER}{}", item.id)) {
-                Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle) * alpha).width(side).height(side).border_radius(side / 2.0).into(),
-                None => Space::new().width(side).height(side).into(),
-            };
-            let back = tint(item).scale_alpha(alpha);
-            // Ближняя светится своим цветом; в lite-версии без свечения.
-            let glow = if self.lite { iced::Color::TRANSPARENT } else { iced::Color { a: 0.7 * spot.depth.powf(8.0) * settled.max(0.3), ..tint(item) } };
+            let back = item.color.as_deref().and_then(ui::hex_color).unwrap_or(ui::c().tile);
+            let sharp = self.covers.get(&format!("{WHEEL_COVER}{}", item.id));
+            let blurred = self.covers.get(&format!("{WHEEL_BLUR}{}", item.id));
+            let fade = sharp.map_or(0.0, |handle| self.cover_alpha(handle)) * spot.shown;
+            // Чёткая и размытая обложки смешиваются: к краям полосы остаётся одна размытая.
+            let mut disc = stack![container(Space::new().width(side).height(side)).style(move |_| container::Style::default().background(back.scale_alpha(spot.shown)).border(iced::border::rounded(radius)))];
+            if let Some(handle) = sharp {
+                disc = disc.push(image(handle.clone()).opacity(fade * (1.0 - spot.blur * blurred.map_or(0.0, |_| 1.0))).width(side).height(side).border_radius(radius));
+            }
+            if let Some(handle) = blurred.filter(|_| spot.blur > 0.0) {
+                disc = disc.push(image(handle.clone()).opacity(fade * spot.blur).width(side).height(side).border_radius(radius));
+            }
+            let shade = iced::Color::BLACK.scale_alpha(spot.dark * spot.shown);
+            disc = disc.push(container(Space::new().width(side).height(side)).style(move |_| container::Style::default().background(shade).border(iced::border::rounded(radius))));
             let ring = if playing { ui::c().accent } else { iced::Color::TRANSPARENT };
-            let disc = container(picture).width(side).height(side).style(move |_| container::Style {
-                background: Some(back.into()),
-                border: iced::Border { color: ring, width: if playing { 3.0 } else { 0.0 }, radius: (side / 2.0).into() },
-                shadow: iced::Shadow { color: glow, offset: iced::Vector::new(0.0, 6.0 * spot.depth), blur_radius: 48.0 * spot.depth.powf(2.0) },
+            // Ближняя приподнята мягкой тенью; в lite-версии без неё.
+            let lift = if self.lite { iced::Color::TRANSPARENT } else { iced::Color::BLACK.scale_alpha(0.55 * spot.near * spot.near) };
+            let disc = container(disc).style(move |_| container::Style {
+                border: iced::Border { color: ring, width: if playing { 3.0 } else { 0.0 }, radius: radius.into() },
+                shadow: iced::Shadow { color: lift, offset: iced::Vector::new(0.0, 14.0 * spot.near), blur_radius: 40.0 * spot.near },
                 ..container::Style::default()
             });
             let disc = button(disc).padding(0).style(ui::bare).on_press(Message::WheelPick(at));
-            layer = layer.push(pin(disc).x(spot.x - side / 2.0).y(spot.y - side / 2.0));
+            layer = layer.push(pin(disc).x(spot.x - radius).y(middle - radius));
         }
         let item = &items[front];
-        let mut label = column![text(item.title.as_str()).size(18).font(ui::font_medium()).color(ui::c().strong.scale_alpha(settled)).width(WHEEL_LABEL).align_x(Alignment::Center).wrapping(Wrapping::WordOrGlyph)].spacing(2).align_x(Alignment::Center);
+        let mut label = column![text(item.title.as_str()).size(22).font(ui::font_medium()).color(ui::c().strong.scale_alpha(settled)).width(WHEEL_LABEL).align_x(Alignment::Center).wrapping(Wrapping::WordOrGlyph)].spacing(4).align_x(Alignment::Center);
         if !item.subtitle.is_empty() {
-            label = label.push(text(item.subtitle.as_str()).size(12).color(ui::c().muted.scale_alpha(settled)).width(WHEEL_LABEL).align_x(Alignment::Center));
+            label = label.push(text(item.subtitle.as_str()).size(13).color(ui::c().muted.scale_alpha(settled)).width(WHEEL_LABEL).align_x(Alignment::Center));
         }
-        layer = layer.push(pin(label).x(width / 2.0 - WHEEL_LABEL / 2.0).y(wheel::front_bottom() + 12.0));
+        layer = layer.push(pin(label).x(width / 2.0 - WHEEL_LABEL / 2.0).y(middle + wheel::FRONT / 2.0 + 22.0));
         let arrow = |icon, step: f32| shine(button(container(ui::icon(icon, 20.0, ui::c().text)).center(20)).padding(9).style(ui::secondary).on_press(Message::WheelSpin(step)), 20.0);
-        let reach = wheel::radius_x(width) + wheel::FRONT * 0.5;
-        let y = wheel::front_bottom() - wheel::FRONT * 0.5 - 19.0;
-        layer = layer.push(pin(arrow(ui::LEFT, -1.0)).x((width / 2.0 - reach - 56.0).max(0.0)).y(y));
-        layer = layer.push(pin(arrow(ui::RIGHT, 1.0)).x((width / 2.0 + reach + 18.0).min(width - 40.0)).y(y));
+        layer = layer.push(pin(arrow(ui::LEFT, -1.0)).x(12.0).y(middle - 19.0));
+        layer = layer.push(pin(arrow(ui::RIGHT, 1.0)).x(width - 50.0).y(middle - 19.0));
+        // Назад к волне — той же стрелкой вверху, что и раскрыла колесо.
+        let back = shine(button(row![ui::icon(ui::UP, 18.0, ui::c().text), text("Моя волна").size(14).color(ui::c().text)].spacing(6).align_y(Alignment::Center)).padding([7, 16]).style(ui::secondary).on_press(Message::WheelShow(false)), 20.0);
+        layer = layer.push(pin(back).x(width / 2.0 - 64.0).y(16.0));
         mouse_area(layer)
             .on_scroll(|delta| {
                 let y = match delta {
@@ -2185,8 +2205,7 @@ impl App {
                 let story = scrollable(container(text(&big.text).size(15).line_height(1.45).color(ui::c().text).wrapping(Wrapping::WordOrGlyph)).padding(Padding::ZERO.right(14))).height(Length::Shrink);
                 // Рассказ занимает то, что осталось от окна, чтобы кнопки под ним не сжимались.
                 let (_, window) = *WINDOW.lock().unwrap();
-                let wheel = if self.wheel_on && self.wheel.as_ref().is_some_and(|(_, items)| !items.is_empty()) { wheel::AREA } else { 0.0 };
-                let room = (window - WORD_PAGE_REST - wheel).clamp(WORD_STORY_MIN, WORD_STORY_HEIGHT);
+                let room = (window - WORD_PAGE_REST).clamp(WORD_STORY_MIN, WORD_STORY_HEIGHT);
                 body = body.push(container(story).max_height(room).width(Length::Fill));
             }
             None => {}
@@ -2251,7 +2270,8 @@ impl App {
                         None => None,
                     }
                 };
-                if let Some(handle) = bytes.and_then(|bytes| decoded(&bytes)) {
+                let blur = id.starts_with(WHEEL_BLUR);
+                if let Some(handle) = bytes.and_then(|bytes| if blur { decoded_blurred(&bytes) } else { decoded(&bytes) }) {
                     if tx.unbounded_send((id, handle)).is_err() {
                         break;
                     }
@@ -2287,6 +2307,8 @@ impl App {
         }
         cards.extend(self.current_track().map(|t| format!("{WAVE_BIG}{}", t.id)));
         cards.extend(page.iter().map(|a| format!("{ARTIST_COVER}{}", a.id)));
+        let wheel = self.wheel.iter().flat_map(|(_, items)| items);
+        cards.extend(wheel.flat_map(|item| [format!("{WHEEL_COVER}{}", item.id), format!("{WHEEL_BLUR}{}", item.id)]));
         self.covers.retain(|id, _| id == AVATAR_COVER || id.starts_with(PLAYLIST_COVER) || id.starts_with(PIN_COVER_PREFIX) || cards.contains(id) || keep.contains(id));
         self.requested.borrow_mut().retain(|id| self.covers.contains_key(id));
     }
@@ -2665,7 +2687,7 @@ impl App {
         let Some(seeds) = saved.wave else {
             self.queue_title = Some(saved.title);
             self.wave_queue = false;
-            return Task::none();
+            return self.wheel_load();
         };
         self.queue_title = None;
         self.wave_title = Some(saved.title).filter(|title| !title.is_empty());
@@ -2688,7 +2710,9 @@ impl App {
             }
             api::wave_new(&asked, &token)
         };
-        Task::perform(background(resume), move |result| Message::WaveResumed(seeds.clone(), result))
+        // Карточки «Слов в волне» и колесо не ждут продолжения сессии: им хватает треков и затравок.
+        let extras = Task::batch([self.words_load(saved.current), self.wheel_load()]);
+        Task::batch([extras, Task::perform(background(resume), move |result| Message::WaveResumed(seeds.clone(), result))])
     }
 
     /// Запоминает очередь и место, волну вместе с её зёрнами.
@@ -3238,6 +3262,11 @@ impl App {
             self.dialog_fade.step(elapsed);
             self.full_fade.step(elapsed);
             self.vibe_step(elapsed);
+            let reveal = if self.wheel_open { 1.0 } else { 0.0 };
+            if self.wheel_reveal != reveal {
+                let step = elapsed / wheel::REVEAL;
+                self.wheel_reveal = if reveal > self.wheel_reveal { (self.wheel_reveal + step).min(1.0) } else { (self.wheel_reveal - step).max(0.0) };
+            }
             if self.wheel_turn != self.wheel_target {
                 self.wheel_turn += (self.wheel_target - self.wheel_turn) * (1.0 - (-elapsed * wheel::SPEED).exp());
                 if (self.wheel_target - self.wheel_turn).abs() < 0.001 {
@@ -3462,9 +3491,10 @@ impl App {
                     (_, _, Some(Preview::Wizard)) => Task::done(Message::WizardNeeded(Ok(true))),
                     _ => Task::none(),
                 };
-                let pins = Task::batch([pins, avatar, self.liked_pages_load(), wizard]);
+                // Экран волны открыт с запуска, без перехода на него: колесо просим сразу.
+                let pins = Task::batch([pins, avatar, self.liked_pages_load(), wizard, self.wheel_load()]);
                 let page = match self.preview.clone() {
-                    Some(Preview::Wave | Preview::WaveSeek | Preview::WaveWords) => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
+                    Some(Preview::Wave | Preview::WaveSeek | Preview::WaveWords | Preview::WaveWheel) => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
                     Some(Preview::Lyrics) => self.wave_load(vec!["artist:3121".to_string()], None, false),
                     Some(Preview::WaveTune) => {
                         self.preview = None;
@@ -4692,12 +4722,18 @@ impl App {
                         for (position, item) in items.iter().enumerate().take(WHEEL_SEEN) {
                             self.wheel_feedbacks.push(api::wheel_feedback(&id, "VIEW", item, position));
                         }
-                        let jobs = items.iter().filter_map(|item| Some((format!("{WHEEL_COVER}{}", item.id), item.cover.clone()?))).collect();
+                        // У каждой подсказки две обложки: чёткая и размытая для краёв полосы.
+                        let jobs = items.iter().filter_map(|item| item.cover.clone().map(|uri| (item.id.clone(), uri))).flat_map(|(id, uri)| [(format!("{WHEEL_COVER}{id}"), uri.clone()), (format!("{WHEEL_BLUR}{id}"), uri)]).collect();
                         // Ближней встаёт играющая волна, иначе первая подсказка.
                         let start = items.iter().position(|item| self.wave_queue && matches!(&item.action, api::WheelAction::Wave(seeds) if *seeds == self.wave_base)).unwrap_or(0) as f32;
                         self.wheel_turn = start;
                         self.wheel_target = start;
                         self.wheel = Some((id, items));
+                        if matches!(self.preview, Some(Preview::WaveWheel)) {
+                            self.preview = None;
+                            self.wheel_open = true;
+                            self.wheel_reveal = 1.0;
+                        }
                         return self.fetch_cover_jobs(jobs, "200x200");
                     }
                     Err(e) => {
@@ -4711,8 +4747,10 @@ impl App {
                     self.wheel_target = self.wheel_target.round() + step;
                 }
             }
+            Message::WheelShow(open) => self.wheel_open = open && self.wheel_ready(),
             Message::WheelToggle => {
                 self.wheel_on = !self.wheel_on;
+                self.wheel_open = false;
                 self.save_settings();
                 self.wheel_key = None;
                 return self.wheel_load();
@@ -4826,7 +4864,7 @@ impl App {
                         return self.notify("Для этой волны у Яндекса нет треков".to_string());
                     }
                     // Пока грузилась фоновая волна, пользователь мог включить свой список.
-                    Ok(_) if !autoplay && self.current.is_some() && !matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded | Preview::Lyrics | Preview::WaveWords)) => {}
+                    Ok(_) if !autoplay && self.current.is_some() && !matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded | Preview::Lyrics | Preview::WaveWords | Preview::WaveWheel)) => {}
                     Ok(wave) => {
                         if let Some(p) = &self.player {
                             p.stop();
@@ -6929,18 +6967,28 @@ impl App {
         ]
         .spacing(8)
         .align_x(Alignment::Center);
-        // Колесо стоит над названием волны.
-        let body = match self.view_wheel() {
-            Some(wheel) => column![wheel, body].align_x(Alignment::Center),
-            None => body,
-        };
         let body = match self.view_word() {
             Some(word) => body.push(Space::new().height(20)).push(word),
             None => body,
         };
         // Не влезает в окно — экран прокручивается, а не сжимает карточки; влезает — стоит посередине.
         let page = scrollable(container(body).center_x(Length::Fill).padding([16, 0])).height(Length::Shrink);
-        container(page).center(Length::Fill).into()
+        let page: Element<'_, Message> = container(page).center(Length::Fill).into();
+        if !self.wheel_ready() {
+            return page;
+        }
+        // Стрелка вверху раскрывает колесо: страница волны улетает вверх, колесо выезжает снизу.
+        let open = shine(button(container(ui::icon(ui::UP, 20.0, ui::c().text)).center(20)).padding(8).style(ui::secondary).on_press(Message::WheelShow(true)), 20.0);
+        let open = container(hint(open, "Колесо волны")).center_x(Length::Fill).padding(Padding::ZERO.top(12));
+        let page: Element<'_, Message> = stack![page, open].into();
+        let shown = smooth_step(self.wheel_reveal);
+        if shown == 0.0 {
+            return page;
+        }
+        let (_, height) = *WINDOW.lock().unwrap();
+        let page = reveal(page).shift(0.0, -shown * height).scale(1.0 - 0.1 * shown, 0.5, 0.0).inert(shown > 0.0);
+        let wheel = reveal(self.view_wheel()).shift(0.0, (1.0 - shown) * height * 0.7).scale(0.9 + 0.1 * shown, 0.5, 0.5).inert(shown < 1.0);
+        container(stack![page, wheel]).width(Length::Fill).height(Length::Fill).clip(true).into()
     }
 
     /// Большой плеер на всё окно: обложка, название, перемотка и кнопки.
@@ -8939,6 +8987,14 @@ fn average_color(handle: &image::Handle) -> Option<iced::Color> {
 
 /// Готовые пиксели обложки. Сжатую картинку iced распаковал бы прямо во время кадра,
 /// и при смене страницы с десятком новых обложек анимация спотыкалась бы.
+/// Размытая обложка для краёв колеса волны.
+fn decoded_blurred(bytes: &[u8]) -> Option<image::Handle> {
+    let picture = ::image::load_from_memory(bytes).ok()?.thumbnail(120, 120).into_rgba8();
+    let picture = ::image::imageops::blur(&picture, WHEEL_BLUR_SIGMA);
+    let (width, height) = picture.dimensions();
+    Some(image::Handle::from_rgba(width, height, picture.into_raw()))
+}
+
 fn decoded(bytes: &[u8]) -> Option<image::Handle> {
     let picture = ::image::load_from_memory(bytes).ok()?.into_rgba8();
     let (width, height) = picture.dimensions();
@@ -9869,6 +9925,7 @@ fn main() -> iced::Result {
         [_, flag, what] if flag == "--preview" => Some(match what.as_str() {
             "wave" => Preview::Wave,
             "wave-words" => Preview::WaveWords,
+            "wave-wheel" => Preview::WaveWheel,
             "home" => Preview::Home,
             "home-trends" => Preview::HomeTrends,
             "history" => Preview::History,
