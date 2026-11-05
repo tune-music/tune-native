@@ -173,6 +173,14 @@ const HISTORY_LIMIT: usize = 200;
 const WHEEL_SEEN: usize = 8;
 /// Ширина подписи ближней подсказки колеса.
 const WHEEL_LABEL: f32 = 320.0;
+/// Сколько пикселей прокрутки тачпада — один щелчок колёсика.
+const WHEEL_SCROLL_PIXELS: f32 = 60.0;
+/// На сколько шагов колесо может убежать вперёд от видимого.
+const WHEEL_RUN: f32 = 8.0;
+/// Высота свёрнутой карточки «Слов в волне»: столько места оставлено под неё заранее.
+const WORD_SLOT: f32 = 196.0;
+/// За сколько секунд проявляются стрелка колеса и карточка «Слов в волне».
+const APPEAR: f32 = 0.35;
 /// Обложки подсказок колеса.
 const WHEEL_COVER: &str = "wheel:";
 /// Размытые обложки подсказок колеса и сила размытия.
@@ -941,6 +949,12 @@ struct App {
     /// Раскрыто ли колесо и насколько оно уже выехало, от 0 до 1.
     wheel_open: bool,
     wheel_reveal: f32,
+    /// Накопленная прокрутка колёсиком, меньше одного шага.
+    wheel_scroll: f32,
+    /// Насколько проявилась стрелка колеса и карточка «Слов в волне» (её номер).
+    wheel_arrow: f32,
+    word_for: Option<String>,
+    word_level: f32,
     /// «Слова в волне»: карточка к треку по его номеру.
     words: HashMap<String, api::WordCard>,
     /// Треки, о карточках которых уже спросили.
@@ -1192,6 +1206,8 @@ enum Message {
     WheelToggle,
     /// Раскрыть колесо или вернуться к волне.
     WheelShow(bool),
+    /// Прокрутка над колесом в щелчках колёсика: дробные копятся до целого шага.
+    WheelScroll(f32),
     /// Открыть или свернуть рассказ к карточке трека.
     WordOpen(String),
     WordBigLoaded(String, Result<api::WordBig, String>),
@@ -1513,6 +1529,10 @@ impl App {
             wheel_on: saved.wheel,
             wheel_open: false,
             wheel_reveal: 0.0,
+            wheel_scroll: 0.0,
+            wheel_arrow: 0.0,
+            word_for: None,
+            word_level: 0.0,
             words: HashMap::new(),
             words_asked: HashSet::new(),
             words_viewed: Vec::new(),
@@ -1614,6 +1634,9 @@ impl App {
 
     fn animating(&self) -> bool {
         self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.eq_fade.busy() || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy() || self.wheel_turn != self.wheel_target || self.wheel_reveal != if self.wheel_open { 1.0 } else { 0.0 }
+            || (self.wheel_ready() && self.wheel_arrow < 1.0)
+            || self.word_now() != self.word_for
+            || (self.word_for.is_some() && self.word_level < 1.0)
     }
 
     /// Сколько места занимает основная часть окна.
@@ -2154,15 +2177,16 @@ impl App {
         layer = layer.push(pin(arrow(ui::LEFT, -1.0)).x(12.0).y(middle - 19.0));
         layer = layer.push(pin(arrow(ui::RIGHT, 1.0)).x(width - 50.0).y(middle - 19.0));
         // Назад к волне — той же стрелкой вверху, что и раскрыла колесо.
-        let back = shine(button(row![ui::icon(ui::UP, 18.0, ui::c().text), text("Моя волна").size(14).color(ui::c().text)].spacing(6).align_y(Alignment::Center)).padding([7, 16]).style(ui::secondary).on_press(Message::WheelShow(false)), 20.0);
-        layer = layer.push(pin(back).x(width / 2.0 - 64.0).y(16.0));
+        // Страница волны ушла вниз — туда и возвращаемся.
+        let back = shine(button(row![ui::icon(ui::COLLAPSE, 18.0, ui::c().text), text("Моя волна").size(14).color(ui::c().text)].spacing(6).align_y(Alignment::Center)).padding([7, 16]).style(ui::secondary).on_press(Message::WheelShow(false)), 20.0);
+        layer = layer.push(pin(back).x(width / 2.0 - 64.0).y(height - 60.0));
         mouse_area(layer)
             .on_scroll(|delta| {
-                let y = match delta {
+                let lines = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => y,
-                    mouse::ScrollDelta::Pixels { y, .. } => y / 40.0,
+                    mouse::ScrollDelta::Pixels { y, .. } => y / WHEEL_SCROLL_PIXELS,
                 };
-                Message::WheelSpin(if y.abs() < 0.25 { 0.0 } else { -y.signum() })
+                Message::WheelScroll(-lines)
             })
             .into()
     }
@@ -2191,18 +2215,21 @@ impl App {
         }
         let track = self.current_track().filter(|_| self.wave_queue)?;
         let card = self.words.get(&track.id)?;
+        // Карточка проявляется на месте, которое для неё уже оставлено.
+        let a = smooth_step(if self.word_for.as_ref() == Some(&card.id) { self.word_level } else { 0.0 });
+        let c = |color: iced::Color| color.scale_alpha(a);
         let width = (self.main_width() - 80.0).clamp(260.0, WORD_WIDTH);
         let open = self.word_open.as_ref().filter(|(id, _)| *id == card.id);
-        let badge = container(row![ui::icon(ui::WAVE, 14.0, ui::c().accent), text("Слова в волне").size(12).font(ui::font_medium()).color(ui::c().accent)].spacing(6).align_y(Alignment::Center)).padding([4, 10]).style(ui::word_badge);
-        let header = row![badge, Space::new().width(Length::Fill), text("ИИ").size(12).color(ui::c().faint)].align_y(Alignment::Center);
-        let mut body = column![header, text(&card.text).size(19).font(ui::font_medium()).color(ui::c().strong).wrapping(Wrapping::WordOrGlyph)].spacing(14);
+        let badge = container(row![ui::icon(ui::WAVE, 14.0, c(ui::c().accent)), text("Слова в волне").size(12).font(ui::font_medium()).color(c(ui::c().accent))].spacing(6).align_y(Alignment::Center)).padding([4, 10]).style(ui::word_badge(a));
+        let header = row![badge, Space::new().width(Length::Fill), text("ИИ").size(12).color(c(ui::c().faint))].align_y(Alignment::Center);
+        let mut body = column![header, text(&card.text).size(19).font(ui::font_medium()).color(c(ui::c().strong)).wrapping(Wrapping::WordOrGlyph)].spacing(14);
         match open {
             Some((_, None)) => {
                 let phrase = WORD_LOADING[card.id.bytes().map(usize::from).sum::<usize>() % WORD_LOADING.len()];
-                body = body.push(text(format!("{phrase}…")).size(14).color(ui::c().muted));
+                body = body.push(text(format!("{phrase}…")).size(14).color(c(ui::c().muted)));
             }
             Some((_, Some(big))) => {
-                let story = scrollable(container(text(&big.text).size(15).line_height(1.45).color(ui::c().text).wrapping(Wrapping::WordOrGlyph)).padding(Padding::ZERO.right(14))).height(Length::Shrink);
+                let story = scrollable(container(text(&big.text).size(15).line_height(1.45).color(c(ui::c().text)).wrapping(Wrapping::WordOrGlyph)).padding(Padding::ZERO.right(14))).height(Length::Shrink);
                 // Рассказ занимает то, что осталось от окна, чтобы кнопки под ним не сжимались.
                 let (_, window) = *WINDOW.lock().unwrap();
                 let room = (window - WORD_PAGE_REST).clamp(WORD_STORY_MIN, WORD_STORY_HEIGHT);
@@ -2211,8 +2238,8 @@ impl App {
             None => {}
         }
         let pill = |icon, label: &'static str, active: bool, press: Message| {
-            let tint = if active { ui::c().on_accent } else { ui::c().text };
-            shine(button(row![ui::icon(icon, 16.0, tint), text(label).size(13).color(tint)].spacing(6).align_y(Alignment::Center)).padding([7, 14]).style(ui::word_rate(active)).on_press(press), 18.0)
+            let tint = c(if active { ui::c().on_accent } else { ui::c().text });
+            shine(button(row![ui::icon(icon, 16.0, tint), text(label).size(13).color(tint)].spacing(6).align_y(Alignment::Center)).padding([7, 14]).style(ui::word_rate(active, a)).on_press(press), 18.0)
         };
         let liked = card.feedback == "like";
         let disliked = card.feedback == "dislike";
@@ -2224,17 +2251,24 @@ impl App {
         .spacing(8)
         .align_y(Alignment::Center);
         if let Some(Some((title, url))) = open.map(|(_, big)| big.as_ref().and_then(|big| big.action.clone())) {
-            actions = actions.push(hover_line(row![text(title).size(13), ui::icon(ui::RIGHT, 14.0, ui::c().accent)].spacing(2).align_y(Alignment::Center), ui::c().accent, ui::c().strong, Message::OpenUrl(url)));
+            actions = actions.push(hover_line(row![text(title).size(13), ui::icon(ui::RIGHT, 14.0, c(ui::c().accent))].spacing(2).align_y(Alignment::Center), c(ui::c().accent), c(ui::c().strong), Message::OpenUrl(url)));
         } else if card.big.is_some() {
             let label = if open.is_some() { "Свернуть" } else { "Подробнее" };
-            actions = actions.push(hover_line(row![text(label).size(13), ui::icon(if open.is_some() { ui::COLLAPSE } else { ui::RIGHT }, 14.0, ui::c().accent)].spacing(2).align_y(Alignment::Center), ui::c().accent, ui::c().strong, Message::WordOpen(track.id.clone())));
+            actions = actions.push(hover_line(row![text(label).size(13), ui::icon(if open.is_some() { ui::COLLAPSE } else { ui::RIGHT }, 14.0, c(ui::c().accent))].spacing(2).align_y(Alignment::Center), c(ui::c().accent), c(ui::c().strong), Message::WordOpen(track.id.clone())));
         }
         if open.is_some_and(|(_, big)| big.as_ref().is_some_and(|big| big.action.is_some())) {
             // Под рассказом свернуть можно и отдельно от ссылки на Алису.
-            body = body.push(hover_line(row![text("Свернуть").size(13), ui::icon(ui::COLLAPSE, 14.0, ui::c().muted)].spacing(2).align_y(Alignment::Center), ui::c().muted, ui::c().strong, Message::WordOpen(track.id.clone())));
+            body = body.push(hover_line(row![text("Свернуть").size(13), ui::icon(ui::COLLAPSE, 14.0, c(ui::c().muted))].spacing(2).align_y(Alignment::Center), c(ui::c().muted), c(ui::c().strong), Message::WordOpen(track.id.clone())));
         }
-        let content = column![body, actions].spacing(18);
-        Some(container(content).padding([20, 22]).width(width).style(ui::word_card).into())
+        let card = container(column![body, Space::new().height(Length::Fill), actions].spacing(18)).padding([20, 22]).width(width).style(ui::word_card(a));
+        // Свёрнутая карточка всегда одной высоты: страница волны не сдвигается, когда она приходит.
+        Some(if open.is_some() { card.height(Length::Shrink) } else { card.height(WORD_SLOT) }.clip(true).into())
+    }
+
+    /// Номер карточки играющего трека, если она должна быть видна.
+    fn word_now(&self) -> Option<String> {
+        let track = self.current_track().filter(|_| self.words_on && self.wave_queue)?;
+        self.words.get(&track.id).map(|card| card.id.clone())
     }
 
     fn fetch_wave_covers(&self, tracks: &[Track]) -> Task<Message> {
@@ -2841,7 +2875,8 @@ impl App {
             }),
             move |result| Message::Started(generation, result),
         );
-        Task::batch([start, self.wave_refill()])
+        // Карточка «Слов в волне» нужна уже этому треку, а не только следующим.
+        Task::batch([start, self.wave_refill(), self.words_load(index)])
     }
 
     /// Точки перехода трека: в волне-сете свои, плотнее обычных.
@@ -3262,6 +3297,14 @@ impl App {
             self.dialog_fade.step(elapsed);
             self.full_fade.step(elapsed);
             self.vibe_step(elapsed);
+            self.wheel_arrow = if self.wheel_ready() { (self.wheel_arrow + elapsed / APPEAR).min(1.0) } else { 0.0 };
+            let word = self.word_now();
+            if word != self.word_for {
+                self.word_for = word;
+                self.word_level = 0.0;
+            } else if self.word_for.is_some() {
+                self.word_level = (self.word_level + elapsed / APPEAR).min(1.0);
+            }
             let reveal = if self.wheel_open { 1.0 } else { 0.0 };
             if self.wheel_reveal != reveal {
                 let step = elapsed / wheel::REVEAL;
@@ -3492,7 +3535,8 @@ impl App {
                     _ => Task::none(),
                 };
                 // Экран волны открыт с запуска, без перехода на него: колесо просим сразу.
-                let pins = Task::batch([pins, avatar, self.liked_pages_load(), wizard, self.wheel_load()]);
+                let words = self.words_load(self.current.unwrap_or(0));
+                let pins = Task::batch([pins, avatar, self.liked_pages_load(), wizard, self.wheel_load(), words]);
                 let page = match self.preview.clone() {
                     Some(Preview::Wave | Preview::WaveSeek | Preview::WaveWords | Preview::WaveWheel) => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
                     Some(Preview::Lyrics) => self.wave_load(vec!["artist:3121".to_string()], None, false),
@@ -3752,7 +3796,7 @@ impl App {
                 }
                 if !self.active {
                     self.wave_pending = Some(wave.session);
-                    return Task::none();
+                    return self.words_load(self.current.unwrap_or(0));
                 }
                 self.wave = Some(wave.session);
                 self.feedback("radioStarted", None, None);
@@ -4043,7 +4087,7 @@ impl App {
                     }
                     Section::Playlists if self.playlists.is_empty() => self.playlists_load(),
                     Section::Search => operation::focus(Id::new(SEARCH_INPUT)),
-                    Section::Wave => self.wheel_load(),
+                    Section::Wave => Task::batch([self.wheel_load(), self.words_load(self.current.unwrap_or(0))]),
                     Section::Discography => self.discography_load(0),
                     Section::Settings if self.ai_less.is_none() => {
                         let Some(token) = self.token() else { return Task::none() };
@@ -4748,6 +4792,20 @@ impl App {
                 }
             }
             Message::WheelShow(open) => self.wheel_open = open && self.wheel_ready(),
+            Message::WheelScroll(lines) => {
+                // Сменилось направление — накопленное в другую сторону забывается.
+                if lines * self.wheel_scroll < 0.0 {
+                    self.wheel_scroll = 0.0;
+                }
+                self.wheel_scroll += lines;
+                let steps = self.wheel_scroll.trunc();
+                if steps != 0.0 {
+                    self.wheel_scroll -= steps;
+                    // Колесо может убежать вперёд от того, что видно, но не бесконечно.
+                    let ahead = (self.wheel_target.round() + steps - self.wheel_turn).clamp(-WHEEL_RUN, WHEEL_RUN);
+                    self.wheel_target = (self.wheel_turn + ahead).round();
+                }
+            }
             Message::WheelToggle => {
                 self.wheel_on = !self.wheel_on;
                 self.wheel_open = false;
@@ -6967,8 +7025,23 @@ impl App {
         ]
         .spacing(8)
         .align_x(Alignment::Center);
+        // Стрелка колеса — своя строка над названием: место под неё есть, даже пока колесо грузится.
+        let body = if self.wheel_on {
+            let a = smooth_step(self.wheel_arrow);
+            let arrow: Element<'_, Message> = if self.wheel_ready() {
+                let open = shine(button(container(ui::icon(ui::UP, 20.0, ui::c().text.scale_alpha(a))).center(20)).padding(8).style(ui::button_faded(ui::secondary, a)).on_press(Message::WheelShow(true)), 20.0);
+                hint(open, "Колесо волны")
+            } else {
+                Space::new().width(36).height(36).into()
+            };
+            column![arrow, Space::new().height(12), body].align_x(Alignment::Center)
+        } else {
+            body
+        };
+        // Место под карточку оставлено заранее, даже пока её нет: страница не прыгает.
         let body = match self.view_word() {
             Some(word) => body.push(Space::new().height(20)).push(word),
+            None if self.words_on && self.wave_queue => body.push(Space::new().height(20.0 + WORD_SLOT)),
             None => body,
         };
         // Не влезает в окно — экран прокручивается, а не сжимает карточки; влезает — стоит посередине.
@@ -6977,17 +7050,14 @@ impl App {
         if !self.wheel_ready() {
             return page;
         }
-        // Стрелка вверху раскрывает колесо: страница волны улетает вверх, колесо выезжает снизу.
-        let open = shine(button(container(ui::icon(ui::UP, 20.0, ui::c().text)).center(20)).padding(8).style(ui::secondary).on_press(Message::WheelShow(true)), 20.0);
-        let open = container(hint(open, "Колесо волны")).center_x(Length::Fill).padding(Padding::ZERO.top(12));
-        let page: Element<'_, Message> = stack![page, open].into();
         let shown = smooth_step(self.wheel_reveal);
         if shown == 0.0 {
             return page;
         }
         let (_, height) = *WINDOW.lock().unwrap();
-        let page = reveal(page).shift(0.0, -shown * height).scale(1.0 - 0.1 * shown, 0.5, 0.0).inert(shown > 0.0);
-        let wheel = reveal(self.view_wheel()).shift(0.0, (1.0 - shown) * height * 0.7).scale(0.9 + 0.1 * shown, 0.5, 0.5).inert(shown < 1.0);
+        // Колесо спускается сверху, страница волны уходит вниз.
+        let page = reveal(page).shift(0.0, shown * height).scale(1.0 - 0.1 * shown, 0.5, 1.0).inert(shown > 0.0);
+        let wheel = reveal(self.view_wheel()).shift(0.0, -(1.0 - shown) * height * 0.7).scale(0.9 + 0.1 * shown, 0.5, 0.5).inert(shown < 1.0);
         container(stack![page, wheel]).width(Length::Fill).height(Length::Fill).clip(true).into()
     }
 

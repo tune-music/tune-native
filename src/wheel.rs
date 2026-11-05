@@ -14,7 +14,7 @@ const VISIBLE: f32 = 3.6;
 /// Как быстро колесо доворачивается до цели.
 pub const SPEED: f32 = 9.0;
 /// За сколько секунд колесо раскрывается и прячется.
-pub const REVEAL: f32 = 0.55;
+pub const REVEAL: f32 = 0.3;
 
 /// Место подсказки в ряду: смещение от ближней в шагах, от −n/2 до n/2.
 pub fn offset(index: usize, turn: f32, count: usize) -> f32 {
