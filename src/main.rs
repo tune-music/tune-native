@@ -183,6 +183,8 @@ const WORD_SLOT: f32 = 196.0;
 const APPEAR: f32 = 0.35;
 /// Обложки подсказок колеса.
 const WHEEL_COVER: &str = "wheel:";
+/// Обложки Моих волн на двоих.
+const VIBE_COVER: &str = "vibe:";
 /// Размытые обложки подсказок колеса и сила размытия.
 const WHEEL_BLUR: &str = "wheel-blur:";
 const WHEEL_BLUR_SIGMA: f32 = 7.0;
@@ -486,6 +488,15 @@ enum Dialog {
     Embed(Embed),
     /// Предупреждение перед альбомом или исполнителем: что открыть и что показать.
     Unsafe(String, &'static str, api::Modal),
+    /// Моя волна на двоих: позвать второго, принять приглашение или управлять волной.
+    Vibe(VibeDialog),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum VibeDialog {
+    Promo,
+    Invite(api::VibeRoom),
+    Room(api::VibeRoom),
 }
 
 /// Что вставить на сайт: адрес плеера Яндекса и подпись «Слушайте … на Яндекс Музыке».
@@ -631,6 +642,8 @@ struct Place {
 /// Запуск с готовым разделом: первый трек показывается в плеере, но не играет.
 #[derive(Clone)]
 enum Preview {
+    /// Коллекция с окном «Моя волна на двоих».
+    VibePromo,
     /// Волна с раскрытым колесом.
     WaveWheel,
     /// Колесо застыло на полпути: видно, где обрезается движение.
@@ -937,6 +950,9 @@ struct App {
     wave_queue: bool,
     wave_loading: bool,
     wave_fetching: bool,
+    /// Свои Мои волны на двоих и идёт ли запрос по ним.
+    vibe_rooms: Vec<api::VibeRoom>,
+    vibe_busy: bool,
     /// Колесо волны: номер колеса у Яндекса и подсказки.
     wheel: Option<(String, Vec<api::WheelItem>)>,
     /// Для какой волны колесо загружено или грузится.
@@ -1201,6 +1217,18 @@ enum Message {
     WaveMore(Result<Vec<Track>, String>),
     WordsLoaded(Vec<String>, Result<Vec<(String, api::WordCard)>, String>),
     WheelLoaded(Vec<String>, Result<(String, Vec<api::WheelItem>), String>),
+    VibeRoomsLoaded(Result<Vec<api::VibeRoom>, String>),
+    /// Создать Мою волну на двоих и скопировать ссылку-приглашение.
+    VibeCreate,
+    VibeCreated(Result<api::VibeRoom, String>),
+    /// Пришла комната по ссылке-приглашению.
+    VibeInvite(Result<api::VibeRoom, String>),
+    VibeJoin(String),
+    VibeJoined(Result<api::VibeRoom, String>),
+    VibeListen(api::VibeRoom),
+    VibeCopy(String),
+    VibeExit(String),
+    VibeExited(String, Result<(), String>),
     /// Нажата подсказка колеса по её месту.
     WheelPick(usize),
     /// Повернуть колесо на столько шагов.
@@ -1523,6 +1551,8 @@ impl App {
             wave_queue: false,
             wave_loading: false,
             wave_fetching: false,
+            vibe_rooms: Vec::new(),
+            vibe_busy: false,
             wheel: None,
             wheel_key: None,
             wheel_feedbacks: Vec::new(),
@@ -2057,6 +2087,7 @@ impl App {
             api::Link::Tag(tag) => self.handle(Message::HomeOpen(HomeItem::Mix { title: String::new(), tag, cover: None })),
             api::Link::Landing(page) => self.landing_open(page, String::new()),
             api::Link::Post(id) => self.handle(Message::HomeOpen(HomeItem::Post { id, title: "Подборка редакции".to_string(), cover: None })),
+            api::Link::VibeRoom(id) => Task::perform(background(move || api::vibe_room(&id, &token)), Message::VibeInvite),
             link => Task::perform(background(move || api::link_playlist(&link, &token)), Message::LinkPlaylist),
         }
     }
@@ -2101,6 +2132,83 @@ impl App {
     }
 
     /// Экран волны показывает обложку крупно.
+    fn vibe_rooms_load(&self) -> Task<Message> {
+        let Some(token) = self.token().filter(|_| !self.offline) else { return Task::none() };
+        Task::perform(background(move || api::vibe_rooms(&token)), Message::VibeRoomsLoaded)
+    }
+
+    /// Полка «Моя волна на двоих» в Коллекции: свои волны и карточка, чтобы позвать ещё кого-то.
+    fn vibe_cards<'a>(&self, shown: Range<usize>) -> Vec<Element<'a, Message>> {
+        shown
+            .map(|at| match at.checked_sub(1).and_then(|at| self.vibe_rooms.get(at)) {
+                Some(room) => {
+                    let subtitle = match room.status.as_str() {
+                        "ENABLED" if !room.members.is_empty() => format!("Вы и {}", room.members.join(", ")),
+                        "DRAFT" => "Ждёт приглашённого".to_string(),
+                        "DISABLED" => "Только вы".to_string(),
+                        _ => "Моя волна на двоих".to_string(),
+                    };
+                    self.card(&format!("{VIBE_COVER}{}", room.id), true, None, room.name.clone(), subtitle, Message::DialogOpen(Dialog::Vibe(VibeDialog::Room(room.clone()))))
+                }
+                None => {
+                    let side = self.card_side();
+                    let plus = container(ui::icon(ui::PLUS, 44.0, ui::c().text)).center(side).style(ui::avatar);
+                    let body = column![plus, fit("Позвать по ссылке".to_string()).font(ui::font_medium()).color(ui::c().text).lines(2), fit("Новая волна на двоих".to_string()).size(13).color(ui::c().muted)].spacing(6).width(side);
+                    glow(button(body).padding(CARD_PAD).style(ui::card).on_press(Message::DialogOpen(Dialog::Vibe(VibeDialog::Promo))), 12.0)
+                }
+            })
+            .collect()
+    }
+
+    /// Окна Моей волны на двоих, тексты как у оригинала.
+    fn view_vibe<'a>(&'a self, kind: &'a VibeDialog) -> Element<'a, Message> {
+        let alpha = self.dialog_fade.shown();
+        let busy = self.vibe_busy;
+        let side = |label: &'static str, press: Message| shine(button(text(label).color(ui::c().text.scale_alpha(alpha))).padding([8, 18]).style(ui::button_faded(ui::secondary, alpha)).on_press_maybe((!busy).then_some(press)), 24.0);
+        let main = |label: &'static str, press: Message| shine(button(text(label).font(ui::font_medium()).color(ui::c().on_accent.scale_alpha(alpha))).padding([8, 18]).style(ui::button_faded(ui::accent, alpha)).on_press_maybe((!busy).then_some(press)), 24.0);
+        let (title, description, buttons): (String, String, Vec<Element<'a, Message>>) = match kind {
+            VibeDialog::Promo => (
+                "Моя волна на двоих".to_string(),
+                "Поделитесь ссылкой и слушайте Мою волну, которая совместит ваши вкусы. Персональные рекомендации не изменятся".to_string(),
+                vec![side("Не сейчас", Message::MenuClose), main(if busy { "Создаём ссылку…" } else { "Скопировать ссылку" }, Message::VibeCreate)],
+            ),
+            VibeDialog::Invite(room) => (
+                format!("{} приглашает вас в Мою волну для двоих", if room.owner.is_empty() { "Вас" } else { room.owner.as_str() }),
+                "Слушайте Мою волну, которая совместит ваши вкусы. Персональные рекомендации не изменятся".to_string(),
+                vec![side("Не сейчас", Message::MenuClose), main(if busy { "Присоединяемся…" } else { "Присоединиться" }, Message::VibeJoin(room.id.clone()))],
+            ),
+            VibeDialog::Room(room) if room.draft() => (
+                "Приглашение ещё не приняли".to_string(),
+                "Когда приглашение примут, Моя волна для двоих появится в вашей Коллекции".to_string(),
+                vec![side("Удалить", Message::VibeExit(room.id.clone())), main("Скопировать ссылку", Message::VibeCopy(room.link()))],
+            ),
+            VibeDialog::Room(room) if room.enabled() => (
+                room.name.clone(),
+                match room.members.is_empty() {
+                    true => "Слушайте Мою волну с объединёнными рекомендациями".to_string(),
+                    false => format!("Вы и {}. Слушайте Мою волну с объединёнными рекомендациями", room.members.join(", ")),
+                },
+                vec![side("Выйти", Message::VibeExit(room.id.clone())), side("Скопировать ссылку", Message::VibeCopy(room.link())), main("Слушать", Message::VibeListen(room.clone()))],
+            ),
+            VibeDialog::Room(room) => (
+                "В этой Моей волне для двоих только вы".to_string(),
+                "Поделитесь ссылкой снова, чтобы слушать Мою волну для двоих".to_string(),
+                vec![side("Выйти", Message::VibeExit(room.id.clone())), main("Скопировать ссылку", Message::VibeCopy(room.link()))],
+            ),
+        };
+        let row_of = buttons.into_iter().fold(row![Space::new().width(Length::Fill)].spacing(8), |line, button| line.push(button));
+        let body = column![
+            text(title).size(20).font(ui::font_medium()).color(ui::c().text.scale_alpha(alpha)),
+            text(description).color(ui::c().muted.scale_alpha(alpha)),
+            Space::new().height(4),
+            row_of,
+        ]
+        .spacing(12);
+        let window = reveal(container(body).width(DIALOG_WIDTH).padding(24).style(ui::popover_faded(alpha))).scale(0.94 + 0.06 * alpha, 0.5, 0.5).shift(0.0, 10.0 * (1.0 - alpha));
+        let dim = iced::Color::BLACK.scale_alpha(0.6 * alpha);
+        reveal(mouse_area(container(window).center(Length::Fill).style(move |_| container::Style::default().background(dim)))).inert(!self.dialog_fade.live).into()
+    }
+
     /// Колесо к играющей волне: грузится, когда открыт экран волны, и заново при смене волны.
     fn wheel_load(&mut self) -> Task<Message> {
         if self.section != Section::Wave || self.offline || !self.wheel_on {
@@ -2344,6 +2452,7 @@ impl App {
         }
         cards.extend(self.current_track().map(|t| format!("{WAVE_BIG}{}", t.id)));
         cards.extend(page.iter().map(|a| format!("{ARTIST_COVER}{}", a.id)));
+        cards.extend(self.vibe_rooms.iter().map(|room| format!("{VIBE_COVER}{}", room.id)));
         let wheel = self.wheel.iter().flat_map(|(_, items)| items);
         cards.extend(wheel.flat_map(|item| [format!("{WHEEL_COVER}{}", item.id), format!("{WHEEL_BLUR}{}", item.id)]));
         self.covers.retain(|id, _| id == AVATAR_COVER || id.starts_with(PLAYLIST_COVER) || id.starts_with(PIN_COVER_PREFIX) || cards.contains(id) || keep.contains(id));
@@ -3539,7 +3648,7 @@ impl App {
                 };
                 // Экран волны открыт с запуска, без перехода на него: колесо просим сразу.
                 let words = self.words_load(self.current.unwrap_or(0));
-                let pins = Task::batch([pins, avatar, self.liked_pages_load(), wizard, self.wheel_load(), words]);
+                let pins = Task::batch([pins, avatar, self.liked_pages_load(), wizard, self.wheel_load(), words, self.vibe_rooms_load()]);
                 let page = match self.preview.clone() {
                     Some(Preview::Wave | Preview::WaveSeek | Preview::WaveWords | Preview::WaveWheel | Preview::WaveWheelHalf) => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
                     Some(Preview::Lyrics) => self.wave_load(vec!["artist:3121".to_string()], None, false),
@@ -3552,6 +3661,10 @@ impl App {
                     Some(Preview::WaveSeeded) => self.wave_load(vec!["artist:3121".to_string()], Some(wave_label("artist:3121", "Metallica")), false),
                     Some(Preview::Likes | Preview::LikesEnd | Preview::Menu | Preview::Panels | Preview::TrackInfo | Preview::QueueJump) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
+                    Some(Preview::VibePromo) => {
+                        let open = self.update(Message::Open(Section::Collection));
+                        Task::batch([open, self.update(Message::DialogOpen(Dialog::Vibe(VibeDialog::Promo)))])
+                    }
                     Some(Preview::CollectionArtists) => self.update(Message::Open(Section::Artists)),
                     Some(Preview::LikesChip) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Playlists | Preview::Playlist | Preview::PlaylistHome | Preview::PageMenu) => self.update(Message::Open(Section::Playlists)),
@@ -4081,7 +4194,7 @@ impl App {
                     Section::Collection => {
                         let likes = if self.liked.is_empty() { self.likes_more() } else { Task::none() };
                         let lists = if self.playlists.is_empty() { self.playlists_load() } else { Task::none() };
-                        Task::batch([likes, lists])
+                        Task::batch([likes, lists, self.vibe_rooms_load()])
                     }
                     Section::Likes => {
                         let likes = if self.liked.is_empty() { self.likes_more() } else { Task::none() };
@@ -4793,6 +4906,91 @@ impl App {
                     }
                 }
             }
+            Message::VibeRoomsLoaded(result) => match result {
+                Ok(rooms) => {
+                    let jobs = rooms.iter().filter_map(|room| Some((format!("{VIBE_COVER}{}", room.id), room.cover.clone()?))).collect();
+                    self.vibe_rooms = rooms;
+                    return self.fetch_cover_jobs(jobs, "200x200");
+                }
+                Err(e) => eprintln!("волны на двоих: {e}"),
+            },
+            Message::VibeCreate => {
+                let Some(token) = self.token() else { return Task::none() };
+                if self.vibe_busy {
+                    return Task::none();
+                }
+                self.vibe_busy = true;
+                return Task::perform(background(move || api::vibe_room_create(&token)), Message::VibeCreated);
+            }
+            Message::VibeCreated(result) => {
+                self.vibe_busy = false;
+                return match result {
+                    Ok(room) => {
+                        let link = room.link();
+                        self.vibe_rooms.retain(|known| known.id != room.id);
+                        self.vibe_rooms.insert(0, room);
+                        self.update(Message::VibeCopy(link))
+                    }
+                    Err(e) => self.notify(e),
+                };
+            }
+            Message::VibeInvite(result) => {
+                return match result {
+                    Ok(room) => {
+                        // Своя волна или та, где уже участвуешь, — просто открыть её.
+                        let mine = room.owner_uid.is_some() && room.owner_uid == self.uid;
+                        let known = self.vibe_rooms.iter().any(|known| known.id == room.id);
+                        let kind = if mine || known { VibeDialog::Room(room) } else { VibeDialog::Invite(room) };
+                        self.update(Message::DialogOpen(Dialog::Vibe(kind)))
+                    }
+                    Err(e) => self.notify(e),
+                };
+            }
+            Message::VibeJoin(id) => {
+                let Some(token) = self.token() else { return Task::none() };
+                self.vibe_busy = true;
+                return Task::perform(background(move || api::vibe_room_enter(&id, &token)), Message::VibeJoined);
+            }
+            Message::VibeJoined(result) => {
+                self.vibe_busy = false;
+                return match result {
+                    Ok(room) => {
+                        self.vibe_rooms.retain(|known| known.id != room.id);
+                        self.vibe_rooms.insert(0, room.clone());
+                        let cover = room.cover.clone().map(|uri| vec![(format!("{VIBE_COVER}{}", room.id), uri)]).unwrap_or_default();
+                        Task::batch([self.fetch_cover_jobs(cover, "200x200"), self.update(Message::VibeListen(room))])
+                    }
+                    Err(e) => self.notify(e),
+                };
+            }
+            Message::VibeListen(room) => {
+                self.dialog = None;
+                if room.seeds.is_empty() {
+                    return self.update(Message::DialogOpen(Dialog::Vibe(VibeDialog::Room(room))));
+                }
+                return self.update(Message::WaveStartSeeds(room.seeds, Some(room.name)));
+            }
+            Message::VibeCopy(link) => {
+                self.dialog = None;
+                return Task::batch([iced::clipboard::write(link), self.notify("Ссылка на Мою волну на двоих скопирована".to_string())]);
+            }
+            Message::VibeExit(id) => {
+                let Some(token) = self.token() else { return Task::none() };
+                self.vibe_busy = true;
+                let room = id.clone();
+                return Task::perform(background(move || api::vibe_room_exit(&room, &token)), move |r| Message::VibeExited(id.clone(), r));
+            }
+            Message::VibeExited(id, result) => {
+                self.vibe_busy = false;
+                return match result {
+                    Ok(()) => {
+                        self.vibe_rooms.retain(|room| room.id != id);
+                        self.dialog = None;
+                        self.notify("Вы вышли из Моей волны на двоих".to_string())
+                    }
+                    Err(e) => self.notify(e),
+                };
+            }
             Message::WheelSpin(step) => {
                 if step != 0.0 {
                     self.wheel_target = self.wheel_target.round() + step;
@@ -4832,6 +5030,15 @@ impl App {
                 return match item.action {
                     api::WheelAction::Wave(seeds) => self.update(Message::WaveStartSeeds(seeds, Some(item.title))),
                     api::WheelAction::Album(album) => self.update(Message::AlbumOpen(album, item.title)),
+                    api::WheelAction::WaveForTwo => {
+                        let feedbacks = std::mem::take(&mut self.wheel_feedbacks);
+                        if let Some(token) = self.token() {
+                            std::thread::spawn(move || {
+                                let _ = api::wheel_feedbacks(&feedbacks, &token);
+                            });
+                        }
+                        self.update(Message::DialogOpen(Dialog::Vibe(VibeDialog::Promo)))
+                    }
                     // Подсказка, которая ничего не включает: отзывы уходят сразу, как у оригинала.
                     api::WheelAction::Setting => {
                         let feedbacks = std::mem::take(&mut self.wheel_feedbacks);
@@ -5073,7 +5280,7 @@ impl App {
             }
             Message::FocusMove(forward) => return if forward { operation::focus_next() } else { operation::focus_previous() },
             Message::Enter => {
-                let confirmable = !matches!(self.dialog, None | Some(Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account | Dialog::Wizard | Dialog::Unsafe(..)));
+                let confirmable = !matches!(self.dialog, None | Some(Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account | Dialog::Wizard | Dialog::Unsafe(..) | Dialog::Vibe(_)));
                 if confirmable {
                     return self.handle(Message::DialogConfirm);
                 }
@@ -5159,7 +5366,7 @@ impl App {
                 }
                 self.dialog = None;
                 return match dialog {
-                    Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account | Dialog::Wizard | Dialog::Unsafe(..) => Task::none(),
+                    Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account | Dialog::Wizard | Dialog::Unsafe(..) | Dialog::Vibe(_) => Task::none(),
                     Dialog::Logout => self.handle(Message::Logout),
                     Dialog::ClearDownloads => self.handle(Message::DownloadsClear),
                     Dialog::DownloadLikes => self.handle(Message::DownloadLikes),
@@ -6271,6 +6478,7 @@ impl App {
             Dialog::TrackInfo(track) => return self.view_track_info(track),
             Dialog::Account => return self.view_account(),
             Dialog::Unsafe(_, go, modal) => return self.view_unsafe(go, modal),
+            Dialog::Vibe(kind) => return self.view_vibe(kind),
             Dialog::Logout => ("Выйти из аккаунта?".to_string(), "Выйти", true),
             Dialog::DownloadLikes => {
                 let left = self.liked_ids.iter().filter(|id| !self.download_ids.contains(*id)).count();
@@ -7417,6 +7625,9 @@ impl App {
         ]
         .spacing(16)
         .padding(Padding::ZERO.right(SCROLLBAR));
+        // Как у оригинала: свои волны на двоих и карточка, чтобы позвать ещё кого-то.
+        let vibes = self.shelf("collection:vibes", "Моя волна на двоих", None, self.vibe_rooms.len() + 1, |shown| self.vibe_cards(shown));
+        page = page.push(Space::new().height(8)).push(vibes);
         if !self.playlists.is_empty() {
             let lists = self.shelf("collection:lists", "Плейлисты", Some(Message::Open(Section::Playlists)), self.playlists.len(), |shown| self.playlist_cards(&self.playlists[shown]));
             page = page.push(Space::new().height(8)).push(lists);
@@ -10004,6 +10215,7 @@ fn main() -> iced::Result {
             "wave" => Preview::Wave,
             "wave-words" => Preview::WaveWords,
             "wave-wheel" => Preview::WaveWheel,
+            "vibe-promo" => Preview::VibePromo,
             "wave-wheel-half" => Preview::WaveWheelHalf,
             "home" => Preview::Home,
             "home-trends" => Preview::HomeTrends,

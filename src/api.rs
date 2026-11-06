@@ -1524,6 +1524,8 @@ pub enum Link {
     Landing(String),
     /// Подборка редакции.
     Post(String),
+    /// Приглашение в Мою волну на двоих.
+    VibeRoom(String),
 }
 
 /// Так помечена страница лейбла среди страниц из блоков: у Яндекса это не скелет, а свои запросы.
@@ -1559,6 +1561,7 @@ pub fn parse_link(text: &str) -> Option<Link> {
         ["label", label, ..] => number(label).map(|label| Link::Landing(format!("{LABEL}{label}"))),
         ["non-music", "category", category, ..] => Some(Link::Tag(format!("{CATEGORY}{category}"))),
         [first @ ("collection" | "non-music" | "kids" | "chart"), ..] => page(&parts[..parts.len().min(if *first == "collection" { 2 } else { 1 })]),
+        ["multivibe", room, ..] => Some(Link::VibeRoom(room.to_string())),
         ["album", album, ..] => number(album).map(Link::Album),
         ["track", track, ..] => number(track).map(Link::Track),
         ["artist", artist, ..] => number(artist).map(Link::Artist),
@@ -2251,6 +2254,127 @@ fn wave_seeds(v: &Value) -> Vec<String> {
     v["acceptedSeeds"].as_array().into_iter().flatten().filter_map(|seed| Some(format!("{}:{}", seed["type"].as_str()?, seed["value"].as_str()?))).collect()
 }
 
+/// Моя волна на двоих: комната, в которой вкусы двух людей сводятся в одну волну.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VibeRoom {
+    pub id: String,
+    pub name: String,
+    pub owner: String,
+    pub owner_uid: Option<String>,
+    /// Имена участников, кроме владельца.
+    pub members: Vec<String>,
+    /// `DRAFT` — приглашение ещё не приняли, `ENABLED` — волна готова, `DISABLED` — второй ушёл.
+    pub status: String,
+    pub seeds: Vec<String>,
+    pub cover: Option<String>,
+}
+
+impl VibeRoom {
+    pub fn link(&self) -> String {
+        format!("https://music.yandex.ru/multivibe/{}", self.id)
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.status == "ENABLED"
+    }
+
+    pub fn draft(&self) -> bool {
+        self.status == "DRAFT"
+    }
+}
+
+/// Ошибки комнат, как их называет Яндекс.
+pub const ROOM_LIMIT: &str = "Вы создали уже 50 Моих волн для двоих. Чтобы создать новую, покиньте одну из текущих";
+pub const ROOM_GONE: &str = "Это приглашение больше не действует. Попросите прислать новое или создайте Мою волну для двоих";
+
+fn parse_vibe_room(v: &Value) -> Option<VibeRoom> {
+    let id = id_text(&v["id"])?;
+    let wave = if v["wave"]["seeds"].is_array() { &v["wave"] } else { &v["wave"]["wave"] };
+    let seeds = wave["seeds"].as_array().into_iter().flatten().filter_map(|seed| seed.as_str().map(str::to_string)).collect();
+    let owner = &v["owner"];
+    let owner_uid = id_text(&owner["uid"]);
+    let members = v["members"].as_array().into_iter().flatten().filter(|member| id_text(&member["uid"]) != owner_uid || owner_uid.is_none()).filter_map(|member| member["name"].as_str().map(str::to_string)).filter(|name| Some(name.as_str()) != owner["name"].as_str()).collect();
+    let name = v["name"].as_str().or(wave["name"].as_str()).filter(|name| !name.is_empty()).unwrap_or("Моя волна на двоих").to_string();
+    let cover = v["wave"]["agent"]["cover"]["uri"].as_str().or(wave["imageUrl"].as_str()).or(owner["cover"]["uri"].as_str()).map(str::to_string);
+    Some(VibeRoom { id, name, owner: owner["name"].as_str().unwrap_or_default().to_string(), owner_uid, members, status: v["status"].as_str().unwrap_or("DRAFT").to_string(), seeds, cover })
+}
+
+/// Свои волны на двоих. Список меняется, поэтому мимо общего кэша.
+pub fn vibe_rooms(token: &str) -> Result<Vec<VibeRoom>, String> {
+    let v = fetch("wave/rooms", &[], token)?;
+    Ok(result(&v).as_array().into_iter().flatten().filter_map(parse_vibe_room).collect())
+}
+
+pub fn vibe_room(id: &str, token: &str) -> Result<VibeRoom, String> {
+    let v = fetch(&format!("wave/rooms/{id}"), &[], token).map_err(room_error)?;
+    parse_vibe_room(result(&v)).ok_or_else(|| ROOM_GONE.to_string())
+}
+
+/// Новая волна на двоих: пока второй не примет приглашение, она черновик.
+pub fn vibe_room_create(token: &str) -> Result<VibeRoom, String> {
+    let (status, v) = room_request("POST", "wave/rooms", token)?;
+    if status >= 300 {
+        return Err(room_error(error_name(&v)));
+    }
+    parse_vibe_room(result(&v)).ok_or_else(|| "Не удалось создать ссылку. Попробуйте снова".to_string())
+}
+
+/// Принять приглашение. Если у двоих уже есть общая волна, Яндекс называет её — входим в неё.
+pub fn vibe_room_enter(id: &str, token: &str) -> Result<VibeRoom, String> {
+    let (status, v) = room_request("PUT", &format!("wave/rooms/{id}/enter"), token)?;
+    if status < 300 {
+        return parse_vibe_room(result(&v)).map_or_else(|| vibe_room(id, token), Ok);
+    }
+    match v["error"]["details"]["correctRoomId"].as_str().or(v["details"]["correctRoomId"].as_str()) {
+        Some(other) if error_name(&v).contains("ROOM_DUPLICATION") && other != id => vibe_room_enter(other, token),
+        _ => Err(room_error(error_name(&v))),
+    }
+}
+
+pub fn vibe_room_exit(id: &str, token: &str) -> Result<(), String> {
+    let (status, v) = room_request("PUT", &format!("wave/rooms/{id}/exit"), token)?;
+    if status >= 300 {
+        return Err(room_error(error_name(&v)));
+    }
+    Ok(())
+}
+
+fn error_name(v: &Value) -> String {
+    v["error"]["name"].as_str().or(v["error"].as_str()).or(v["result"]["name"].as_str()).unwrap_or("ошибка").to_string()
+}
+
+fn room_error(name: String) -> String {
+    if name.contains("ROOM_LIMIT_EXCEEDED") {
+        ROOM_LIMIT.to_string()
+    } else if name.contains("ROOM_NOT_FOUND") || name.contains("404") {
+        ROOM_GONE.to_string()
+    } else {
+        name
+    }
+}
+
+/// Запрос к комнатам: ответ с ошибкой тоже нужен целиком, в нём бывает номер верной комнаты.
+fn room_request(method: &str, path: &str, token: &str) -> Result<(u16, Value), String> {
+    forget_cache();
+    let url = format!("{API}/{path}");
+    let request = if method == "POST" { agent().post(url) } else { agent().put(url) };
+    let resp = request
+        .header("Authorization", &format!("OAuth {token}"))
+        .header("X-Yandex-Music-Client", CLIENT)
+        .header("Content-Type", "application/json")
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .send("{}")
+        .map_err(|e| format!("Не удалось связаться с Яндексом: {e}"))?;
+    let status = resp.status().as_u16();
+    if status == 401 {
+        return Err(NEED_LOGIN.into());
+    }
+    let body = resp.into_body().read_to_string().unwrap_or_default();
+    Ok((status, serde_json::from_str(&body).unwrap_or(Value::Null)))
+}
+
 /// Подсказка колеса волны: другая волна, альбом или «Настроить Мою волну».
 #[derive(Clone, Debug, PartialEq)]
 pub struct WheelItem {
@@ -2270,6 +2394,8 @@ pub enum WheelAction {
     Wave(Vec<String>),
     Album(String),
     Setting,
+    /// «Моя волна на двоих»: позвать второго по ссылке.
+    WaveForTwo,
 }
 
 /// Колесо волны, как в оригинале: подсказки к тому, что играет. Отзывы о прошлом колесе
@@ -2286,7 +2412,7 @@ pub fn wheel_feedbacks(feedbacks: &[Value], token: &str) -> Result<(), String> {
     post("wheel/feedbacks", "application/json", json!({ "feedbacks": feedbacks }).to_string(), token).map(|_| ())
 }
 
-/// «Волна на двоих» и прочие ссылки пока не поддерживаются: такие подсказки пропускаются.
+/// Ссылки, кроме «Моей волны на двоих», не поддерживаются: такие подсказки пропускаются.
 fn parse_wheel_item(v: &Value) -> Option<WheelItem> {
     let kind = v["type"].as_str()?.to_string();
     let id = id_text(&v["id"])?;
@@ -2306,6 +2432,9 @@ fn parse_wheel_item(v: &Value) -> Option<WheelItem> {
             (WheelAction::Album(id_text(&album["id"])?), album["title"].as_str()?, artists, album["cover"]["uri"].as_str(), album["cover"]["color"].as_str())
         }
         "SETTING" => (WheelAction::Setting, data["title"].as_str()?, String::new(), data["cover"]["uri"].as_str(), None),
+        "PROMO_LINK" if id == "waveForTwo" || data["action"]["weblink"].as_str().is_some_and(|link| link.contains("multivibe")) => {
+            (WheelAction::WaveForTwo, data["title"].as_str()?, "Слушайте вместе с тем, кого пригласите".to_string(), data["cover"]["uri"].as_str(), data["color"].as_str())
+        }
         _ => return None,
     };
     Some(WheelItem { kind, id, action, title: title.to_string(), subtitle, cover: cover.map(str::to_string), color: color.map(str::to_string) })
@@ -2735,13 +2864,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vibe_rooms_parse() {
+        let v = json!({"id": "r1", "owner": {"uid": 1, "name": "Егор"}, "members": [{"uid": 1, "name": "Егор"}, {"uid": 2, "name": "Аня", "status": "ACTIVE"}], "status": "ENABLED", "wave": {"name": "Моя волна на двоих", "seeds": ["multivibe:r1"]}});
+        let room = parse_vibe_room(&v).unwrap();
+        assert_eq!((room.members.clone(), room.seeds.clone(), room.enabled()), (vec!["Аня".to_string()], vec!["multivibe:r1".to_string()], true));
+        assert_eq!(room.link(), "https://music.yandex.ru/multivibe/r1");
+        let draft = parse_vibe_room(&json!({"id": "r2", "owner": {"name": "Егор"}, "members": [], "status": "DRAFT"})).unwrap();
+        assert!(draft.draft() && draft.seeds.is_empty() && draft.name == "Моя волна на двоих");
+        assert_eq!(parse_link("https://music.yandex.ru/multivibe/abc"), Some(Link::VibeRoom("abc".to_string())));
+        assert_eq!(room_error("Яндекс ответил 400: ROOM_LIMIT_EXCEEDED".to_string()), ROOM_LIMIT);
+    }
+
+    #[test]
     fn wheel_items() {
         let wave = json!({"type": "WAVE", "id": "mood:sad", "data": {"agent": {"cover": {"color": "#00B2CC", "uri": "avatars/x/%%"}}, "wave": {"description": "Моя волна по настроению", "name": "Прожить эту грусть", "seeds": ["mood:sad"]}}});
         let item = parse_wheel_item(&wave).unwrap();
         assert_eq!((item.action.clone(), item.title.as_str(), item.color.as_deref()), (WheelAction::Wave(vec!["mood:sad".into()]), "Прожить эту грусть", Some("#00B2CC")));
         let album = json!({"type": "ALBUM", "id": 44474459, "data": {"album": {"id": 44474459, "title": "planett", "cover": {"uri": "a/%%"}}, "artists": [{"id": 1, "name": "brokendaddy?"}]}});
         assert_eq!(parse_wheel_item(&album).unwrap().action, WheelAction::Album("44474459".into()));
-        assert!(parse_wheel_item(&json!({"type": "PROMO_LINK", "id": "waveForTwo", "data": {}})).is_none());
+        assert!(parse_wheel_item(&json!({"type": "PROMO_LINK", "id": "other", "data": {"title": "Ещё"}})).is_none());
+        let two = json!({"type": "PROMO_LINK", "id": "waveForTwo", "data": {"title": "Моя волна на двоих", "cover": {"uri": "a/orig"}, "action": {"weblink": "/collection/multivibes"}}});
+        assert_eq!(parse_wheel_item(&two).unwrap().action, WheelAction::WaveForTwo);
         let feedback = wheel_feedback("w", "CLICK", &item, 2);
         assert_eq!((feedback["item"]["type"].as_str(), feedback["position"].as_u64()), (Some("WAVE"), Some(2)));
     }
