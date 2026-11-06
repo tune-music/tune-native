@@ -514,6 +514,7 @@ pub fn hex_color(hex: &str) -> Option<Color> {
 /// Полоса прокрутки: тонкий скруглённый бегунок без дорожки.
 const SCROLL_WIDTH: f32 = 6.0;
 const SCROLL_MARGIN: f32 = 4.0;
+const SCROLL_INNER: f32 = 4.0;
 /// Яркость бегунка: в покое, с курсором над списком, над бегунком и когда его тянут.
 const SCROLL_REST: f32 = 0.14;
 const SCROLL_OVER_LIST: f32 = 0.22;
@@ -587,6 +588,18 @@ pub fn scroll_still(theme: &Theme, status: scrollable::Status) -> scrollable::St
 pub fn scroll<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Scrollable<'a, M> {
     let bar = scrollable::Scrollbar::new().width(SCROLL_WIDTH).scroller_width(SCROLL_WIDTH).margin(SCROLL_MARGIN);
     Scrollable::new(content).direction(scrollable::Direction::Vertical(bar)).style(scroll_style)
+}
+
+/// Небольшая область внутри карточки: полоса тоньше и не спорит с полосой страницы.
+pub fn scroll_inner<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Scrollable<'a, M> {
+    let bar = scrollable::Scrollbar::new().width(SCROLL_INNER).scroller_width(SCROLL_INNER).margin(0);
+    Scrollable::new(content).direction(scrollable::Direction::Vertical(bar)).style(scroll_still)
+}
+
+/// Лента, которая листается вбок: та же тонкая полоса снизу.
+pub fn scroll_x<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Scrollable<'a, M> {
+    let bar = scrollable::Scrollbar::new().width(SCROLL_INNER).scroller_width(SCROLL_INNER).margin(0);
+    Scrollable::new(content).direction(scrollable::Direction::Horizontal(bar)).style(scroll_still)
 }
 
 #[cfg(test)]

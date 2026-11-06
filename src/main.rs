@@ -2232,7 +2232,7 @@ impl App {
                 body = body.push(text(format!("{phrase}…")).size(14).color(c(ui::c().muted)));
             }
             Some((_, Some(big))) => {
-                let story = scrollable(container(text(&big.text).size(15).line_height(1.45).color(c(ui::c().text)).wrapping(Wrapping::WordOrGlyph)).padding(Padding::ZERO.right(14))).height(Length::Shrink);
+                let story = ui::scroll_inner(container(text(&big.text).size(15).line_height(1.45).color(c(ui::c().text)).wrapping(Wrapping::WordOrGlyph)).padding(Padding::ZERO.right(14))).height(Length::Shrink);
                 // Рассказ занимает то, что осталось от окна, чтобы кнопки под ним не сжимались.
                 let (_, window) = *WINDOW.lock().unwrap();
                 let room = (window - WORD_PAGE_REST).clamp(WORD_STORY_MIN, WORD_STORY_HEIGHT);
@@ -6458,7 +6458,7 @@ impl App {
         let genres = wizard.genres.iter().enumerate().fold(row![].spacing(8), |chips, (index, (_, title))| {
             chips.push(shine(button(text(title.as_str()).wrapping(Wrapping::None)).padding([7, 14]).style(ui::chip_faded(index == wizard.genre, alpha)).on_press(Message::WizardGenre(index)), 18.0))
         });
-        let genres = scrollable(genres.padding(Padding::ZERO.bottom(10))).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::new().width(4).scroller_width(4)));
+        let genres = ui::scroll_x(genres.padding(Padding::ZERO.bottom(10)));
         let artists = wizard.genres.get(wizard.genre).and_then(|(genre, _)| wizard.artists.get(genre));
         let grid: Element<'_, Message> = match artists {
             Some(cards) if !cards.is_empty() => {
@@ -7052,7 +7052,7 @@ impl App {
             None => body,
         };
         // Не влезает в окно — экран прокручивается, а не сжимает карточки; влезает — стоит посередине.
-        let page = scrollable(container(body).center_x(Length::Fill).padding([16, 0])).height(Length::Shrink);
+        let page = ui::scroll(container(body).center_x(Length::Fill).padding([16, 0])).height(Length::Shrink);
         let page: Element<'_, Message> = container(page).center(Length::Fill).into();
         if !self.wheel_ready() {
             return page;
