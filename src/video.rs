@@ -523,6 +523,8 @@ pub struct Pipeline {
     texture: Option<(wgpu::Texture, wgpu::BindGroup, u32, u32)>,
     /// Какой кадр уже на видеокарте и от какого плеера.
     shown: (usize, u64),
+    /// На видеокарте кадр именно этого плеера: иначе не рисуем, под видео видна обложка.
+    ready: bool,
     srgb: bool,
 }
 
@@ -556,7 +558,7 @@ impl shader::Pipeline for Pipeline {
             multiview: None,
             cache: None,
         });
-        Self { pipeline, uniforms, sampler, layout, texture: None, shown: (0, u64::MAX), srgb: format.is_srgb() }
+        Self { pipeline, uniforms, sampler, layout, texture: None, shown: (0, u64::MAX), ready: false, srgb: format.is_srgb() }
     }
 }
 
@@ -616,14 +618,15 @@ impl shader::Primitive for Primitive {
             }
             None => [0.0; 4],
         };
-        let has = if pipeline.texture.is_some() && owner == pipeline.shown.0 && serial > 0 { 1.0 } else { 0.0 };
+        pipeline.ready = pipeline.texture.is_some() && owner == pipeline.shown.0 && serial > 0;
+        let has = if pipeline.ready { 1.0 } else { 0.0 };
         let values: [[f32; 4]; 3] = [area, picture, [self.radius * scale, has, 0.0, 0.0]];
         let bytes: Vec<u8> = values.iter().flatten().flat_map(|x| x.to_ne_bytes()).collect();
         queue.write_buffer(&pipeline.uniforms, 0, &bytes);
     }
 
     fn draw(&self, pipeline: &Pipeline, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
-        let Some((_, bind, ..)) = pipeline.texture.as_ref() else {
+        let Some((_, bind, ..)) = pipeline.texture.as_ref().filter(|_| pipeline.ready) else {
             return true;
         };
         render_pass.set_pipeline(&pipeline.pipeline);
