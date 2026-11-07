@@ -2,6 +2,8 @@
 
 mod api;
 mod anim;
+mod clips;
+mod video;
 mod dpi;
 mod client;
 mod fonts;
@@ -414,6 +416,8 @@ enum Section {
     Block,
     /// Другая страница из блоков: «Жанры», жанр, настроение.
     Landing,
+    /// Клипы: свои и «Вам понравится».
+    Clips,
 }
 
 /// Карусель, у которой есть «Показать все».
@@ -575,6 +579,7 @@ enum SearchTab {
     Albums,
     Artists,
     Playlists,
+    Clips,
     Podcasts,
     Books,
     Waves,
@@ -584,12 +589,13 @@ enum SearchTab {
 const SEARCH_FILTERED_TYPES: &str = "album,artist,playlist,track,wave,podcast,podcast_episode";
 
 impl SearchTab {
-    const ALL: [SearchTab; 8] = [
+    const ALL: [SearchTab; 9] = [
         SearchTab::All,
         SearchTab::Tracks,
         SearchTab::Albums,
         SearchTab::Artists,
         SearchTab::Playlists,
+        SearchTab::Clips,
         SearchTab::Podcasts,
         SearchTab::Books,
         SearchTab::Waves,
@@ -602,6 +608,7 @@ impl SearchTab {
             SearchTab::Albums => "Альбомы",
             SearchTab::Artists => "Исполнители",
             SearchTab::Playlists => "Плейлисты",
+            SearchTab::Clips => "Клипы",
             SearchTab::Podcasts => "Подкасты",
             SearchTab::Books => "Аудиокниги",
             SearchTab::Waves => "Волны",
@@ -610,7 +617,8 @@ impl SearchTab {
 
     fn types(self) -> &'static str {
         match self {
-            SearchTab::All => "album,artist,playlist,track",
+            SearchTab::All => "album,artist,playlist,track,clip",
+            SearchTab::Clips => "clip",
             SearchTab::Tracks => "track",
             SearchTab::Albums => "album",
             SearchTab::Artists => "artist",
@@ -642,6 +650,10 @@ struct Place {
 /// Запуск с готовым разделом: первый трек показывается в плеере, но не играет.
 #[derive(Clone)]
 enum Preview {
+    /// Страница «Клипы».
+    Clips,
+    /// Открытый клип по номеру.
+    Clip(String),
     /// Коллекция с окном «Моя волна на двоих».
     VibePromo,
     /// Волна с раскрытым колесом.
@@ -1044,6 +1056,13 @@ struct App {
     /// Плеер на всё окно: открыт ли и как далеко выехал.
     player_full: bool,
     full_fade: Fade<()>,
+    /// Открытый клип поверх всего окна.
+    clip: Option<clips::Watch>,
+    clip_ticket: u64,
+    clips_liked: Vec<api::Clip>,
+    clips_like: Vec<api::Clip>,
+    clips_loading: bool,
+    clip_feed: Option<api::ClipFeed>,
     /// Средний цвет крупной обложки трека: им окрашен фон плеера на всё окно.
     cover_tints: HashMap<String, iced::Color>,
     /// Цвет фона плеера на всё окно сейчас: догоняет цвет обложки играющего трека.
@@ -1113,6 +1132,31 @@ enum Message {
     AccountRetry,
     Back,
     Open(Section),
+    ClipsLoaded(Result<(Vec<api::Clip>, Vec<api::Clip>), String>),
+    ClipOpen(Vec<api::Clip>, usize),
+    /// Клипы по ссылке `/video?ids=…`.
+    ClipLink(Result<Vec<api::Clip>, String>, usize),
+    ClipStream(u64, Result<Vec<(u32, String)>, String>),
+    ClipCredits(u64, Result<Vec<(String, String)>, String>),
+    ClipToggle,
+    ClipSeek(f32),
+    ClipSeekDone,
+    ClipSeekBy(f32),
+    ClipMove,
+    ClipStep(bool),
+    ClipPick(usize),
+    ClipClose,
+    ClipFull,
+    ClipMenu(Option<clips::ClipMenu>),
+    ClipSpeed(f32),
+    ClipQuality(usize),
+    ClipLike(api::Clip),
+    ClipLiked(api::Clip, bool, Result<(), String>),
+    ClipShare(api::Clip),
+    ClipFeed(Result<api::ClipFeed, String>),
+    ClipFeedStart,
+    /// Клипы ленты: номер открытия, сессия и клипы.
+    ClipFeedLoaded(u64, Result<(String, Vec<api::Clip>), String>),
     Query(String),
     Search,
     Found(u64, SearchTab, String, Result<Found, String>),
@@ -1629,6 +1673,12 @@ impl App {
             dialog_fade: Fade::new(DIALOG_OPEN, DIALOG_CLOSE),
             player_full: false,
             full_fade: Fade::new(FULL_OPEN, FULL_CLOSE),
+            clip: None,
+            clip_ticket: 0,
+            clips_liked: Vec::new(),
+            clips_like: Vec::new(),
+            clips_loading: false,
+            clip_feed: None,
             cover_tints: HashMap::new(),
             full_tint: ui::c().tile,
             notice_fade: Fade::new(NOTICE_OPEN, NOTICE_CLOSE),
@@ -1684,6 +1734,7 @@ impl App {
             || (self.word_for.is_some() && self.word_level < 1.0)
             || self.word_grow != self.word_grow_target()
             || self.word_shut
+            || self.clip.as_ref().is_some_and(clips::Watch::moving)
     }
 
     /// Рассказ раскрыт, когда он уже пришёл и его не сворачивают.
@@ -2110,6 +2161,7 @@ impl App {
             api::Link::Post(id) => self.handle(Message::HomeOpen(HomeItem::Post { id, title: "Подборка редакции".to_string(), cover: None })),
             api::Link::VibeRoom(id) => Task::perform(background(move || api::vibe_room(&id, &token)), Message::VibeInvite),
             api::Link::Block(path) => self.handle(Message::HomeOpen(HomeItem::Post { id: format!("{}{path}", api::BLOCK), title: "Подборка".to_string(), cover: None })),
+            api::Link::Clips(ids, at) => Task::perform(background(move || api::clips_by_id(&ids, &token)), move |result| Message::ClipLink(result, at)),
             link => Task::perform(background(move || api::link_playlist(&link, &token)), Message::LinkPlaylist),
         }
     }
@@ -2150,7 +2202,7 @@ impl App {
         self.searched = true;
         self.prune_covers();
         let waves = self.found.waves.iter().filter_map(|item| Some((home_item_key(item), home_item_cover(item)?))).collect();
-        Task::batch([self.fetch_card_covers(self.found.albums.iter(), self.found.artists.iter(), &self.found.playlists), self.fetch_cover_jobs(waves, "200x200")])
+        Task::batch([self.fetch_card_covers(self.found.albums.iter(), self.found.artists.iter(), &self.found.playlists), self.fetch_cover_jobs(waves, "200x200"), self.clip_covers(&self.found.clips)])
     }
 
     /// Экран волны показывает обложку крупно.
@@ -2482,6 +2534,7 @@ impl App {
         cards.extend(self.current_track().map(|t| format!("{WAVE_BIG}{}", t.id)));
         cards.extend(page.iter().map(|a| format!("{ARTIST_COVER}{}", a.id)));
         cards.extend(self.vibe_rooms.iter().map(|room| format!("{VIBE_COVER}{}", room.id)));
+        cards.extend(self.clip_cover_keys());
         let wheel = self.wheel.iter().flat_map(|(_, items)| items);
         cards.extend(wheel.flat_map(|item| [format!("{WHEEL_COVER}{}", item.id), format!("{WHEEL_BLUR}{}", item.id)]));
         self.covers.retain(|id, _| id == AVATAR_COVER || id.starts_with(PLAYLIST_COVER) || id.starts_with(PIN_COVER_PREFIX) || cards.contains(id) || keep.contains(id));
@@ -3392,7 +3445,7 @@ impl App {
             Section::Dislikes => &self.disliked_list,
             Section::Downloads => &self.download_tracks,
             Section::Queue => self.current.and_then(|i| self.queue.get(i + 1..)).unwrap_or(&[]),
-            Section::Lyrics | Section::Settings => &[],
+            Section::Lyrics | Section::Settings | Section::Clips => &[],
             Section::Search => &self.results,
         }
     }
@@ -3490,8 +3543,9 @@ impl App {
             };
             let queue = self.queue_scroll_step(elapsed);
             let edge = self.drag_scroll(elapsed);
+            let clip = self.clip_step();
             self.last_frame = Some(now).filter(|_| self.animating());
-            return Task::batch([lyrics, queue, edge, self.visible_covers()]);
+            return Task::batch([lyrics, queue, edge, self.visible_covers(), clip]);
         }
         let place = self.list_place();
         let offset = self.list_offset;
@@ -3647,7 +3701,53 @@ impl App {
     }
 
     fn handle(&mut self, message: Message) -> Task<Message> {
+        // Пока открыт клип, клавиши плеера управляют им, а переход по ссылке закрывает его.
+        if let Some(watch) = &self.clip {
+            let menus = self.menu.is_some() || self.dialog.is_some();
+            let routed = match &message {
+                Message::Toggle => Some(Message::ClipToggle),
+                Message::SeekBy(step) => Some(Message::ClipSeekBy(*step)),
+                Message::Next => Some(Message::ClipStep(true)),
+                Message::Previous => Some(Message::ClipStep(false)),
+                Message::FullToggle => Some(Message::ClipFull),
+                Message::MenuClose if !menus && watch.menu.is_some() => Some(Message::ClipMenu(None)),
+                Message::MenuClose if !menus && watch.full => Some(Message::ClipFull),
+                Message::MenuClose if !menus => Some(Message::ClipClose),
+                _ => None,
+            };
+            if let Some(routed) = routed {
+                return self.clip_handle(routed);
+            }
+            if matches!(message, Message::ArtistOpen(_) | Message::Open(_) | Message::ListOpen(_) | Message::AlbumOpen(..)) {
+                let close = self.clip_close();
+                return Task::batch([close, self.handle(message)]);
+            }
+        }
         match message {
+            message @ (Message::ClipsLoaded(_)
+                | Message::ClipOpen(..)
+                | Message::ClipLink(..)
+                | Message::ClipStream(..)
+                | Message::ClipCredits(..)
+                | Message::ClipToggle
+                | Message::ClipSeek(_)
+                | Message::ClipSeekDone
+                | Message::ClipSeekBy(_)
+                | Message::ClipMove
+                | Message::ClipStep(_)
+                | Message::ClipPick(_)
+                | Message::ClipClose
+                | Message::ClipFull
+                | Message::ClipMenu(_)
+                | Message::ClipSpeed(_)
+                | Message::ClipQuality(_)
+                | Message::ClipLike(_)
+                | Message::ClipLiked(..)
+                | Message::ClipShare(_)
+                | Message::ClipFeed(_)
+                | Message::ClipFeedStart
+                | Message::ClipFeedLoaded(..)
+            ) => return self.clip_handle(message),
             Message::LoginOpen => {
                 if matches!(self.screen, Screen::Login(true)) {
                     return Task::none();
@@ -3701,6 +3801,11 @@ impl App {
                     Some(Preview::WaveSeeded) => self.wave_load(vec!["artist:3121".to_string()], Some(wave_label("artist:3121", "Metallica")), false),
                     Some(Preview::Likes | Preview::LikesEnd | Preview::Menu | Preview::Panels | Preview::TrackInfo | Preview::QueueJump) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
+                    Some(Preview::Clips) => self.update(Message::Open(Section::Clips)),
+                    Some(Preview::Clip(id)) => match self.token() {
+                        Some(token) => Task::perform(background(move || api::clips_by_id(&[id], &token)), |result| Message::ClipLink(result, 0)),
+                        None => Task::none(),
+                    },
                     Some(Preview::VibePromo) => {
                         let open = self.update(Message::Open(Section::Collection));
                         Task::batch([open, self.update(Message::DialogOpen(Dialog::Vibe(VibeDialog::Promo)))])
@@ -4245,6 +4350,10 @@ impl App {
                     Section::Search => operation::focus(Id::new(SEARCH_INPUT)),
                     Section::Wave => Task::batch([self.wheel_load(), self.words_load(self.current.unwrap_or(0))]),
                     Section::Discography => self.discography_load(0),
+                    Section::Clips => {
+                        let covers = Task::batch([self.clip_covers(&self.clips_liked), self.clip_covers(&self.clips_like)]);
+                        Task::batch([covers, self.clips_load(), self.clip_feed_load()])
+                    }
                     Section::Settings if self.ai_less.is_none() => {
                         let Some(token) = self.token() else { return Task::none() };
                         Task::perform(background(move || api::ai_reduction(&token)), Message::AiLessLoaded)
@@ -4720,6 +4829,7 @@ impl App {
                         let release = artist.release.iter().chain(&artist.upcoming).filter_map(|c| Some((format!("{ALBUM_COVER}{}", c.id), c.cover.clone()?)));
                         let lists = artist.playlists.iter().filter_map(|item| Some((home_item_key(item), home_item_cover(item)?)));
                         let videos = artist.videos.iter().filter_map(|video| Some((format!("{VIDEO_COVER}{}", video.id), video.cover.clone()?)));
+                        let clip_covers = self.clip_covers(&if artist.clips.is_empty() { clips::artist_video_clips(&artist) } else { artist.clips.clone() });
                         let photos = artist.photos.iter().enumerate().map(|(at, uri)| (format!("{PHOTO_COVER}{}:{at}", artist.id), uri.clone()));
                         let jobs = main.into_iter().chain(artists).chain(albums).chain(release).chain(lists).chain(videos).chain(photos).collect();
                         self.familiar_wave = artist.familiar_collection.is_empty();
@@ -4728,7 +4838,7 @@ impl App {
                             self.dialog = Some(Dialog::Unsafe(format!("artist:{}", artist.id), "К артисту", modal));
                         }
                         self.artist = Some(artist);
-                        let covers = Task::batch([self.fetch_cover_jobs(jobs, "300x300"), self.artist_familiar_covers()]);
+                        let covers = Task::batch([self.fetch_cover_jobs(jobs, "300x300"), self.artist_familiar_covers(), clip_covers]);
                         return match self.preview.clone() {
                             Some(Preview::Discography(_)) => {
                                 self.preview = None;
@@ -4765,6 +4875,7 @@ impl App {
             Message::ToggleMute => {
                 self.muted = !self.muted;
                 self.apply_volume();
+                self.clip_volume();
                 self.save_settings();
             }
             Message::RepeatNext => {
@@ -6364,6 +6475,7 @@ impl App {
                 self.volume = volume;
                 self.muted = false;
                 self.apply_volume();
+                self.clip_volume();
                 self.save_settings();
             }
         }
@@ -6434,6 +6546,7 @@ impl App {
             Section::Artists if !self.top_artists.is_empty() => self.view_artists(),
             Section::Artists => self.view_card_page("Исполнители", &self.liked_artists, ARTIST_COVER, true, "Здесь появятся исполнители, которые вам понравились"),
             Section::Search => self.view_search(),
+            Section::Clips => self.view_clips(),
         };
         // Альбома, исполнителя или плейлиста нет у Яндекса: страница, как в оригинале, а не плашка.
         let missing = self.error.as_deref().is_some_and(|error| error.starts_with("Яндекс ответил 404")) && matches!(self.section, Section::Playlists | Section::Artist | Section::Landing | Section::Block);
@@ -6481,6 +6594,9 @@ impl App {
         let mut layers = stack![base];
         if let Some(full) = self.view_full() {
             layers = layers.push(full);
+        }
+        if let Some(clip) = self.view_clip() {
+            layers = layers.push(clip);
         }
         if self.menu.is_some() || self.quality_menu.is_some() || self.eq_menu.is_some() || self.page_menu.is_some() || self.pin_menu.is_some() {
             layers = layers.push(mouse_area(container(Space::new()).width(Length::Fill).height(Length::Fill)).on_press(Message::MenuClose).on_right_press(Message::MenuClose));
@@ -7685,7 +7801,7 @@ impl App {
             })
         };
         let mut page = column![
-            row![text("Коллекция").size(36).font(ui::font_headline()).color(ui::c().text), Space::new().width(Length::Fill), self.block_title("Скачанное", Section::Downloads), self.block_title("История", Section::History), self.block_title("Дизлайки", Section::Dislikes)].align_y(Alignment::Center),
+            row![text("Коллекция").size(36).font(ui::font_headline()).color(ui::c().text), Space::new().width(Length::Fill), self.block_title("Клипы", Section::Clips), self.block_title("Скачанное", Section::Downloads), self.block_title("История", Section::History), self.block_title("Дизлайки", Section::Dislikes)].align_y(Alignment::Center),
             Space::new().height(16),
             likes,
             if self.main_width() >= COLLECTION_COLUMNS { Element::from(row![column_of(0..4), column_of(4..8)].spacing(24)) } else { column_of(0..8).into() },
@@ -8005,7 +8121,7 @@ impl App {
             page = page.push(text(format!("Показаны результаты по запросу «{corrected}»")).color(ui::c().muted));
         }
         let found = &self.found;
-        let nothing = found.tracks.is_empty() && found.albums.is_empty() && found.artists.is_empty() && found.playlists.is_empty() && found.waves.is_empty();
+        let nothing = found.tracks.is_empty() && found.albums.is_empty() && found.artists.is_empty() && found.playlists.is_empty() && found.waves.is_empty() && found.clips.is_empty();
         // В подкастах и книгах альбомы — это сами подкасты и книги, а треки — их выпуски.
         let (albums_title, tracks_title) = match self.search_tab {
             SearchTab::Podcasts => ("Подкасты", "Выпуски"),
@@ -8042,7 +8158,10 @@ impl App {
                 blocks = blocks.push(albums()).push(Space::new().height(8));
             }
             if !found.playlists.is_empty() {
-                blocks = blocks.push(self.search_cards("search:lists", "Плейлисты", SearchTab::Playlists, found.playlists.len(), |shown| self.playlist_cards(&found.playlists[shown])));
+                blocks = blocks.push(self.search_cards("search:lists", "Плейлисты", SearchTab::Playlists, found.playlists.len(), |shown| self.playlist_cards(&found.playlists[shown]))).push(Space::new().height(8));
+            }
+            if !found.clips.is_empty() {
+                blocks = blocks.push(self.search_clips(&found.clips));
             }
             ui::scroll(blocks).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
         };
@@ -8379,7 +8498,11 @@ impl App {
             page = page.push(Space::new().height(8)).push(similar);
         }
         // Клипы открываются в браузере: видео плеер приложения не показывает.
-        if !artist.videos.is_empty() {
+        // Клипы играют в Tune; старый список без номеров открывается в браузере, если видеоплеера нет.
+        let clips = if artist.clips.is_empty() { clips::artist_video_clips(artist) } else { artist.clips.clone() };
+        if !clips.is_empty() && video::available() {
+            page = page.push(Space::new().height(8)).push(self.clip_shelf("artist:clips", "Клипы", None, &clips));
+        } else if !artist.videos.is_empty() {
             let videos = self.shelf("artist:videos", "Клипы", None, artist.videos.len(), |shown| {
                 artist.videos[shown].iter().map(|video| self.card(&format!("{VIDEO_COVER}{}", video.id), false, None, video.title.clone(), "Клип".to_string(), Message::OpenUrl(video.url.clone()))).collect()
             });
@@ -8947,6 +9070,7 @@ fn page_section(page: &str) -> Section {
         "collection/artists" => Section::Artists,
         "collection/playlists" => Section::Playlists,
         "collection/dislikes" => Section::Dislikes,
+        "collection/clips" | "video" => Section::Clips,
         // Остальных разделов коллекции здесь пока нет: открывается она сама.
         page if page.starts_with("collection") => Section::Collection,
         _ => Section::Home,
@@ -9585,6 +9709,45 @@ fn smoke_catalog(genre: &str) -> Result<(), String> {
 }
 
 /// Строение ответа на запрос чтения: ключи, типы и начало строк, массивы — по первому элементу.
+/// Клип по номеру: поток у видеоплеера Яндекса, четыре секунды в libmpv без окна, кадры и место.
+fn smoke_clip(id: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Нет токена")?;
+    let clip = api::clips_by_id(&[id.to_string()], &token)?.into_iter().next().ok_or("Клип не найден")?;
+    println!("Клип: {} — {} ({} с), ролик {:?}", clip.artist_names(), clip.full_title(), clip.duration, clip.player);
+    let qualities = api::clip_stream(&clip, &token)?;
+    println!("Качества: {:?}", qualities.iter().map(|(height, _)| *height).collect::<Vec<_>>());
+    let (_, url) = qualities.iter().find(|(height, _)| *height <= 1080).or(qualities.first()).ok_or("Нет потоков")?;
+    let started = Instant::now();
+    let video = video::Video::open(url, 0.0, 0.0)?;
+    let mut first = None;
+    while started.elapsed() < Duration::from_secs(8) {
+        std::thread::sleep(Duration::from_millis(250));
+        if first.is_none() && video.serial() > 0 {
+            first = Some(started.elapsed());
+        }
+        if let Some(error) = video.failed() {
+            return Err(error);
+        }
+    }
+    let state = video.state();
+    println!("Первый кадр через {:?}, кадров {}, место {:.1} из {:.1} с", first, video.serial(), state.time, state.duration);
+    // Смена качества: место остаётся, конец клипа не наступает.
+    if let Some((height, other)) = qualities.iter().find(|(height, _)| *height < 720) {
+        let before = video.serial();
+        video.switch(other, state.time);
+        std::thread::sleep(Duration::from_secs(4));
+        let after = video.state();
+        println!("Качество {height}p: место {:.1} с, конец {}, новых кадров {}", after.time, after.ended, video.serial() - before);
+    }
+    video.set_paused(true);
+    std::thread::sleep(Duration::from_millis(300));
+    println!("Пауза: {}", video.state().paused);
+    if video.serial() == 0 {
+        return Err("Кадров нет".to_string());
+    }
+    Ok(())
+}
+
 fn smoke_get(request: &str) -> Result<(), String> {
     const NL: char = 10 as char;
     fn shape(v: &serde_json::Value, depth: usize, out: &mut String) {
@@ -10257,7 +10420,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" || flag == "--smoke-clone" || flag == "--smoke-words" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" || flag == "--smoke-clone" || flag == "--smoke-words" || flag == "--smoke-clip" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -10284,6 +10447,7 @@ fn main() -> iced::Result {
             "--smoke-preview" => smoke_preview(query),
             "--smoke-clone" => smoke_clone(query),
             "--smoke-words" => smoke_words(query),
+            "--smoke-clip" => smoke_clip(query),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
@@ -10297,6 +10461,8 @@ fn main() -> iced::Result {
         [_, flag, what] if flag == "--preview" => Some(match what.as_str() {
             "wave" => Preview::Wave,
             "wave-words" => Preview::WaveWords,
+            "clips" => Preview::Clips,
+            what if what.starts_with("clip:") => Preview::Clip(what["clip:".len()..].to_string()),
             "wave-wheel" => Preview::WaveWheel,
             "vibe-promo" => Preview::VibePromo,
             "wave-wheel-half" => Preview::WaveWheelHalf,

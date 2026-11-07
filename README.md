@@ -25,6 +25,10 @@
 cargo run
 ```
 
+Клипы играет libmpv. Библиотека большая и в репозиторий не входит: возьмите `libmpv-2.dll` из архива `mpv-dev-x86_64-*.7z` сборки [shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake/releases) и положите в `vendor/mpv/`. При сборке она копируется к программе. Без неё всё остальное работает, а клипы открываются в браузере.
+
+Клип без окна: `tune-native --smoke-clip <номер клипа>` — поток, первые кадры и пауза.
+
 Проверка без окна, после входа: `tune-native --smoke "запрос"`.
 
 Окно с готовым разделом, без звука: `tune-native --preview wave`, `likes` или поисковый запрос.

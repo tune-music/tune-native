@@ -15,6 +15,10 @@ use sha2::Sha256;
 
 const API: &str = "https://api.music.yandex.net";
 const CLIENT: &str = "YandexMusicDesktopAppWindows/5.120.0";
+/// Так видеоплеер Яндекса узнаёт браузер: другим клиентам он отвечает `old_browser`
+/// без потоков. Официальный клиент — тоже браузер (Electron), с тем же токеном.
+pub const BROWSER: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
+const VIDEO_PLAYER: &str = "https://frontend.vh.yandex.ru/player";
 const SIGN_KEY: &[u8] = b"kzqU4XhfCaY6B6JTHODeq5";
 const CODECS: [&str; 7] = ["flac", "flac-mp4", "mp3", "aac", "aac-mp4", "he-aac", "he-aac-mp4"];
 const TRANSPORT: &str = "encraw";
@@ -903,6 +907,8 @@ pub struct Artist {
     pub playlists: Vec<HomeItem>,
     /// Клипы: название, обложка и адрес плеера Яндекса.
     pub videos: Vec<Video>,
+    /// Клипы из блока исполнителя (`artist-clips`), как у оригинала: с номерами для лайка.
+    pub clips: Vec<Clip>,
     /// Фотографии исполнителя.
     pub photos: Vec<String>,
     /// BandLink: «Плейлисты, где встречается» на других площадках.
@@ -1038,6 +1044,7 @@ fn parse_artist(v: &Value) -> Option<Artist> {
         upcoming: None,
         release: v["lastReleases"].as_array().and_then(|list| list.first()).and_then(album_card),
         playlists: v["playlists"].as_array().into_iter().flatten().filter_map(parse_home_playlist).collect(),
+        clips: Vec::new(),
         videos: v["videos"].as_array().into_iter().flatten().filter_map(|video| {
             let url = video["embedUrl"].as_str().filter(|url| url.starts_with("https://"))?;
             Some(Video {
@@ -1116,6 +1123,9 @@ pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
     // Описание не главное: без него страница всё равно откроется.
     if let Ok(v) = get(&format!("artists/{id}/about-artist"), &[], token) {
         (artist.about, artist.links) = parse_about(result(&v));
+    }
+    if let Ok(v) = get(&format!("artists/{id}/blocks/artist-clips"), &[("page", "0"), ("pageSize", "50")], token) {
+        artist.clips = parse_clips(&result(&v)["items"]);
     }
     let limit = FAMILIAR_LIMIT.to_string();
     if let Ok(v) = get(&format!("artists/{id}/familiar-you"), &[("waveTracksLimit", &limit), ("collectionTracksLimit", &limit), ("collectionAlbumsLimit", "0")], token) {
@@ -1248,6 +1258,7 @@ pub struct Found {
     pub playlists: Vec<Playlist>,
     /// Волны по жанру, настроению или занятию.
     pub waves: Vec<HomeItem>,
+    pub clips: Vec<Clip>,
     /// Яндекс исправил опечатку и искал вот это.
     pub corrected: Option<String>,
 }
@@ -1268,6 +1279,7 @@ fn parse_found(v: &Value) -> Found {
             Some("podcast_episode") => found.tracks.extend(parse_track(&item["podcast_episode"])),
             Some("wave") => found.waves.extend(parse_home_item(&item["wave"]).filter(|wave| matches!(wave, HomeItem::Wave { .. }))),
             Some("artist") => found.artists.extend(artist_card(&item["artist"])),
+            Some("clip") => found.clips.extend(parse_clip(&item["clip"])),
             Some("playlist") => {
                 let owner = id_text(&item["playlist"]["uid"]).unwrap_or_default();
                 found.playlists.extend(parse_playlist(&item["playlist"], &owner));
@@ -1302,6 +1314,245 @@ pub fn liked_pages(uid: &str, token: &str) -> Result<(Vec<Card>, Vec<Card>, Vec<
 pub fn set_artist_disliked(uid: &str, id: &str, disliked: bool, token: &str) -> Result<(), String> {
     let path = if disliked { format!("users/{uid}/dislikes/artists/add?artist-id={id}") } else { format!("users/{uid}/dislikes/artists/{id}/remove") };
     post(&path, "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
+}
+
+/// Клип: в списках приходит то плоским (`clips`, `clips/will/like`), то внутри
+/// `{type: clip, data: {clip, artists}}` (блок исполнителя).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Clip {
+    pub id: String,
+    pub title: String,
+    /// «feat. …», «Closed-Captioned»: пишется рядом с названием.
+    pub version: String,
+    pub artists: Vec<(String, String)>,
+    pub cover: Option<String>,
+    /// Номер ролика у видеоплеера Яндекса. В блоке исполнителя его нет — берётся из `clips?clipIds=`.
+    pub player: Option<String>,
+    pub duration: u32,
+    pub explicit: bool,
+    /// Треки клипа: по первому видно, что это за песня.
+    pub tracks: Vec<String>,
+}
+
+impl Clip {
+    pub fn artist_names(&self) -> String {
+        self.artists.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(", ")
+    }
+
+    pub fn full_title(&self) -> String {
+        if self.version.is_empty() { self.title.clone() } else { format!("{} ({})", self.title, self.version) }
+    }
+
+    pub fn share_link(&self) -> String {
+        // Как у оригинала: страница клипов со списком номеров (`/video?ids=…`).
+        format!("https://music.yandex.ru/video?ids={}", self.id)
+    }
+}
+
+fn clip_cover_uri(uri: &str) -> String {
+    uri.trim_start_matches("https://").trim_start_matches("//").to_string()
+}
+
+fn parse_clip(v: &Value) -> Option<Clip> {
+    // Блок исполнителя: клип и исполнители лежат рядом.
+    if v["type"].as_str() == Some("clip") || v["data"]["clip"].is_object() {
+        let data = &v["data"];
+        let mut clip = parse_clip(&data["clip"])?;
+        if clip.artists.is_empty() {
+            clip.artists = parse_artist_list(&data["artists"]);
+        }
+        return Some(clip);
+    }
+    let id = id_text(&v["clipId"]).or_else(|| id_text(&v["id"]))?;
+    let title = v["title"].as_str().filter(|t| !t.is_empty())?.to_string();
+    let cover = v["thumbnail"].as_str().or(v["cover"]["uri"].as_str()).map(clip_cover_uri);
+    let available = v["contentRestrictions"]["available"].as_bool().unwrap_or(true);
+    if !available {
+        return None;
+    }
+    Some(Clip {
+        id,
+        title,
+        version: v["version"].as_str().unwrap_or_default().trim().to_string(),
+        artists: parse_artist_list(&v["artists"]),
+        cover,
+        player: v["playerId"].as_str().filter(|p| !p.is_empty()).map(str::to_string),
+        duration: v["duration"].as_u64().unwrap_or(0) as u32,
+        explicit: v["explicit"].as_bool().unwrap_or(false) || v["disclaimers"].as_array().is_some_and(|list| list.iter().any(|d| d.as_str() == Some("explicit"))),
+        tracks: v["trackIds"].as_array().into_iter().flatten().filter_map(id_text).collect(),
+    })
+}
+
+fn parse_clips(v: &Value) -> Vec<Clip> {
+    v.as_array().into_iter().flatten().filter_map(parse_clip).collect()
+}
+
+/// «Вам понравится»: клипы по вкусу, как на странице клипов оригинала.
+pub fn clips_will_like(token: &str) -> Result<Vec<Clip>, String> {
+    let v = get("clips/will/like", &[("page", "0"), ("pageSize", "50")], token)?;
+    Ok(parse_clips(&result(&v)["clips"]))
+}
+
+/// Клипы в коллекции. Яндекс отдаёт номера, подробности — отдельным запросом.
+pub fn liked_clips(uid: &str, token: &str) -> Result<Vec<Clip>, String> {
+    let v = get(&format!("users/{uid}/likes/clips"), &[("page", "0"), ("pageSize", "200")], token)?;
+    let v = result(&v);
+    let list = v["clips"].as_array().or(v["items"].as_array()).cloned().unwrap_or_default();
+    let mut found: Vec<Clip> = list.iter().filter_map(parse_clip).collect();
+    let ids: Vec<String> = list.iter().filter_map(|item| id_text(&item["clipId"]).or_else(|| id_text(&item["id"])).or_else(|| id_text(item))).collect();
+    // Пришли одни номера: подробности одним запросом.
+    if found.len() < ids.len() {
+        found = clips_by_id(&ids, token)?;
+    }
+    Ok(found)
+}
+
+pub fn clips_by_id(ids: &[String], token: &str) -> Result<Vec<Clip>, String> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let v = get("clips", &[("clipIds", &ids.join(","))], token)?;
+    Ok(parse_clips(result(&v)))
+}
+
+/// «Время клипов»: лента клипов по вкусу, как новая вкладка волны в оригинале.
+#[derive(Clone, Debug, Default)]
+pub struct ClipFeed {
+    pub title: String,
+    pub description: String,
+    pub button: String,
+    pub clips: Vec<Clip>,
+}
+
+const CLIP_FEED_TYPES: &str = r#""supportedTypes":["CLIP","TRACK"],"child":false,"allowExplicit":true"#;
+
+fn feed_clips(v: &Value) -> Vec<Clip> {
+    v["list"].as_array().into_iter().flatten().filter(|item| item["type"].as_str().is_some_and(|kind| kind.eq_ignore_ascii_case("clip"))).filter_map(|item| parse_clip(&item["data"])).collect()
+}
+
+/// Карточка «Время клипов»: название, описание и первые клипы.
+pub fn clip_feed(token: &str) -> Result<ClipFeed, String> {
+    let v = post("rotor/combined/session/landing", "application/json", format!("{{{CLIP_FEED_TYPES}}}"), token)?;
+    let v = result(&v);
+    Ok(ClipFeed {
+        title: v["title"].as_str().unwrap_or("Время клипов").to_string(),
+        description: v["description"].as_str().unwrap_or_default().to_string(),
+        button: v["button"].as_str().unwrap_or("Смотреть").to_string(),
+        clips: feed_clips(v),
+    })
+}
+
+/// Начинает ленту: номер сессии и первые клипы.
+pub fn clip_feed_start(token: &str) -> Result<(String, Vec<Clip>), String> {
+    let v = post("rotor/combined/session/new", "application/json", format!("{{{CLIP_FEED_TYPES},\"queue\":[]}}"), token)?;
+    let v = result(&v);
+    let session = v["sessionId"].as_str().ok_or("Яндекс не начал ленту клипов")?.to_string();
+    Ok((session, feed_clips(v)))
+}
+
+/// Следующие клипы ленты. Показанные уходят в `queue`: без них Яндекс повторяет те же.
+pub fn clip_feed_next(session: &str, seen: &[String], token: &str) -> Result<Vec<Clip>, String> {
+    let queue: Vec<Value> = seen.iter().map(|id| json!({"type": "CLIP", "id": id.parse::<u64>().map(Value::from).unwrap_or_else(|_| Value::from(id.as_str()))})).collect();
+    let v = post(&format!("rotor/combined/session/{session}/next"), "application/json", json!({"queue": queue}).to_string(), token)?;
+    Ok(feed_clips(result(&v)))
+}
+
+/// «О клипе»: лейбл, режиссёр и прочие авторы.
+pub fn clip_credits(id: &str, token: &str) -> Result<Vec<(String, String)>, String> {
+    let v = get(&format!("clips/{id}/credits"), &[], token)?;
+    Ok(result(&v)["credits"].as_array().into_iter().flatten().filter_map(|c| Some((c["title"].as_str()?.to_string(), c["value"].as_str()?.to_string()))).collect())
+}
+
+pub fn set_clip_liked(uid: &str, id: &str, liked: bool, token: &str) -> Result<(), String> {
+    set_page_liked(uid, "clips", "clip-id", id, liked, token)
+}
+
+/// Качества клипа: высота кадра и адрес потока, от лучшего к худшему. Плееру Яндекса
+/// нужен вход: токен Музыки он принимает, если запрос пришёл как из браузера.
+pub fn clip_stream(clip: &Clip, token: &str) -> Result<Vec<(u32, String)>, String> {
+    let player = match &clip.player {
+        Some(player) => player.clone(),
+        None => clips_by_id(std::slice::from_ref(&clip.id), token)?.into_iter().find_map(|found| found.player).ok_or("Яндекс не прислал клип")?,
+    };
+    let url = format!("{VIDEO_PLAYER}/{player}.json");
+    let resp = agent()
+        .get(&url)
+        .query("service", "ya-music")
+        .query("from", "ya-music")
+        .header("Authorization", &format!("OAuth {token}"))
+        .header("User-Agent", BROWSER)
+        .header("Referer", "https://music.yandex.ru/")
+        .header("Origin", "https://music.yandex.ru")
+        .call()
+        .map_err(|e| format!("Не удалось связаться с Яндексом: {e}"))?;
+    let status = resp.status().as_u16();
+    let body = resp.into_body().read_to_string().map_err(|e| e.to_string())?;
+    let v: Value = serde_json::from_str(&body).map_err(|_| format!("Видеоплеер Яндекса ответил {status}"))?;
+    let master = parse_clip_stream(&v)?;
+    // В общем списке каждое качество повторено запасными копиями: плеер открыл бы их все.
+    // Берём список сами и отдаём плееру один вариант.
+    let resp = agent().get(&master).header("User-Agent", BROWSER).call().map_err(|e| format!("Не удалось связаться с Яндексом: {e}"))?;
+    let base = ureq::ResponseExt::get_uri(&resp).to_string();
+    let text = resp.into_body().read_to_string().map_err(|e| e.to_string())?;
+    let variants = parse_variants(&text, &base);
+    if variants.is_empty() {
+        return Ok(vec![(0, master)]);
+    }
+    Ok(variants)
+}
+
+/// Варианты из списка HLS: по одному на высоту кадра, с наибольшим битрейтом, без запасных копий.
+fn parse_variants(text: &str, base: &str) -> Vec<(u32, String)> {
+    let origin = base.find("://").and_then(|at| base[at + 3..].find('/').map(|slash| &base[..at + 3 + slash])).unwrap_or(base);
+    let folder = base.split('?').next().unwrap_or(base).rsplit_once('/').map_or(base, |(folder, _)| folder);
+    let mut found: Vec<(u32, u64, String)> = Vec::new();
+    let mut lines = text.lines().map(str::trim);
+    while let Some(line) = lines.next() {
+        let Some(info) = line.strip_prefix("#EXT-X-STREAM-INF:") else { continue };
+        let Some(uri) = lines.next().filter(|uri| !uri.is_empty() && !uri.starts_with('#')) else { continue };
+        if uri.contains("redundant=") {
+            continue;
+        }
+        let field = |name: &str| info.split(',').find_map(|part| part.trim().strip_prefix(name));
+        let height = field("RESOLUTION=").and_then(|r| r.split_once('x')).and_then(|(_, h)| h.parse().ok()).unwrap_or(0);
+        let bandwidth = field("BANDWIDTH=").and_then(|b| b.parse().ok()).unwrap_or(0);
+        let url = if uri.starts_with("http") {
+            uri.to_string()
+        } else if uri.starts_with('/') {
+            format!("{origin}{uri}")
+        } else {
+            format!("{folder}/{uri}")
+        };
+        match found.iter_mut().find(|(h, ..)| *h == height) {
+            Some(have) if have.1 < bandwidth => *have = (height, bandwidth, url),
+            Some(_) => {}
+            None => found.push((height, bandwidth, url)),
+        }
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    found.into_iter().map(|(height, _, url)| (height, url)).collect()
+}
+
+fn parse_clip_stream(v: &Value) -> Result<String, String> {
+    let streams = v["content"]["streams"].as_array().cloned().unwrap_or_default();
+    let pick = |kind: &str| streams.iter().find(|s| s["stream_type"].as_str() == Some(kind)).and_then(|s| s["url"].as_str()).filter(|url| url.starts_with("https://")).map(str::to_string);
+    if let Some(url) = pick("HLS").or_else(|| pick("DASH")) {
+        return Ok(url);
+    }
+    Err(match v["error"].as_str().unwrap_or_default() {
+        "no_licenses" => "Клип недоступен: Яндекс не дал на него прав".to_string(),
+        "old_browser" => "Видеоплеер Яндекса не принял запрос".to_string(),
+        "" => "Яндекс не прислал видео".to_string(),
+        other => format!("Клип недоступен: {other}"),
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn clip_variants_skip_copies_and_sort() {
+    let text = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=394206,CODECS=\"avc1.4D400C,mp4a.40.2\",RESOLUTION=256x144\n/vod/a/index-v1-a4.m3u8?vsid=1\n#EXT-X-STREAM-INF:BANDWIDTH=5085408,RESOLUTION=1920x1080\n/vod/a/index-v7-a4.m3u8?vsid=1\n#EXT-X-STREAM-INF:BANDWIDTH=5085408,RESOLUTION=1920x1080\n/vod/a/index-v7-a4.m3u8?redundant=1&vsid=1\n";
+    let found = parse_variants(text, "https://strm.yandex.ru/vod/a/master.m3u8?vsid=1");
+    assert_eq!(found, vec![(1080, "https://strm.yandex.ru/vod/a/index-v7-a4.m3u8?vsid=1".to_string()), (144, "https://strm.yandex.ru/vod/a/index-v1-a4.m3u8?vsid=1".to_string())]);
 }
 
 /// `kind` — albums или artists, `param` — album-id или artist-id.
@@ -1582,6 +1833,8 @@ pub enum Link {
     VibeRoom(String),
     /// Подборка из блока страницы или редакции раздела: путь запроса к Яндексу.
     Block(String),
+    /// Клипы по номерам и какой из них открыть (`/video?ids=…&activeIndex=…`).
+    Clips(Vec<String>, usize),
 }
 
 /// Так помечена подборка из блока среди подборок редакции: в `id` лежит путь запроса.
@@ -1626,6 +1879,12 @@ pub fn parse_link(text: &str) -> Option<Link> {
         ["non-music", "category", category, ..] => Some(Link::Tag(format!("{CATEGORY}{category}"))),
         [first @ ("collection" | "non-music" | "kids" | "chart"), ..] => page(&parts[..parts.len().min(if *first == "collection" { 2 } else { 1 })]),
         ["multivibe", room, ..] => Some(Link::VibeRoom(room.to_string())),
+        ["video", ..] => {
+            let value = |key: &str| query.split('&').find_map(|pair| pair.strip_prefix(key)).map(|v| v.replace("%2C", ",").replace("%2c", ","));
+            let ids: Vec<String> = value("ids=").unwrap_or_default().split(',').filter_map(number).collect();
+            let index = value("activeIndex=").and_then(|v| v.parse().ok()).unwrap_or(0);
+            Some(if ids.is_empty() { Link::Page("video".to_string()) } else { Link::Clips(ids, index) })
+        }
         ["album", album, ..] => number(album).map(Link::Album),
         ["track", track, ..] => number(track).map(Link::Track),
         ["artist", artist, ..] => number(artist).map(Link::Artist),
