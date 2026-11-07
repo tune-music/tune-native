@@ -50,6 +50,8 @@ use player::Player;
 use raw_window_handle::RawWindowHandle;
 use settings::{Look, Quality, Repeat, Settings};
 
+/// Шаг перерисовки, пока идёт клип и больше ничего не движется.
+const CLIP_FRAME: Duration = Duration::from_micros(16_667);
 const TICK: Duration = Duration::from_millis(500);
 const COVER: f32 = 40.0;
 const BAR_COVER: f32 = 52.0;
@@ -1729,13 +1731,17 @@ impl App {
     }
 
     fn animating(&self) -> bool {
+        self.ui_animating() || self.clip.as_ref().is_some_and(clips::Watch::moving)
+    }
+
+    /// Анимации интерфейса: им нужен каждый кадр монитора.
+    fn ui_animating(&self) -> bool {
         self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.eq_fade.busy() || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy() || self.wheel_turn != self.wheel_target || self.wheel_reveal != if self.wheel_open { 1.0 } else { 0.0 }
             || (self.wheel_ready() && self.wheel_arrow < 1.0)
             || self.word_now() != self.word_for
             || (self.word_for.is_some() && self.word_level < 1.0)
             || self.word_grow != self.word_grow_target()
             || self.word_shut
-            || self.clip.as_ref().is_some_and(clips::Watch::moving)
     }
 
     /// Рассказ раскрыт, когда он уже пришёл и его не сворачивают.
@@ -6495,7 +6501,15 @@ impl App {
             Screen::Main(_) if self.active => time::every(TICK).map(|_| Message::Tick),
             _ => Subscription::none(),
         };
-        let frames = if self.animating() { window::frames().map(Message::Frame) } else { Subscription::none() };
+        // Клипу хватает 60 кадров в секунду: окно не перерисовывается на каждый кадр монитора
+        // (на 240 Гц это вчетверо больше работы видеокарте, а нового кадра видео нет).
+        let frames = if self.ui_animating() {
+            window::frames().map(Message::Frame)
+        } else if self.animating() {
+            time::every(CLIP_FRAME).map(|_| Message::Frame(Instant::now()))
+        } else {
+            Subscription::none()
+        };
         let online = if self.offline { time::every(ONLINE_CHECK).map(|_| Message::OnlineCheck) } else { Subscription::none() };
         let sync = match &self.screen {
             Screen::Main(_) if !self.offline && self.uid.is_some() => time::every(SYNC_EVERY).map(|_| Message::SyncTick),
@@ -6593,9 +6607,11 @@ impl App {
         let main: Element<'_, Message> = container(main).padding(Padding::ZERO.right(12).bottom(12)).width(Length::Fill).height(Length::Fill).into();
         let columns = row![self.view_sidebar(), main];
         let base = container(columns).width(Length::Fill).height(Length::Fill).style(ui::root);
-        let mut layers = stack![base];
+        // Окно клипа непрозрачно и на всё окно: что под ним, не рисуем.
+        let covered = self.clip.is_some();
+        let mut layers = stack![anim::covered(base, covered)];
         if let Some(full) = self.view_full() {
-            layers = layers.push(full);
+            layers = layers.push(anim::covered(full, covered));
         }
         if let Some(clip) = self.view_clip() {
             layers = layers.push(clip);
