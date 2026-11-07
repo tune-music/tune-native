@@ -163,14 +163,31 @@ impl Widget<Message, Theme, Renderer> for Reveal<'_> {
 }
 
 impl Reveal<'_> {
+    /// Область экрана в координатах содержимого: обратно сдвигу и масштабу.
+    fn unmove(&self, bounds: Rectangle, seen: Rectangle) -> Rectangle {
+        let scale = self.scale.max(0.01);
+        let (ox, oy) = (bounds.x + bounds.width * self.origin.0, bounds.y + bounds.height * self.origin.1);
+        Rectangle {
+            x: (seen.x - self.shift.x - ox) / scale + ox,
+            y: (seen.y - self.shift.y - oy) / scale + oy,
+            width: seen.width / scale,
+            height: seen.height / scale,
+        }
+    }
+
     fn draw_moved(&self, tree: &Tree, renderer: &mut Renderer, theme: &Theme, style: &renderer::Style, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle) {
         let bounds = layout.bounds();
         if self.shift == Vector::ZERO && self.scale == 1.0 {
             self.content.as_widget().draw(&tree.children[0], renderer, theme, style, layout, cursor, viewport);
         } else {
             let move_to = Transformation::translate(self.shift.x, self.shift.y) * scale_around(bounds, self.origin.0, self.origin.1, self.scale);
+            // Свои слои (прокрутка, полоса прокрутки) содержимое обрезает по видимой области
+            // и не знает об обрезке снаружи. Отдаём ему область, которая после сдвига
+            // и масштаба ляжет ровно в наше место, — тогда и они не вылезут за край.
+            let inner = if self.clip { bounds.intersection(viewport).map(|seen| self.unmove(bounds, seen)) } else { None };
+            let inner = inner.unwrap_or(*viewport);
             renderer.with_transformation(move_to, |renderer| {
-                self.content.as_widget().draw(&tree.children[0], renderer, theme, style, layout, cursor, viewport);
+                self.content.as_widget().draw(&tree.children[0], renderer, theme, style, layout, cursor, &inner);
             });
         }
         if self.veil.a > 0.0 {
@@ -502,5 +519,62 @@ mod tests {
         fade.sync(Some(2));
         assert!(fade.busy());
         assert_eq!(fade.item, Some(2));
+    }
+}
+
+/// Раскрывающийся блок: занимает такую долю своей настоящей высоты, а остальное обрезано.
+/// Высота берётся из раскладки, поэтому блок растёт ровно до конца текста, без прикидок.
+pub struct Grow<'a> {
+    content: Element<'a, Message>,
+    level: f32,
+}
+
+pub fn grow<'a>(content: impl Into<Element<'a, Message>>, level: f32) -> Element<'a, Message> {
+    Element::new(Grow { content: content.into(), level: level.clamp(0.0, 1.0) })
+}
+
+impl Widget<Message, Theme, Renderer> for Grow<'_> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size::new(self.content.as_widget().size().width, Length::Shrink)
+    }
+
+    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) -> layout::Node {
+        let inner = self.content.as_widget_mut().layout(&mut tree.children[0], renderer, &limits.loose());
+        let full = inner.size();
+        layout::Node::with_children(Size::new(full.width, (full.height * self.level).round()), vec![inner])
+    }
+
+    fn operate(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer, operation: &mut dyn Operation) {
+        let inner = layout.children().next().unwrap();
+        self.content.as_widget_mut().operate(&mut tree.children[0], inner, renderer, operation);
+    }
+
+    fn update(&mut self, tree: &mut Tree, event: &Event, layout: Layout<'_>, cursor: mouse::Cursor, renderer: &Renderer, clipboard: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, viewport: &Rectangle) {
+        if self.level > 0.0 {
+            let inner = layout.children().next().unwrap();
+            let cursor = if cursor.is_over(layout.bounds()) { cursor } else { mouse::Cursor::Unavailable };
+            self.content.as_widget_mut().update(&mut tree.children[0], event, inner, cursor, renderer, clipboard, shell, viewport);
+        }
+    }
+
+    fn mouse_interaction(&self, tree: &Tree, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle, renderer: &Renderer) -> mouse::Interaction {
+        if self.level == 0.0 || !cursor.is_over(layout.bounds()) {
+            return mouse::Interaction::None;
+        }
+        self.content.as_widget().mouse_interaction(&tree.children[0], layout.children().next().unwrap(), cursor, viewport, renderer)
+    }
+
+    fn draw(&self, tree: &Tree, renderer: &mut Renderer, theme: &Theme, style: &renderer::Style, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle) {
+        let Some(seen) = layout.bounds().intersection(viewport) else { return };
+        let inner = layout.children().next().unwrap();
+        renderer.with_layer(seen, |renderer| self.content.as_widget().draw(&tree.children[0], renderer, theme, style, inner, cursor, &seen));
     }
 }

@@ -590,13 +590,7 @@ pub fn scroll<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Scrollable<'a, M
     Scrollable::new(content).direction(scrollable::Direction::Vertical(bar)).style(scroll_style)
 }
 
-/// Небольшая область внутри карточки: полоса тоньше и не спорит с полосой страницы.
-pub fn scroll_inner<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Scrollable<'a, M> {
-    let bar = scrollable::Scrollbar::new().width(SCROLL_INNER).scroller_width(SCROLL_INNER).margin(0);
-    Scrollable::new(content).direction(scrollable::Direction::Vertical(bar)).style(scroll_still)
-}
-
-/// Лента, которая листается вбок: та же тонкая полоса снизу.
+/// Лента, которая листается вбок: тонкая полоса снизу.
 pub fn scroll_x<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Scrollable<'a, M> {
     let bar = scrollable::Scrollbar::new().width(SCROLL_INNER).scroller_width(SCROLL_INNER).margin(0);
     Scrollable::new(content).direction(scrollable::Direction::Horizontal(bar)).style(scroll_still)

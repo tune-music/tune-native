@@ -183,7 +183,8 @@ const WORD_SLOT: f32 = 196.0;
 const APPEAR: f32 = 0.35;
 /// За сколько секунд раскрывается рассказ «Слов в волне» и сколько места под строкой «Свернуть».
 const WORD_GROW_TIME: f32 = 0.32;
-const WORD_FOLD: f32 = 34.0;
+/// Высота строки с оценками внизу карточки.
+const WORD_ACTIONS: f32 = 36.0;
 /// Обложки подсказок колеса.
 const WHEEL_COVER: &str = "wheel:";
 /// Обложки Моих волн на двоих.
@@ -193,12 +194,8 @@ const WHEEL_BLUR: &str = "wheel-blur:";
 const WHEEL_BLUR_SIGMA: f32 = 7.0;
 /// К скольким трекам волны вперёд просить карточки «Слов в волне».
 const WORDS_AHEAD: usize = 10;
-/// Ширина карточки «Слов в волне» и высота рассказа, дальше он прокручивается.
+/// Ширина карточки «Слов в волне».
 const WORD_WIDTH: f32 = 560.0;
-const WORD_STORY_HEIGHT: f32 = 220.0;
-const WORD_STORY_MIN: f32 = 72.0;
-/// Сколько высоты окна занимает экран волны без рассказа: заголовок, кнопки, плеер и сама карточка.
-const WORD_PAGE_REST: f32 = 900.0;
 /// Что пишет оригинал, пока готовит рассказ к карточке.
 const WORD_LOADING: [&str; 5] = ["Изучаю звучание", "Настраиваюсь", "Собираю интересное силой ИИ", "Читаю про артиста", "Ловлю ритм"];
 /// Сколько последних треков очереди отдать Яндексу, продолжая волну, как оригинал.
@@ -2353,20 +2350,22 @@ impl App {
         let story = open.and_then(|(_, big)| big.as_ref());
         // Рассказ выезжает плавно: карточка растёт на его высоту, текст проявляется.
         let grow = smooth_step(if open.is_some() { self.word_grow } else { 0.0 });
-        let (_, window) = *WINDOW.lock().unwrap();
-        let room = (window - WORD_PAGE_REST).clamp(WORD_STORY_MIN, WORD_STORY_HEIGHT);
-        let story_height = story.map_or(0.0, |big| word_story_height(&big.text, width - 44.0 - 14.0).min(room));
         let badge = container(row![ui::icon(ui::WAVE, 14.0, c(ui::c().accent)), text("Слова в волне").size(12).font(ui::font_medium()).color(c(ui::c().accent))].spacing(6).align_y(Alignment::Center)).padding([4, 10]).style(ui::word_badge(a));
         let header = row![badge, Space::new().width(Length::Fill), text("ИИ").size(12).color(c(ui::c().faint))].align_y(Alignment::Center);
         let title = text(&card.text).size(19).font(ui::font_medium()).color(c(ui::c().strong)).wrapping(Wrapping::WordOrGlyph);
+        // Заголовок занимает ровно оставленное место, рассказ раскрывается под ним целиком.
+        let head = container(column![header, title].spacing(14)).height(WORD_SLOT - 40.0 - WORD_ACTIONS - 14.0).clip(true);
         let area: Element<'_, Message> = match story.filter(|_| grow > 0.0) {
             Some(big) => {
                 let shown = c(ui::c().text).scale_alpha(grow);
-                let text_box = ui::scroll_inner(container(text(&big.text).size(15).line_height(1.45).color(shown).wrapping(Wrapping::WordOrGlyph)).padding(Padding::ZERO.right(14))).height(Length::Fill);
-                let fold = hover_line(row![text("Свернуть").size(13), ui::icon(ui::COLLAPSE, 14.0, c(ui::c().muted).scale_alpha(grow))].spacing(2).align_y(Alignment::Center), c(ui::c().muted).scale_alpha(grow), c(ui::c().strong), Message::WordOpen(track.id.clone()));
-                column![text_box, fold].spacing(10).height(Length::Fill).into()
+                let mut story = column![text(&big.text).size(15).line_height(1.45).color(shown).wrapping(Wrapping::WordOrGlyph)].spacing(10).width(Length::Fill);
+                if let Some((label, url)) = &big.action {
+                    let tint = c(ui::c().accent).scale_alpha(grow);
+                    story = story.push(hover_line(row![text(label.as_str()).size(13), ui::icon(ui::RIGHT, 14.0, tint)].spacing(2).align_y(Alignment::Center), tint, c(ui::c().strong), Message::OpenUrl(url.clone())));
+                }
+                anim::grow(container(story).width(Length::Fill).padding(Padding::ZERO.bottom(14)), grow)
             }
-            None => Space::new().height(Length::Fill).into(),
+            None => Space::new().height(0).into(),
         };
         let pill = |icon, label: &'static str, active: bool, press: Message| {
             let tint = c(if active { ui::c().on_accent } else { ui::c().text });
@@ -2381,25 +2380,22 @@ impl App {
         ]
         .spacing(8)
         .align_y(Alignment::Center);
-        // Справа одно место: «Подробнее», пока готовится — что делает ИИ, потом ссылка на Алису.
+        // Справа одно место: «Подробнее», пока готовится — что делает ИИ, раскрытый — «Свернуть».
         match open {
-            None if card.big.is_some() => {
-                actions = actions.push(hover_line(row![text("Подробнее").size(13), ui::icon(ui::RIGHT, 14.0, c(ui::c().accent))].spacing(2).align_y(Alignment::Center), c(ui::c().accent), c(ui::c().strong), Message::WordOpen(track.id.clone())));
-            }
-            None => {}
             Some((_, None)) => {
                 let phrase = WORD_LOADING[card.id.bytes().map(usize::from).sum::<usize>() % WORD_LOADING.len()];
                 actions = actions.push(text(format!("{phrase}…")).size(13).color(c(ui::c().muted)));
             }
-            Some((_, Some(big))) => {
-                if let Some((label, url)) = &big.action {
-                    let tint = c(ui::c().accent).scale_alpha(grow.max(0.15));
-                    actions = actions.push(hover_line(row![text(label.as_str()).size(13), ui::icon(ui::RIGHT, 14.0, tint)].spacing(2).align_y(Alignment::Center), tint, c(ui::c().strong), Message::OpenUrl(url.clone())));
-                }
+            Some((_, Some(_))) if !self.word_shut => {
+                actions = actions.push(hover_line(row![text("Свернуть").size(13), ui::icon(ui::COLLAPSE, 14.0, c(ui::c().muted))].spacing(2).align_y(Alignment::Center), c(ui::c().muted), c(ui::c().strong), Message::WordOpen(track.id.clone())));
             }
+            _ if card.big.is_some() => {
+                actions = actions.push(hover_line(row![text("Подробнее").size(13), ui::icon(ui::RIGHT, 14.0, c(ui::c().accent))].spacing(2).align_y(Alignment::Center), c(ui::c().accent), c(ui::c().strong), Message::WordOpen(track.id.clone())));
+            }
+            _ => {}
         }
-        let height = WORD_SLOT + grow * (story_height + WORD_FOLD);
-        let card = container(column![header, title, area, actions].spacing(14)).padding([20, 22]).width(width).height(height).clip(true).style(ui::word_card(a));
+        let actions = container(actions).height(WORD_ACTIONS).align_y(Alignment::Center);
+        let card = container(column![head, Space::new().height(14), area, actions]).padding([20, 22]).width(width).style(ui::word_card(a));
         Some(card.into())
     }
 
@@ -9323,15 +9319,6 @@ fn average_color(handle: &image::Handle) -> Option<iced::Color> {
     (weights > 0.0).then(|| iced::Color::from_rgb(part(sum[0]), part(sum[1]), part(sum[2])))
 }
 
-/// Готовые пиксели обложки. Сжатую картинку iced распаковал бы прямо во время кадра,
-/// и при смене страницы с десятком новых обложек анимация спотыкалась бы.
-/// Примерная высота рассказа: строки по средней ширине буквы, как их раскладывает шрифт 15 px.
-fn word_story_height(text: &str, width: f32) -> f32 {
-    let per_line = (width / 7.4).max(10.0) as usize;
-    let lines: usize = text.split('\n').map(|part| part.chars().count().div_ceil(per_line).max(1)).sum();
-    lines as f32 * 15.0 * 1.45 + 4.0
-}
-
 /// Размытая обложка для краёв колеса волны.
 fn decoded_blurred(bytes: &[u8]) -> Option<image::Handle> {
     let picture = ::image::load_from_memory(bytes).ok()?.thumbnail(120, 120).into_rgba8();
@@ -9340,6 +9327,8 @@ fn decoded_blurred(bytes: &[u8]) -> Option<image::Handle> {
     Some(image::Handle::from_rgba(width, height, picture.into_raw()))
 }
 
+/// Готовые пиксели обложки. Сжатую картинку iced распаковал бы прямо во время кадра,
+/// и при смене страницы с десятком новых обложек анимация спотыкалась бы.
 fn decoded(bytes: &[u8]) -> Option<image::Handle> {
     let picture = ::image::load_from_memory(bytes).ok()?.into_rgba8();
     let (width, height) = picture.dimensions();
