@@ -230,6 +230,20 @@ pub fn data_dir() -> PathBuf {
     PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("dev.tune.native")
 }
 
+/// Журнал ошибок: у собранной программы нет консоли, а без журнала редкую ошибку не найти.
+/// Больше полумегабайта — старый журнал уходит в `log.old.txt`.
+pub fn log(message: &str) {
+    use std::io::Write;
+    let path = data_dir().join("log.txt");
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 512 * 1024) {
+        let _ = std::fs::rename(&path, data_dir().join("log.old.txt"));
+    }
+    let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(file, "{seconds} {message}");
+    }
+}
+
 fn token_path() -> PathBuf {
     data_dir().join("token")
 }
@@ -347,6 +361,20 @@ fn fetch(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, Strin
 }
 
 fn post(path: &str, content_type: &str, body: String, token: &str) -> Result<Value, String> {
+    // «Слишком много запросов» бывает на запуске, когда всё грузится разом: ждём и повторяем.
+    let mut waits = BUSY_WAITS.iter();
+    loop {
+        match post_once(path, content_type, body.clone(), token) {
+            Err(e) if e == BUSY => match waits.next() {
+                Some(wait) => std::thread::sleep(*wait),
+                None => return Err(e),
+            },
+            other => return other,
+        }
+    }
+}
+
+fn post_once(path: &str, content_type: &str, body: String, token: &str) -> Result<Value, String> {
     // Отзывы волны и отчёты о прослушивании ничего из сохранённого не меняют.
     if !path.starts_with("rotor") && !path.starts_with("words") && !path.starts_with("wheel") && !path.starts_with("plays") && !path.starts_with("lyric-views") && !path.starts_with("availability") && !path.starts_with("streams/progress/sync") {
         forget_cache();

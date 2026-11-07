@@ -238,9 +238,6 @@ const FULL_CHROME: f32 = 330.0;
 const EQ_HEIGHT: f32 = 150.0;
 /// Эквалайзер из трекбара: ширина и высота окна, высота ползунков в нём.
 const EQ_POPUP_WIDTH: f32 = 520.0;
-const EQ_POPUP_HEIGHT: f32 = 336.0;
-/// Насколько выше точки клика по кнопке кончается окно эквалайзера, чтобы не закрывать трекбар.
-const EQ_POPUP_LIFT: f32 = 76.0;
 const EQ_POPUP_SLIDER: f32 = 120.0;
 const FULL_COVER_MAX: f32 = 560.0;
 const FULL_TINT: f32 = 0.55;
@@ -292,8 +289,10 @@ const TIME_WIDTH: f32 = 72.0;
 const TIME_WIDTH_EPISODE: f32 = 150.0;
 /// От этой ширины коллекция показывает треки в две колонки.
 const COLLECTION_COLUMNS: f32 = 860.0;
+/// Сколько раз сами повторяем загрузку аккаунта (через 2, 4, 8… секунд).
+const ACCOUNT_TRIES: u32 = 6;
 /// С какой ширины основной части ссылки коллекции помещаются в строку с заголовком.
-const COLLECTION_HEADER: f32 = 980.0;
+const COLLECTION_HEADER: f32 = 880.0;
 const PAGE_COVER_SMALL: f32 = 120.0;
 const PAGE_COVER_WIDTH: f32 = 640.0;
 /// Сколько результатов просить: на вкладке «Всё» и на отдельной вкладке.
@@ -686,6 +685,8 @@ enum Preview {
     WaveTune,
     Lyrics,
     Collection,
+    /// Коллекция открыта до прихода аккаунта (с `TUNE_SLOW_ACCOUNT`).
+    CollectionEarly,
     /// Исполнители коллекции с топом месяца.
     CollectionArtists,
     /// «Мне нравится» с выбранным первым фильтром.
@@ -1063,6 +1064,7 @@ struct App {
     /// Открытый клип поверх всего окна.
     clip: Option<clips::Watch>,
     clip_ticket: u64,
+    account_tries: u32,
     clips_liked: Vec<api::Clip>,
     clips_like: Vec<api::Clip>,
     clips_loading: bool,
@@ -1487,6 +1489,11 @@ impl App {
             Some(token) => load_account(token.clone()),
             None => Task::done(Message::LoginOpen),
         };
+        // Проверка запуска: коллекцию открыли раньше, чем пришёл аккаунт.
+        let (preview, task) = match preview {
+            Some(Preview::CollectionEarly) => (None, Task::batch([task, Task::done(Message::Open(Section::Collection))])),
+            preview => (preview, task),
+        };
         let app = Self {
             screen: token.map_or(Screen::Login(false), Screen::Main),
             section: Section::Wave,
@@ -1680,6 +1687,7 @@ impl App {
             full_fade: Fade::new(FULL_OPEN, FULL_CLOSE),
             clip: None,
             clip_ticket: 0,
+            account_tries: 0,
             clips_liked: Vec::new(),
             clips_like: Vec::new(),
             clips_loading: false,
@@ -2056,6 +2064,7 @@ impl App {
 
     fn fail(&mut self, error: String) -> Task<Message> {
         eprintln!("ошибка: {error}");
+        api::log(&format!("ошибка: {error}"));
         self.retry = None;
         if error == NEED_LOGIN {
             self.reset();
@@ -3778,6 +3787,7 @@ impl App {
                 return Task::done(Message::LoginOpen);
             }
             Message::Account(Ok((profile, ids, disliked))) => {
+                self.account_tries = 0;
                 offline::save_account(&profile, &ids, &disliked);
                 if let Some(token) = self.token().filter(|_| !self.offline) {
                     offline::flush_plays(token);
@@ -3811,6 +3821,8 @@ impl App {
                     Some(Preview::WaveSeeded) => self.wave_load(vec!["artist:3121".to_string()], Some(wave_label("artist:3121", "Metallica")), false),
                     Some(Preview::Likes | Preview::LikesEnd | Preview::Menu | Preview::Panels | Preview::TrackInfo | Preview::QueueJump) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
+                    // Превращается в обычный запуск ещё в `new`.
+                    Some(Preview::CollectionEarly) => Task::none(),
                     Some(Preview::Clips) => self.update(Message::Open(Section::Clips)),
                     Some(Preview::Clip(id)) => match self.token() {
                         Some(token) => Task::perform(background(move || api::clips_by_id(&[id], &token)), |result| Message::ClipLink(result, 0)),
@@ -3978,7 +3990,6 @@ impl App {
                         self.query = query;
                         self.update(Message::Search)
                     }
-                    None if self.section == Section::Likes => self.likes_more(),
                     // Главная сразу показывает трек и управление, как в оригинале.
                     None if self.queue.is_empty() => match session::load() {
                         Some(saved) => self.restore(saved),
@@ -3986,7 +3997,9 @@ impl App {
                     },
                     None => Task::none(),
                 };
-                return Task::batch([pins, page]);
+                // Страницу открыли раньше, чем пришёл аккаунт: без него она осталась пустой.
+                let reload = if self.preview.is_none() && account_page(self.section) && !(self.section == Section::Playlists && self.playlist.is_some()) { self.update(Message::Open(self.section)) } else { Task::none() };
+                return Task::batch([pins, page, reload]);
             }
             Message::PinsLoaded(Ok(pins)) => {
                 if self.pin_saving > 0 {
@@ -4246,7 +4259,18 @@ impl App {
                 let downloads = if self.downloads.is_empty() { Task::none() } else { self.update(Message::Open(Section::Downloads)) };
                 return Task::batch([opened, downloads]);
             }
-            Message::Account(Err(e)) => return self.fail_retry(e, Message::AccountRetry),
+            // Без аккаунта пусты коллекция, лайки и многое другое: повторяем сами, не дожидаясь
+            // кнопки, — плашку с ошибкой закрывает любой переход.
+            Message::Account(Err(e)) => {
+                let shown = self.fail_retry(e, Message::AccountRetry);
+                self.account_tries += 1;
+                if self.account_tries > ACCOUNT_TRIES || self.token().is_none() {
+                    return shown;
+                }
+                let wait = Duration::from_secs(2u64.pow(self.account_tries.min(5)));
+                let again = Task::perform(background(move || std::thread::sleep(wait)), |()| Message::AccountRetry);
+                return Task::batch([shown, again]);
+            }
             Message::SyncTick => {
                 let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
                 self.sync_ticks += 1;
@@ -4304,7 +4328,7 @@ impl App {
                 return Task::batch([back, reload]);
             }
             Message::AccountRetry => {
-                if let Some(token) = self.token() {
+                if let Some(token) = self.token().filter(|_| self.profile.is_none() || self.offline) {
                     return load_account(token);
                 }
             }
@@ -6630,8 +6654,8 @@ impl App {
         if let Some((x, y)) = self.quality_fade.item {
             layers = layers.push(self.view_quality(x, y));
         }
-        if let Some((x, y)) = self.eq_fade.item {
-            layers = layers.push(self.view_eq_popup(x, y));
+        if let Some((x, _)) = self.eq_fade.item {
+            layers = layers.push(self.view_eq_popup(x));
         }
         if let Some((x, y)) = self.page_menu_fade.item {
             layers = layers.push(self.view_page_menu(x, y));
@@ -7239,7 +7263,7 @@ impl App {
     }
 
     /// Эквалайзер, открытый из трекбара: тот же, что в настройках, пресеты списком.
-    fn view_eq_popup(&self, x: f32, y: f32) -> Element<'_, Message> {
+    fn view_eq_popup(&self, x: f32) -> Element<'_, Message> {
         let (alpha, live) = (self.eq_fade.shown(), self.eq_fade.live);
         let eq = self.eq;
         let head = row![text("Эквалайзер").size(16).font(ui::font_medium()).color(ui::c().text.scale_alpha(alpha)).width(Length::Fill), view_switch(Some(eq.enabled))].align_y(Alignment::Center);
@@ -7252,7 +7276,14 @@ impl App {
             .style(ui::select_faded(alpha))
             .menu_style(ui::select_menu);
         let body = column![head, container(select).padding([0, 8]), self.eq_bands(EQ_POPUP_SLIDER, alpha)].spacing(12);
-        popup(body.into(), x, y, EQ_POPUP_WIDTH, EQ_POPUP_HEIGHT, alpha, live)
+        popup_above(body.into(), x, self.bar_top_y() - 12.0, EQ_POPUP_WIDTH, alpha, live)
+    }
+
+    /// Верхний край трекбара в окне: под ним отступ окна, в нём строка с названием (в узком
+    /// окне), полоса перемотки и кнопки.
+    fn bar_top_y(&self) -> f32 {
+        let (_, height) = *WINDOW.lock().unwrap();
+        height - 12.0 - (BAR_TOP_LINE * self.bar_top + SEEK_HEIGHT + BAR_HEIGHT)
     }
 
     /// Ползунки эквалайзера: уровень и десять полос с подписями.
@@ -7386,14 +7417,6 @@ impl App {
     }
 
     /// Заголовок блока со стрелкой, как на страницах оригинала.
-    fn block_title<'a>(&self, title: &'a str, section: Section) -> Element<'a, Message> {
-        glow(button(row![text(title).size(24).font(ui::font_headline()).color(ui::c().text), ui::icon(ui::CHEVRON, 24.0, ui::c().muted)].spacing(6).align_y(Alignment::Center))
-            .padding([4, 8])
-            .style(ui::ghost)
-            .on_press(Message::Open(section)), 20.0)
-            .into()
-    }
-
     /// Главная: играющий трек с управлением, откуда бы он ни играл.
     /// Страница волны: только управление волной. Трек и его кнопки — в нижнем плеере,
     /// середина свободна под будущую анимацию.
@@ -7821,12 +7844,17 @@ impl App {
             })
         };
         let title = text("Коллекция").size(36).font(ui::font_headline()).color(ui::c().text);
-        let links = [self.block_title("Клипы", Section::Clips), self.block_title("Скачанное", Section::Downloads), self.block_title("История", Section::History), self.block_title("Дизлайки", Section::Dislikes)];
+        // Разделы коллекции — кнопками со значками, как в оригинале, а не строкой надписей.
+        let link = |icon, label: &'static str, section| -> Element<'_, Message> {
+            let face = row![ui::icon(icon, 20.0, ui::c().text), text(label).size(15).font(ui::font_medium()).color(ui::c().text)].spacing(8).align_y(Alignment::Center);
+            shine(button(face).padding([8, 16]).style(ui::secondary).on_press(Message::Open(section)), 24.0)
+        };
+        let links = [link(ui::CLIP, "Клипы", Section::Clips), link(ui::DOWNLOAD, "Скачанное", Section::Downloads), link(ui::REPLAY, "История", Section::History), link(ui::DISLIKE, "Дизлайки", Section::Dislikes)];
         // В узком окне ссылки уходят под заголовок и переносятся, а не вылезают за край.
         let header: Element<'_, Message> = if self.main_width() >= COLLECTION_HEADER {
-            row![title, Space::new().width(Length::Fill)].extend(links).align_y(Alignment::Center).into()
+            row![title, Space::new().width(Length::Fill), row(links).spacing(8)].align_y(Alignment::Center).into()
         } else {
-            column![title, row(links).spacing(4).wrap().vertical_spacing(4)].spacing(8).into()
+            column![title, row(links).spacing(8).wrap().vertical_spacing(8)].spacing(12).into()
         };
         let mut page = column![
             header,
@@ -8303,10 +8331,10 @@ impl App {
         let info = info.push(fit(about).color(ui::c().muted)).push(Space::new().height(8)).push(actions.wrap().vertical_spacing(8));
         // Фон шапки в цвет обложки, к низу он сходит на нет.
         let tint = self.covers.get(&cover_key).and_then(average_color).map(|color| color.scale_alpha(if ui::is_light() { 0.35 } else { 0.5 }));
-        let body = row![container(back).height(PAGE_COVER), cover, container(info).center_y(PAGE_COVER)].spacing(16);
+        // Высота — не меньше обычной; если кнопки перенеслись на новые строки, шапка растёт.
+        let body = row![container(back).height(PAGE_COVER), cover, info].spacing(16).align_y(Alignment::Center);
         container(body)
             .padding(PAGE_HEADER_PAD)
-            .height(PAGE_HEADER)
             .width(Length::Fill)
             .style(move |_| match tint {
                 Some(color) => {
@@ -8976,6 +9004,20 @@ fn popup<'a>(content: Element<'a, Message>, x: f32, y: f32, width: f32, height: 
         .into()
 }
 
+/// Окно, которое стоит нижним краем на `bottom` и раскрывается снизу вверх.
+fn popup_above<'a>(content: Element<'a, Message>, x: f32, bottom: f32, width: f32, alpha: f32, live: bool) -> Element<'a, Message> {
+    let (window_width, window_height) = *WINDOW.lock().unwrap();
+    let placed_x = x.min(window_width - width - 8.0).max(8.0);
+    let origin_x = if placed_x < x { 1.0 } else { 0.0 };
+    let body = container(content).width(width).padding(8).style(ui::popover_faded(alpha));
+    container(reveal(anim::block(body)).scale(0.92 + 0.08 * alpha, origin_x, 1.0).inert(!live))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_y(Alignment::End)
+        .padding(Padding::new(0.0).left(placed_x).bottom((window_height - bottom).max(8.0)).top(8.0))
+        .into()
+}
+
 /// Куда встанет трек, взятый с места `from`, если отпустить его над строкой `at` (выше или
 /// ниже её середины). `None` — трек остаётся на месте.
 fn drop_index(from: usize, at: usize, below: bool) -> Option<usize> {
@@ -9603,8 +9645,9 @@ fn view_hotkeys<'a>() -> Element<'a, Message> {
 
 /// Переключатель. Пока значение неизвестно, он блёклый и стоит в положении «выключено».
 /// Эквалайзер встаёт над трекбаром: низ окна над кнопкой, а не поверх неё.
+/// Эквалайзер открывается от кнопки в трекбаре: по высоте он встаёт над трекбаром.
 fn eq_place((x, y): (f32, f32)) -> (f32, f32) {
-    (x, (y - EQ_POPUP_LIFT - EQ_POPUP_HEIGHT).max(8.0))
+    (x, y)
 }
 
 /// Пресет эквалайзера в выпадающем списке.
@@ -9651,9 +9694,18 @@ fn login_window() -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// Страницы, которым нужен аккаунт: открытые до его прихода, они пустые.
+fn account_page(section: Section) -> bool {
+    matches!(section, Section::Collection | Section::Likes | Section::Playlists | Section::Albums | Section::Artists | Section::Dislikes | Section::History | Section::Clips)
+}
+
 fn load_account(token: String) -> Task<Message> {
     Task::perform(
         background(move || {
+            // Для проверки: аккаунт приходит позже, чем открывается страница.
+            if let Some(ms) = std::env::var("TUNE_SLOW_ACCOUNT").ok().and_then(|ms| ms.parse().ok()) {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
             let profile = api::profile(&token)?;
             let ids = api::liked_ids(&profile.uid, &token)?;
             let disliked = api::disliked_ids(&profile.uid, &token)?;
@@ -10520,6 +10572,7 @@ fn main() -> iced::Result {
             "pin-play-1" => Preview::PinPlay(1),
             "pin-play-2" => Preview::PinPlay(2),
             "collection" => Preview::Collection,
+            "collection-early" => Preview::CollectionEarly,
             "collection-artists" => Preview::CollectionArtists,
             "likes-chip" => Preview::LikesChip,
             "playlists" => Preview::Playlists,
