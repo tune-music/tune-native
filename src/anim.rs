@@ -177,15 +177,16 @@ impl Reveal<'_> {
 
     fn draw_moved(&self, tree: &Tree, renderer: &mut Renderer, theme: &Theme, style: &renderer::Style, layout: Layout<'_>, cursor: mouse::Cursor, viewport: &Rectangle) {
         let bounds = layout.bounds();
+        // Свои слои (прокрутка, полоса прокрутки) содержимое обрезает по видимой области,
+        // а обрезку снаружи не наследует. Поэтому видимая область — наше место, если мы
+        // обрезаем, — передаётся внутрь всегда, а под сдвигом пересчитывается обратно:
+        // после сдвига и масштаба она ляжет ровно туда, где её видно, и слои не вылезут.
+        let seen = if self.clip { bounds.intersection(viewport).unwrap_or(Rectangle::new(bounds.position(), Size::ZERO)) } else { *viewport };
         if self.shift == Vector::ZERO && self.scale == 1.0 {
-            self.content.as_widget().draw(&tree.children[0], renderer, theme, style, layout, cursor, viewport);
+            self.content.as_widget().draw(&tree.children[0], renderer, theme, style, layout, cursor, &seen);
         } else {
             let move_to = Transformation::translate(self.shift.x, self.shift.y) * scale_around(bounds, self.origin.0, self.origin.1, self.scale);
-            // Свои слои (прокрутка, полоса прокрутки) содержимое обрезает по видимой области
-            // и не знает об обрезке снаружи. Отдаём ему область, которая после сдвига
-            // и масштаба ляжет ровно в наше место, — тогда и они не вылезут за край.
-            let inner = if self.clip { bounds.intersection(viewport).map(|seen| self.unmove(bounds, seen)) } else { None };
-            let inner = inner.unwrap_or(*viewport);
+            let inner = self.unmove(bounds, seen);
             renderer.with_transformation(move_to, |renderer| {
                 self.content.as_widget().draw(&tree.children[0], renderer, theme, style, layout, cursor, &inner);
             });
