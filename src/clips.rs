@@ -16,6 +16,8 @@ const NEXT_WIDTH: f32 = 340.0;
 /// Колонка «Далее» появляется, только если видео при ней остаётся не уже этого.
 const NEXT_ROOM: f32 = 640.0;
 const CLIP_COVER: &str = "clip:";
+/// Ширина карточки клипа, к которой подгоняется ряд.
+const CLIP_CARD: f32 = 290.0;
 const CLIP_POSTER: &str = "clip-poster:";
 
 /// Меню на видео: скорость или качество.
@@ -100,8 +102,9 @@ impl App {
     }
 
     pub(crate) fn clip_covers(&self, clips: &[Clip]) -> Task<Message> {
-        let jobs = clips.iter().filter_map(|clip| Some((clip_cover_key(clip), clip.cover.clone()?))).collect();
-        self.fetch_cover_jobs(jobs, "m400x400")
+        // Кадры с видеохостинга (`get-vh`) знают только точные размеры 16:9.
+        let (vh, music): (Vec<(String, String)>, Vec<(String, String)>) = clips.iter().filter_map(|clip| Some((clip_cover_key(clip), clip.cover.clone()?))).partition(|(_, uri)| uri.contains("/get-vh/"));
+        Task::batch([self.fetch_cover_jobs(music, "m400x400"), self.fetch_cover_jobs(vh, "400x225")])
     }
 
     pub(crate) fn clip_liked(&self, clip: &Clip) -> bool {
@@ -453,6 +456,11 @@ impl App {
                 let covers = self.clip_covers(&fresh);
                 return Task::batch([covers, self.clip_feed_more()]);
             }
+            Message::ClipShelfPage(key, forward, total) => {
+                let step = self.clips_in_row();
+                let from = self.shelf_pages.entry(key).or_insert(0);
+                *from = if forward { (*from + step).min(total.saturating_sub(step)) } else { from.saturating_sub(step) };
+            }
             Message::ClipShare(clip) => return Task::batch([iced::clipboard::write(clip.share_link()), self.notify("Ссылка на клип скопирована".to_string())]),
             _ => {}
         }
@@ -481,25 +489,44 @@ impl App {
         glow(button(body).padding(CARD_PAD).style(ui::card).on_press(Message::ClipOpen(list.to_vec(), at)), 12.0)
     }
 
-    pub(crate) fn clip_card_width(&self) -> f32 {
-        self.card_side() * 2.0 + CARD_PAD * 2.0 + CARD_GAP
+    /// Сколько клипов в ряду: карточки около 300 точек, как кадры клипов в оригинале.
+    pub(crate) fn clips_in_row(&self) -> usize {
+        let room = self.main_width() - 48.0 - SCROLLBAR;
+        ((room + CARD_GAP) / (CLIP_CARD + CARD_PAD * 2.0 + CARD_GAP)).floor().max(2.0) as usize
     }
 
-    /// Карусель клипов: каждая карточка — два места обычной карусели.
+    pub(crate) fn clip_card_width(&self) -> f32 {
+        let columns = self.clips_in_row() as f32;
+        let room = self.main_width() - 48.0 - SCROLLBAR - CARD_GAP * (columns - 1.0);
+        (room / columns - CARD_PAD * 2.0).floor()
+    }
+
+    /// Карусель клипов: свой счёт карточек в ряду, стрелки листают по ряду.
     pub(crate) fn clip_shelf<'a>(&self, key: &str, title: &'a str, all: Option<Message>, list: &[Clip]) -> Element<'a, Message> {
-        let list = list.to_vec();
-        self.shelf(key, title, all, list.len() * 2, |slots| {
-            let from = slots.start / 2;
-            let to = slots.end.div_ceil(2).min(list.len());
-            let in_row = (self.cards_in_row() / 2).max(1);
-            (from..to.min(from + in_row)).map(|at| self.clip_card(&list, at)).collect()
-        })
+        let in_row = self.clips_in_row();
+        let total = list.len();
+        let from = self.shelf_pages.get(key).copied().unwrap_or(0).min(total.saturating_sub(in_row));
+        let shown = from..(from + in_row).min(total);
+        let name: Element<'a, Message> = match all {
+            Some(press) => more_title(title, press),
+            None => container(text(title).size(24).font(ui::font_headline()).color(ui::c().text).wrapping(Wrapping::None)).padding([4, 0]).into(),
+        };
+        let mut head = row![name, Space::new().width(Length::Fill)].spacing(4).align_y(Alignment::Center);
+        if total > in_row {
+            let arrow = |icon, active: bool, forward| {
+                let press = active.then(|| Message::ClipShelfPage(key.to_string(), forward, total));
+                hint(glow(button(ui::icon(icon, 22.0, if active { ui::c().text } else { ui::c().control_hover })).padding(5).style(ui::ghost).on_press_maybe(press), 20.0), if forward { "Вперёд" } else { "Назад" })
+            };
+            head = head.push(arrow(ui::LEFT, shown.start > 0, false)).push(arrow(ui::RIGHT, shown.end < total, true));
+        }
+        let line = shown.fold(row![].spacing(CARD_GAP), |line, at| line.push(self.clip_card(list, at)));
+        column![head, line].spacing(8).into()
     }
 
     /// Клипы в поиске: во «Всё» карусель с переходом на вкладку, во вкладке — сетка.
     pub(crate) fn search_clips<'a>(&self, list: &[Clip]) -> Element<'a, Message> {
         if self.search_tab == SearchTab::All {
-            let all = (list.len() > (self.cards_in_row() / 2).max(1)).then_some(Message::SearchTabSet(SearchTab::Clips));
+            let all = (list.len() > self.clips_in_row()).then_some(Message::SearchTabSet(SearchTab::Clips));
             return self.clip_shelf("search:clips", "Клипы", all, list);
         }
         column![text("Клипы").size(24).font(ui::font_headline()).color(ui::c().text), grid((0..list.len()).map(|at| self.clip_card(list, at)).collect())].spacing(12).into()

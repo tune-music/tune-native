@@ -1153,6 +1153,7 @@ enum Message {
     ClipLike(api::Clip),
     ClipLiked(api::Clip, bool, Result<(), String>),
     ClipShare(api::Clip),
+    ClipShelfPage(String, bool, usize),
     ClipFeed(Result<api::ClipFeed, String>),
     ClipFeedStart,
     /// Клипы ленты: номер открытия, сессия и клипы.
@@ -3744,6 +3745,7 @@ impl App {
                 | Message::ClipLike(_)
                 | Message::ClipLiked(..)
                 | Message::ClipShare(_)
+                | Message::ClipShelfPage(..)
                 | Message::ClipFeed(_)
                 | Message::ClipFeedStart
                 | Message::ClipFeedLoaded(..)
