@@ -292,6 +292,8 @@ const TIME_WIDTH: f32 = 72.0;
 const TIME_WIDTH_EPISODE: f32 = 150.0;
 /// От этой ширины коллекция показывает треки в две колонки.
 const COLLECTION_COLUMNS: f32 = 860.0;
+/// С какой ширины основной части ссылки коллекции помещаются в строку с заголовком.
+const COLLECTION_HEADER: f32 = 980.0;
 const PAGE_COVER_SMALL: f32 = 120.0;
 const PAGE_COVER_WIDTH: f32 = 640.0;
 /// Сколько результатов просить: на вкладке «Всё» и на отдельной вкладке.
@@ -7818,8 +7820,16 @@ impl App {
                 None => list,
             })
         };
+        let title = text("Коллекция").size(36).font(ui::font_headline()).color(ui::c().text);
+        let links = [self.block_title("Клипы", Section::Clips), self.block_title("Скачанное", Section::Downloads), self.block_title("История", Section::History), self.block_title("Дизлайки", Section::Dislikes)];
+        // В узком окне ссылки уходят под заголовок и переносятся, а не вылезают за край.
+        let header: Element<'_, Message> = if self.main_width() >= COLLECTION_HEADER {
+            row![title, Space::new().width(Length::Fill)].extend(links).align_y(Alignment::Center).into()
+        } else {
+            column![title, row(links).spacing(4).wrap().vertical_spacing(4)].spacing(8).into()
+        };
         let mut page = column![
-            row![text("Коллекция").size(36).font(ui::font_headline()).color(ui::c().text), Space::new().width(Length::Fill), self.block_title("Клипы", Section::Clips), self.block_title("Скачанное", Section::Downloads), self.block_title("История", Section::History), self.block_title("Дизлайки", Section::Dislikes)].align_y(Alignment::Center),
+            header,
             Space::new().height(16),
             likes,
             if self.main_width() >= COLLECTION_COLUMNS { Element::from(row![column_of(0..4), column_of(4..8)].spacing(24)) } else { column_of(0..8).into() },
@@ -10554,6 +10564,8 @@ fn main() -> iced::Result {
     let yandex_fonts = fonts::load();
     ui::set_icons(icons::load());
     ui::YANDEX_FONTS.store(!yandex_fonts.is_empty(), Ordering::Relaxed);
+    // Для проверки вёрстки: снимки предпросмотра в узком окне.
+    let width = preview.as_ref().and(std::env::var("TUNE_PREVIEW_WIDTH").ok()).and_then(|w| w.parse().ok()).unwrap_or(1280.0_f32);
     let mut app = iced::application(move || App::new(preview.clone()), App::update, App::view);
     for font in yandex_fonts {
         app = app.font(font);
@@ -10562,7 +10574,7 @@ fn main() -> iced::Result {
         .theme(|_: &App| ui::theme())
         .default_font(ui::font())
         .subscription(App::subscription)
-        .window(window::Settings { size: Size::new(1280.0, 820.0), min_size: Some(Size::new(900.0, 600.0)), exit_on_close_request: false, ..window::Settings::default() })
+        .window(window::Settings { size: Size::new(width, 820.0), min_size: Some(Size::new(900.0, 600.0)), exit_on_close_request: false, ..window::Settings::default() })
         .run()
 }
 

@@ -18,6 +18,8 @@ const NEXT_ROOM: f32 = 640.0;
 const CLIP_COVER: &str = "clip:";
 /// Ширина карточки клипа, к которой подгоняется ряд.
 const CLIP_CARD: f32 = 290.0;
+/// Ширина текста в карточке «Время клипов»: меньше — название и кнопка ломаются.
+const FEED_WORDS: f32 = 300.0;
 const CLIP_POSTER: &str = "clip-poster:";
 
 /// Меню на видео: скорость или качество.
@@ -576,7 +578,10 @@ impl App {
     fn clip_feed_card<'a>(&self, feed: &api::ClipFeed) -> Element<'a, Message> {
         let side = 120.0;
         let height = (side * 9.0 / 16.0_f32).round();
-        let thumbs = feed.clips.iter().take(5).fold(row![].spacing(8), |line, clip| {
+        // Текст не меньше FEED_WORDS, кадров — сколько поместится рядом (в узком окне ни одного).
+        let room = self.main_width() - 48.0 - SCROLLBAR - 40.0 - 24.0 - FEED_WORDS;
+        let fit = ((room + 8.0) / (side + 8.0)).floor().clamp(0.0, 5.0) as usize;
+        let thumbs = feed.clips.iter().take(fit).fold(row![].spacing(8), |line, clip| {
             line.push(match self.covers.get(&clip_cover_key(clip)) {
                 Some(handle) => Element::from(image(handle.clone()).content_fit(iced::ContentFit::Cover).width(side).height(height).border_radius(6.0)),
                 None => container(Space::new()).width(side).height(height).style(ui::tile).into(),
@@ -591,7 +596,7 @@ impl App {
         ]
         .spacing(4)
         .width(Length::Fill);
-        let content = row![words, thumbs].spacing(24).align_y(Alignment::Center);
+        let content = if fit == 0 { row![words] } else { row![words, thumbs].spacing(24).align_y(Alignment::Center) };
         container(content).padding(20).width(Length::Fill).style(ui::tile).into()
     }
 
@@ -606,7 +611,7 @@ impl App {
             return Some(anim::block(container(player).width(Length::Fill).height(Length::Fill).style(back)));
         }
         let side = watch.list.len() > 1 && width - 48.0 - NEXT_WIDTH - 24.0 >= NEXT_ROOM;
-        let room = if side { width - 48.0 - NEXT_WIDTH - 24.0 } else { width - 48.0 };
+        let room = if side { width - 48.0 - NEXT_WIDTH - 24.0 } else { width - 48.0 } - SCROLLBAR;
         // Видео 16:9 во всю ширину, но так, чтобы под ним оставалось место для названия.
         let video_width = room.min((height - 64.0 - 150.0) * 16.0 / 9.0).max(320.0);
         let video_height = (video_width * 9.0 / 16.0).round();
@@ -617,7 +622,8 @@ impl App {
         if let Some(error) = &watch.error {
             main = main.push(text(human_error(error)).color(ui::c().danger));
         }
-        let main = ui::scroll(main).width(video_width).height(Length::Fill);
+        // Полоса прокрутки — справа от видео, а не поверх него.
+        let main = ui::scroll(container(main).padding(Padding::ZERO.right(SCROLLBAR))).width(video_width + SCROLLBAR).height(Length::Fill);
         let mut content = row![main].spacing(24);
         if side {
             content = content.push(self.clip_next(watch));
