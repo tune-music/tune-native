@@ -1056,6 +1056,9 @@ struct App {
     wave_base: Vec<String>,
     /// Текст: для какого трека он загружен, что загружается, куда прокручена страница.
     lyrics: Option<(String, Option<api::Lyrics>)>,
+    /// Сколько строк синхронного текста сменилось на глазах и ушёл ли отчёт о просмотре.
+    lyrics_seen: u32,
+    lyrics_told: bool,
     lyrics_loading: Option<String>,
     lyrics_line: Option<usize>,
     /// Текст только что открыт: на звучащую строку встаём сразу, без перемотки сверху.
@@ -1633,6 +1636,8 @@ impl App {
             wave_tuning: saved.wave,
             wave_base: vec![api::MY_WAVE.to_string()],
             lyrics: None,
+            lyrics_seen: 0,
+            lyrics_told: false,
             lyrics_loading: None,
             lyrics_line: None,
             lyrics_fresh: true,
@@ -2104,6 +2109,7 @@ impl App {
             api::Link::Landing(page) => self.landing_open(page, String::new()),
             api::Link::Post(id) => self.handle(Message::HomeOpen(HomeItem::Post { id, title: "Подборка редакции".to_string(), cover: None })),
             api::Link::VibeRoom(id) => Task::perform(background(move || api::vibe_room(&id, &token)), Message::VibeInvite),
+            api::Link::Block(path) => self.handle(Message::HomeOpen(HomeItem::Post { id: format!("{}{path}", api::BLOCK), title: "Подборка".to_string(), cover: None })),
             link => Task::perform(background(move || api::link_playlist(&link, &token)), Message::LinkPlaylist),
         }
     }
@@ -4886,6 +4892,8 @@ impl App {
                 self.lyrics_shown = -1.0;
                 self.lyrics_target = -1.0;
                 self.lyrics_fresh = true;
+                self.lyrics_seen = 0;
+                self.lyrics_told = false;
                 return match result {
                     Ok(found) => {
                         self.lyrics = Some((id, found));
@@ -6842,6 +6850,20 @@ impl App {
         }
         let Some((_, Some(lyrics))) = self.lyrics.as_ref().filter(|(id, _)| self.current_track().is_some_and(|t| t.id == *id)) else { return };
         let line = lyrics.line_at(self.position.as_secs_f32());
+        // Отчёт о просмотре, как в оригинале: обычный текст — сразу, синхронный — когда
+        // на глазах сменились две строки. Один раз на трек.
+        if line != self.lyrics_line && line.is_some() {
+            self.lyrics_seen += 1;
+        }
+        if !self.lyrics_told && (!lyrics.synced() || self.lyrics_seen >= 2) {
+            self.lyrics_told = true;
+            if let (Some(view), Some(track), Some(token)) = (lyrics.view.clone(), self.current_track(), self.token()) {
+                let (id, album) = (track.id.clone(), track.album.clone());
+                std::thread::spawn(move || {
+                    let _ = api::lyric_view(&id, album.as_deref(), &view, &token);
+                });
+            }
+        }
         if line != self.lyrics_line {
             self.lyrics_target = line.map_or(-1.0, |index| index as f32);
             self.lyrics_line = line;
@@ -8228,8 +8250,17 @@ impl App {
         if let Some((label, url)) = &album.action {
             actions = actions.push(shine(button(text(label).color(ui::c().text)).padding([8, 18]).style(ui::secondary).on_press(Message::OpenUrl(url.clone())), 24.0));
         }
+        // Подписка на подкаст и полка для книги — это тот же лайк альбома, но с подписью, как в оригинале.
         let liked = self.liked_albums.iter().any(|c| c.id == album.id);
-        let actions = actions.push(self.page_like(liked, Message::AlbumLike)).push(self.page_more());
+        let label = match (podcast, liked) {
+            (true, false) => "Подписаться на подкаст",
+            (true, true) => "Вы подписаны",
+            (false, false) => "Добавить на полку",
+            (false, true) => "Убрать с полки",
+        };
+        let icon = if liked { ui::CHECK } else { ui::PLUS };
+        let follow = shine(button(row![ui::icon(icon, 18.0, ui::c().text), text(label).color(ui::c().text)].spacing(6).align_y(Alignment::Center)).padding([8, 16]).style(ui::secondary).on_press(Message::AlbumLike), 24.0);
+        let actions = actions.push(follow).push(self.page_more());
         let links = artist_links(&album.artists, 16.0, ui::font(), ui::c().muted);
         let kicker = if podcast { "Подкаст" } else { "Аудиокнига" };
         let header = self.page_header(kicker, playlist.title.clone(), format!("{ALBUM_COVER}{}", album.id), false, Some(links), about.join(" · "), actions);
@@ -9584,7 +9615,9 @@ fn smoke_get(request: &str) -> Result<(), String> {
     // `raw:` в начале — весь ответ как есть, для разбора другими средствами.
     let (raw, request) = request.strip_prefix("raw:").map_or((false, request), |rest| (true, rest));
     // `post:путь {json}` — POST с телом вместо GET.
-    let v = if let Some(rest) = request.strip_prefix("post:") {
+    let v = if request.starts_with("https://") {
+        api::probe_url(request, &token)?
+    } else if let Some(rest) = request.strip_prefix("post:") {
         let (path, body) = rest.split_once(' ').unwrap_or((rest, "{}"));
         api::probe_post(path, body, &token)?
     } else {
@@ -9797,6 +9830,11 @@ fn smoke_home() -> Result<(), String> {
     }
     let items = api::category("category_non-music_comedy", &token)?;
     println!("=== Категория «Юмор»: {} карточек, первые: {}", items.len(), items.iter().take(3).map(|item| format!("{item:?}").chars().take(60).collect::<String>()).collect::<Vec<_>>().join(" | "));
+    for link in ["https://music.yandex.ru/entities/non-music-editorial-compilation/kids_zaichonok_mimi", "https://music.yandex.ru/kids/editorial/album/mouse_tim"] {
+        let Some(api::Link::Block(path)) = api::parse_link(link) else { return Err(format!("не разобрана ссылка {link}")) };
+        let block = api::editorial_post(&format!("{}{path}", api::BLOCK), &token)?;
+        println!("=== {link}: «{}», карточек {}", block.title, block.items.len());
+    }
     Ok(())
 }
 

@@ -344,7 +344,7 @@ fn fetch(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, Strin
 
 fn post(path: &str, content_type: &str, body: String, token: &str) -> Result<Value, String> {
     // Отзывы волны и отчёты о прослушивании ничего из сохранённого не меняют.
-    if !path.starts_with("rotor") && !path.starts_with("words") && !path.starts_with("wheel") && !path.starts_with("plays") && !path.starts_with("availability") && !path.starts_with("streams/progress/sync") {
+    if !path.starts_with("rotor") && !path.starts_with("words") && !path.starts_with("wheel") && !path.starts_with("plays") && !path.starts_with("lyric-views") && !path.starts_with("availability") && !path.starts_with("streams/progress/sync") {
         forget_cache();
     }
     let resp = agent()
@@ -1456,6 +1456,60 @@ fn item_key(item: &HomeItem) -> String {
     }
 }
 
+fn promo_item(promo: &Value) -> Option<HomeItem> {
+    let link = promo["action"]["weblink"].as_str().filter(|link| link.starts_with('/'))?;
+    let title = promo["title"].as_str().map(str::trim).filter(|t| !t.is_empty())?.to_string();
+    let subtitle = promo["subtitle"].as_str().unwrap_or_default().trim().to_string();
+    let cover = promo["imageUrl"].as_str().map(str::to_string);
+    Some(match parse_link(&format!("https://music.yandex.ru{link}"))? {
+        Link::Album(id) => HomeItem::Album(Card { id, title, subtitle, cover }),
+        Link::Playlist(owner, kind) => HomeItem::Playlist(Playlist { source: Source::Playlist, owner, kind, title, count: 0, cover }),
+        Link::Landing(page) => HomeItem::Landing { page, title, cover },
+        Link::Tag(tag) => HomeItem::Mix { tag, title, cover },
+        Link::Post(id) => HomeItem::Post { id, title, cover },
+        Link::Block(path) => HomeItem::Post { id: format!("{BLOCK}{path}"), title, cover },
+        _ => return None,
+    })
+}
+
+/// Подборка из блока (`/entities/…`) или редакции раздела (`/kids/editorial/album/…`):
+/// блок приходит карточками, редакция — номерами альбомов или плейлистов.
+fn block_page(path: &str, token: &str) -> Result<HomeBlock, String> {
+    let v = get(path, &[("page", "0"), ("pageSize", "100")], token)?;
+    let v = result(&v);
+    let title = v["title"].as_str().unwrap_or_default().to_string();
+    let ids: Vec<String> = v["entities"].as_array().into_iter().flatten().filter_map(id_text).collect();
+    if ids.is_empty() {
+        return Ok(parse_home_block(&title, v));
+    }
+    let items = if path.contains("/playlist/") {
+        let found = get("playlists/list", &[("playlist-ids", &ids.join(","))], token)?;
+        parse_tag_playlists(result(&found)).into_iter().map(HomeItem::Playlist).collect()
+    } else {
+        let found = get("albums", &[("album-ids", &ids.join(","))], token)?;
+        result(&found).as_array().into_iter().flatten().filter_map(album_card).map(HomeItem::Album).collect()
+    };
+    Ok(HomeBlock { title, items, ..HomeBlock::default() })
+}
+
+/// Детская коллекция, как в оригинале: любимые песенки и выпуски, альбомы со сказками, плейлисты.
+fn kids_favourite(token: &str) -> Vec<HomeBlock> {
+    let page = [("page", "0"), ("pageSize", "20")];
+    let load = |kind: &str| get(&format!("landing-blocks/collection/kids/{kind}"), &page, token).ok().map(|v| result(&v)["items"].as_array().cloned().unwrap_or_default()).unwrap_or_default();
+    let tracks = load("tracks-liked").iter().filter_map(|item| parse_track(&item["data"]["track"])).collect();
+    let pick = |entry: &Value, key: &str| if entry[key].is_object() { entry[key].clone() } else { entry.clone() };
+    let albums = load("albums-liked").iter().filter_map(|item| album_card(&pick(&item["data"], "album"))).map(HomeItem::Album).collect();
+    let lists = load("playlists-liked").iter().filter_map(|item| parse_home_playlist(&pick(&item["data"], "playlist"))).collect();
+    [
+        HomeBlock { title: "Любимые песенки и выпуски".to_string(), tracks, ..HomeBlock::default() },
+        HomeBlock { title: "Альбомы, подкасты и сказки".to_string(), items: albums, ..HomeBlock::default() },
+        HomeBlock { title: "Плейлисты".to_string(), items: lists, ..HomeBlock::default() },
+    ]
+    .into_iter()
+    .filter(|block| !block.items.is_empty() || !block.tracks.is_empty())
+    .collect()
+}
+
 /// Альбомы из ответов полки и новых выпусков: они лежат то списком, то внутри блоков.
 fn shelf_albums(v: &Value) -> Vec<HomeItem> {
     let mut found = Vec::new();
@@ -1526,7 +1580,14 @@ pub enum Link {
     Post(String),
     /// Приглашение в Мою волну на двоих.
     VibeRoom(String),
+    /// Подборка из блока страницы или редакции раздела: путь запроса к Яндексу.
+    Block(String),
 }
+
+/// Так помечена подборка из блока среди подборок редакции: в `id` лежит путь запроса.
+pub const BLOCK: &str = "block:";
+/// Блок «Детям» с детской коллекцией: у него нет адреса, он собирается из трёх запросов.
+const KIDS_FAVOURITE: &str = "kids-favourite";
 
 /// Так помечена страница лейбла среди страниц из блоков: у Яндекса это не скелет, а свои запросы.
 pub const LABEL: &str = "label:";
@@ -1558,6 +1619,9 @@ pub fn parse_link(text: &str) -> Option<Link> {
         ["landing", landing, ..] => Some(Link::Landing(landing.to_string())),
         ["genre", genre, ..] => Some(Link::Landing(format!("tag_{genre}"))),
         ["post", post, ..] => Some(Link::Post(post.to_string())),
+        ["entities", _, block, ..] => Some(Link::Block(format!("landing/block/{block}/entities"))),
+        ["kids", "editorial", kind @ ("album" | "playlist"), id, ..] => Some(Link::Block(format!("children-landing/editorial/{kind}/{id}"))),
+        ["non-music", "editorial", kind @ ("album" | "playlist"), id, ..] => Some(Link::Block(format!("non-music/editorial/{kind}/{id}"))),
         ["label", label, ..] => number(label).map(|label| Link::Landing(format!("{LABEL}{label}"))),
         ["non-music", "category", category, ..] => Some(Link::Tag(format!("{CATEGORY}{category}"))),
         [first @ ("collection" | "non-music" | "kids" | "chart"), ..] => page(&parts[..parts.len().min(if *first == "collection" { 2 } else { 1 })]),
@@ -1644,13 +1708,8 @@ fn parse_home_block(title: &str, v: &Value) -> HomeBlock {
     if v["playlist"].is_object() {
         items.extend(parse_home_playlist(&v["playlist"]));
     }
-    // Промо ведёт на альбом: подкаст или книгу.
-    items.extend(v["promotions"].as_array().into_iter().flatten().filter_map(|promo| {
-        let id = promo["action"]["weblink"].as_str()?.strip_prefix("/album/")?.trim_matches('/').to_string();
-        let title = promo["title"].as_str().filter(|t| !t.is_empty())?.to_string();
-        let subtitle = promo["subtitle"].as_str().unwrap_or_default().to_string();
-        Some(HomeItem::Album(Card { id, title, subtitle, cover: promo["imageUrl"].as_str().map(str::to_string) }))
-    }));
+    // Промо ведёт на альбом, плейлист, страницу из блоков или подборку. Ссылки наружу пропускаем.
+    items.extend(v["promotions"].as_array().into_iter().flatten().filter_map(promo_item));
     let favorites = &v["favorites"];
     if favorites.is_object() {
         items.push(HomeItem::Likes { count: favorites["count"].as_u64().unwrap_or(0), cover: cover_uri(favorites) });
@@ -1689,6 +1748,9 @@ pub fn landing(skeleton: &str, tab: usize, token: &str) -> Result<Home, String> 
         .flatten()
         .filter_map(|b| {
             let data = &b["data"];
+            if b["type"].as_str() == Some("KIDS_FAVOURITE_SECTION") {
+                return Some((String::new(), KIDS_FAVOURITE.to_string(), None));
+            }
             let more = data["viewAllAction"]["weblink"].as_str().map(str::to_string);
             Some((data["title"].as_str().unwrap_or_default().to_string(), data["source"]["uri"].as_str()?.trim_start_matches('/').to_string(), more))
         })
@@ -1700,12 +1762,15 @@ pub fn landing(skeleton: &str, tab: usize, token: &str) -> Result<Home, String> 
             .cloned()
             .map(|(title, uri, more)| {
                 let token = token.to_string();
-                std::thread::spawn(move || get(&uri, &[], &token).ok().map(|v| HomeBlock { more, ..parse_home_block(&title, result(&v)) }))
+                std::thread::spawn(move || match uri.as_str() {
+                    KIDS_FAVOURITE => kids_favourite(&token),
+                    _ => get(&uri, &[], &token).ok().map(|v| HomeBlock { more, ..parse_home_block(&title, result(&v)) }).into_iter().collect(),
+                })
             })
             .collect();
         // Без названия показываем только то, что понятно и так: карточки разделов, волну жанра, список жанров.
         let plain = |item: &HomeItem| item.is_shortcut() || matches!(item, HomeItem::Wave { .. } | HomeItem::Landing { cover: None, .. });
-        blocks.extend(handles.into_iter().filter_map(|h| h.join().ok().flatten()).filter(|b| (!b.title.is_empty() || b.items.iter().all(plain)) && (!b.items.is_empty() || !b.tracks.is_empty())));
+        blocks.extend(handles.into_iter().filter_map(|h| h.join().ok()).flatten().filter(|b| (!b.title.is_empty() || b.items.iter().all(plain)) && (!b.items.is_empty() || !b.tracks.is_empty())));
     }
     if skeleton_id == "non_music" {
         let podcasts = tabs[tab]["id"].as_str() == Some("podcasts");
@@ -1750,6 +1815,9 @@ pub fn genre_list(genre: &str, kind: &str, token: &str) -> Result<Vec<HomeItem>,
 
 /// Подборка редакции (`feed/promotions/<id>`): название и карточки.
 pub fn editorial_post(id: &str, token: &str) -> Result<HomeBlock, String> {
+    if let Some(path) = id.strip_prefix(BLOCK) {
+        return block_page(path, token);
+    }
     let v = get(&format!("feed/promotions/{}", encode(id)), &[], token)?;
     let v = result(&v);
     let mut items: Vec<HomeItem> = v["albums"].as_array().into_iter().flatten().filter_map(album_card).map(HomeItem::Album).collect();
@@ -2724,6 +2792,14 @@ pub fn probe_post(path: &str, body: &str, token: &str) -> Result<Value, String> 
     post(path, "application/json", body.to_string(), token)
 }
 
+/// Проба чужого адреса Яндекса со входом в Музыку: так видно, что отдаёт видеоплеер.
+pub fn probe_url(url: &str, token: &str) -> Result<Value, String> {
+    let resp = agent().get(url).header("Authorization", &format!("OAuth {token}")).config().http_status_as_error(false).build().call().map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    let body = resp.into_body().read_to_string().map_err(|e| e.to_string())?;
+    Ok(serde_json::from_str(&body).unwrap_or_else(|_| json!({"status": status, "body": body.chars().take(3000).collect::<String>()})))
+}
+
 pub fn probe(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, String> {
     fetch(path, query, token)
 }
@@ -2758,6 +2834,30 @@ pub fn plays(reports: Vec<Value>, token: &str) -> Result<(), String> {
 pub struct Lyrics {
     pub lines: Vec<(Option<f32>, String)>,
     pub authors: Vec<String>,
+    /// Что нужно для отчёта о просмотре текста.
+    pub view: Option<LyricView>,
+}
+
+/// Номера текста у Яндекса и правообладателя: с ними уходит отчёт о просмотре.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LyricView {
+    pub lyric: String,
+    pub external: String,
+    pub major: String,
+    pub format: &'static str,
+}
+
+/// Текст посмотрели: так Яндекс считает просмотры для правообладателя, как в оригинале.
+pub fn lyric_view(track: &str, album: Option<&str>, view: &LyricView, token: &str) -> Result<(), String> {
+    let mut item = json!({"id": random_id(), "trackId": track, "majorId": view.major, "lyricId": view.lyric, "externalLyricId": view.external, "lyricFormat": view.format});
+    if let Some(album) = album {
+        item["albumId"] = json!(album);
+    }
+    post("lyric-views", "application/json", json!({"lyricViews": [item]}).to_string(), token).map(|_| ())
+}
+
+fn parse_lyric_view(v: &Value, format: &'static str) -> Option<LyricView> {
+    Some(LyricView { lyric: id_text(&v["lyricId"])?, external: id_text(&v["externalLyricId"])?, major: id_text(&v["major"]["id"])?, format })
 }
 
 impl Lyrics {
@@ -2790,7 +2890,7 @@ fn parse_lrc(text: &str) -> Vec<(Option<f32>, String)> {
         .collect()
 }
 
-fn lyrics_in(id: &str, format: &str, token: &str) -> Result<Option<Lyrics>, String> {
+fn lyrics_in(id: &str, format: &'static str, token: &str) -> Result<Option<Lyrics>, String> {
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs().to_string();
     // Текст подписывается целиком, в отличие от запроса файла.
     let signature = sign_full(&format!("{id}{ts}"));
@@ -2803,7 +2903,7 @@ fn lyrics_in(id: &str, format: &str, token: &str) -> Result<Option<Lyrics>, Stri
     let Some(url) = v["downloadUrl"].as_str() else { return Ok(None) };
     let text = agent().get(url).call().map_err(|e| format!("Не удалось загрузить текст: {e}"))?.into_body().read_to_string().map_err(|e| e.to_string())?;
     let authors = v["writers"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(str::to_string)).collect();
-    Ok(Some(Lyrics { lines: parse_lrc(&text), authors }).filter(|lyrics| !lyrics.lines.is_empty()))
+    Ok(Some(Lyrics { lines: parse_lrc(&text), authors, view: parse_lyric_view(v, format) }).filter(|lyrics| !lyrics.lines.is_empty()))
 }
 
 /// Сначала синхронный текст, потом обычный. У многих треков есть только один из них.
@@ -3241,12 +3341,14 @@ mod tests {
     fn parses_lyrics() {
         let lines = parse_lrc("[00:01.50] раз\n[00:03.00]\n[01:00.00] два\n\nбез времени");
         assert_eq!(lines, [(Some(1.5), "раз".to_string()), (Some(60.0), "два".to_string()), (None, "без времени".to_string())]);
-        let lyrics = Lyrics { lines, authors: Vec::new() };
+        let lyrics = Lyrics { lines, authors: Vec::new(), view: None };
+        let view = parse_lyric_view(&json!({"lyricId": 5, "externalLyricId": "e1", "major": {"id": 9}}), "LRC").unwrap();
+        assert_eq!((view.lyric.as_str(), view.external.as_str(), view.major.as_str()), ("5", "e1", "9"));
         assert!(lyrics.synced());
         assert_eq!(lyrics.line_at(0.5), None);
         assert_eq!(lyrics.line_at(2.0), Some(0));
         assert_eq!(lyrics.line_at(90.0), Some(1));
-        assert!(!Lyrics { lines: parse_lrc("текст"), authors: Vec::new() }.synced());
+        assert!(!Lyrics { lines: parse_lrc("текст"), authors: Vec::new(), view: None }.synced());
     }
 
     #[test]
