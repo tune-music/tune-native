@@ -3,6 +3,7 @@
 mod api;
 mod anim;
 mod clips;
+mod concerts;
 mod sync;
 mod video;
 mod ynison;
@@ -425,6 +426,10 @@ enum Section {
     Landing,
     /// Клипы: свои и «Вам понравится».
     Clips,
+    /// Концерты: «Топ для вас» и «Концерты для вас» в выбранном городе.
+    Concerts,
+    /// Страница одного концерта.
+    Concert,
 }
 
 /// Карусель, у которой есть «Показать все».
@@ -501,6 +506,8 @@ enum Dialog {
     Unsafe(String, &'static str, api::Modal),
     /// Моя волна на двоих: позвать второго, принять приглашение или управлять волной.
     Vibe(VibeDialog),
+    /// «Найти город» для концертов.
+    ConcertCity,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -652,6 +659,7 @@ struct Place {
     artist: Option<Artist>,
     block: Option<HomeBlock>,
     landing: Option<(String, String)>,
+    concert: Option<api::ConcertPage>,
 }
 
 /// Запуск с готовым разделом: первый трек показывается в плеере, но не играет.
@@ -659,6 +667,10 @@ struct Place {
 enum Preview {
     /// Страница «Клипы».
     Clips,
+    /// Раздел «Концерты»; с `city` — окно выбора города.
+    Concerts(bool),
+    /// Страница концерта по номеру.
+    Concert(String),
     /// Открытый клип по номеру.
     Clip(String),
     /// Коллекция с окном «Моя волна на двоих».
@@ -1078,6 +1090,14 @@ struct App {
     clips_liked: Vec<api::Clip>,
     clips_like: Vec<api::Clip>,
     clips_loading: bool,
+    concerts: Vec<api::Concert>,
+    concerts_top: usize,
+    concerts_loading: bool,
+    concerts_error: bool,
+    concert_cities: Vec<(u64, String)>,
+    /// Город для концертов; `None` — «Рядом», как определит Яндекс.
+    concert_city: Option<(u64, String)>,
+    concert: Option<api::ConcertPage>,
     clip_feed: Option<api::ClipFeed>,
     /// Средний цвет крупной обложки трека: им окрашен фон плеера на всё окно.
     cover_tints: HashMap<String, iced::Color>,
@@ -1176,6 +1196,12 @@ enum Message {
     ClipLiked(api::Clip, bool, Result<(), String>),
     ClipShare(api::Clip),
     ClipShelfPage(String, bool, usize),
+    /// Лента концертов для города (`None` — «рядом»): сколько в топе и все концерты.
+    ConcertsLoaded(Option<u64>, Result<(usize, Vec<api::Concert>), String>),
+    ConcertCities(Result<Vec<(u64, String)>, String>),
+    ConcertCityPick(Option<(u64, String)>),
+    ConcertOpen(String),
+    ConcertLoaded(String, Result<api::ConcertPage, String>),
     ClipFeed(Result<api::ClipFeed, String>),
     ClipFeedStart,
     /// Клипы ленты: номер открытия, сессия и клипы.
@@ -1711,6 +1737,13 @@ impl App {
             clips_liked: Vec::new(),
             clips_like: Vec::new(),
             clips_loading: false,
+            concerts: Vec::new(),
+            concerts_top: 0,
+            concerts_loading: false,
+            concerts_error: false,
+            concert_cities: Vec::new(),
+            concert_city: concerts::load_city(),
+            concert: None,
             clip_feed: None,
             cover_tints: HashMap::new(),
             full_tint: ui::c().tile,
@@ -2577,6 +2610,7 @@ impl App {
         cards.extend(page.iter().map(|a| format!("{ARTIST_COVER}{}", a.id)));
         cards.extend(self.vibe_rooms.iter().map(|room| format!("{VIBE_COVER}{}", room.id)));
         cards.extend(self.clip_cover_keys());
+        cards.extend(self.concert_cover_keys());
         let wheel = self.wheel.iter().flat_map(|(_, items)| items);
         cards.extend(wheel.flat_map(|item| [format!("{WHEEL_COVER}{}", item.id), format!("{WHEEL_BLUR}{}", item.id)]));
         self.covers.retain(|id, _| id == AVATAR_COVER || id.starts_with(PLAYLIST_COVER) || id.starts_with(PIN_COVER_PREFIX) || cards.contains(id) || keep.contains(id));
@@ -3255,7 +3289,7 @@ impl App {
     }
 
     fn here(&self) -> Place {
-        Place { section: self.section, playlist: self.playlist.clone(), artist: self.artist.clone(), block: self.block.clone(), landing: self.landing.clone() }
+        Place { section: self.section, playlist: self.playlist.clone(), artist: self.artist.clone(), block: self.block.clone(), landing: self.landing.clone(), concert: self.concert.clone() }
     }
 
     fn remember(&mut self) {
@@ -3281,6 +3315,9 @@ impl App {
         self.artist = place.artist;
         self.block = place.block;
         self.landing = place.landing;
+        if place.concert.is_some() {
+            self.concert = place.concert;
+        }
         // Страницы из блоков делят одно место: вернувшись на другую, грузим её заново.
         if matches!(place.section, Section::Home | Section::Books | Section::Kids | Section::Landing) && self.home_skeleton != self.skeleton_of(place.section) {
             let tab = self.landing_tabs[landing_index(place.section)];
@@ -3487,7 +3524,8 @@ impl App {
             Section::Dislikes => &self.disliked_list,
             Section::Downloads => &self.download_tracks,
             Section::Queue => self.current.and_then(|i| self.queue.get(i + 1..)).unwrap_or(&[]),
-            Section::Lyrics | Section::Settings | Section::Clips => &[],
+            Section::Lyrics | Section::Settings | Section::Clips | Section::Concerts => &[],
+            Section::Concert => self.concert.as_ref().map_or(&[], |page| page.tracks.as_slice()),
             Section::Search => &self.results,
         }
     }
@@ -3724,6 +3762,8 @@ impl App {
             Section::Discography => self.discography_key.is_none(),
             Section::Tag => !self.tag_loading,
             Section::Block => true,
+            Section::Concerts => !self.concerts_loading,
+            Section::Concert => self.concert.is_some(),
             Section::Playlists if self.playlist.is_none() => !self.playlists.is_empty(),
             section => !self.list(section).is_empty(),
         }
@@ -3793,6 +3833,7 @@ impl App {
                 | Message::ClipFeedStart
                 | Message::ClipFeedLoaded(..)
             ) => return self.clip_handle(message),
+            Message::ConcertsLoaded(..) | Message::ConcertCities(_) | Message::ConcertCityPick(_) | Message::ConcertOpen(_) | Message::ConcertLoaded(..) => return self.concert_handle(message),
             Message::LoginOpen => {
                 if matches!(self.screen, Screen::Login(true)) {
                     return Task::none();
@@ -3851,6 +3892,13 @@ impl App {
                     // Превращается в обычный запуск ещё в `new`.
                     Some(Preview::CollectionEarly) => Task::none(),
                     Some(Preview::Clips) => self.update(Message::Open(Section::Clips)),
+                    Some(Preview::Concerts(city)) => {
+                        let open = self.update(Message::Open(Section::Concerts));
+                        // Окно города открывается, когда придёт список городов.
+                        let dialog = if city { Task::perform(background(|| std::thread::sleep(Duration::from_secs(3))), |()| Message::DialogOpen(Dialog::ConcertCity)) } else { Task::none() };
+                        Task::batch([open, dialog])
+                    }
+                    Some(Preview::Concert(id)) => self.update(Message::ConcertOpen(id)),
                     Some(Preview::Clip(id)) => match self.token() {
                         Some(token) => Task::perform(background(move || api::clips_by_id(&[id], &token)), |result| Message::ClipLink(result, 0)),
                         None => Task::none(),
@@ -4415,6 +4463,7 @@ impl App {
                         let covers = Task::batch([self.clip_covers(&self.clips_liked), self.clip_covers(&self.clips_like)]);
                         Task::batch([covers, self.clips_load(), self.clip_feed_load()])
                     }
+                    Section::Concerts if !self.concerts_loading => self.concerts_load(),
                     Section::Settings if self.ai_less.is_none() => {
                         let Some(token) = self.token() else { return Task::none() };
                         Task::perform(background(move || api::ai_reduction(&token)), Message::AiLessLoaded)
@@ -4892,6 +4941,8 @@ impl App {
                         let videos = artist.videos.iter().filter_map(|video| Some((format!("{VIDEO_COVER}{}", video.id), video.cover.clone()?)));
                         let clip_covers = self.clip_covers(&if artist.clips.is_empty() { clips::artist_video_clips(&artist) } else { artist.clips.clone() });
                         let photos = artist.photos.iter().enumerate().map(|(at, uri)| (format!("{PHOTO_COVER}{}:{at}", artist.id), uri.clone()));
+                        let concerts = artist.concerts.iter().filter_map(|c| Some((concerts::concert_cover_key(c), c.cover.clone()?))).collect();
+                        let clip_covers = Task::batch([clip_covers, self.fetch_cover_jobs(concerts, "400x400")]);
                         let jobs = main.into_iter().chain(artists).chain(albums).chain(release).chain(lists).chain(videos).chain(photos).collect();
                         self.familiar_wave = artist.familiar_collection.is_empty();
                         self.familiar_all = false;
@@ -5593,6 +5644,17 @@ impl App {
                 return match dialog {
                     Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account | Dialog::Wizard | Dialog::Unsafe(..) | Dialog::Vibe(_) => Task::none(),
                     Dialog::Logout => self.handle(Message::Logout),
+                    Dialog::ConcertCity => {
+                        let _ = (uid, token);
+                        // Ничего не нашлось — окно остаётся, чтобы поправить запрос.
+                        match self.concert_city_first() {
+                            Some(pick) => self.handle(pick),
+                            None => {
+                                self.dialog = Some(Dialog::ConcertCity);
+                                Task::none()
+                            }
+                        }
+                    }
                     Dialog::ClearDownloads => self.handle(Message::DownloadsClear),
                     Dialog::DownloadLikes => self.handle(Message::DownloadLikes),
                     Dialog::Create => Task::perform(background(move || api::create_playlist(&uid, &title, &token)), Message::PlaylistCreated),
@@ -6339,6 +6401,7 @@ impl App {
                         },
                         Section::Search => "Поиск".to_string(),
                         Section::Artist => self.artist.as_ref().map_or_else(String::new, |a| a.name.clone()),
+                        Section::Concert => self.concert.as_ref().map_or_else(String::new, |page| page.artist_name.clone()),
                         Section::History => "История".to_string(),
                         Section::Dislikes => "Дизлайки".to_string(),
                         Section::Downloads => "Скачанное".to_string(),
@@ -6347,6 +6410,7 @@ impl App {
                     self.queue_from = match section {
                         Section::Playlists => self.playlist.clone().map_or(QueueFrom::Unknown, QueueFrom::List),
                         Section::Artist => self.artist.as_ref().map_or(QueueFrom::Unknown, |artist| QueueFrom::Artist(artist.id.clone())),
+                        Section::Concert => self.concert.as_ref().and_then(|page| page.artist.clone()).map_or(QueueFrom::Unknown, QueueFrom::Artist),
                         Section::Search => QueueFrom::Search,
                         Section::History => QueueFrom::History,
                         Section::Dislikes => QueueFrom::Dislikes,
@@ -6618,6 +6682,8 @@ impl App {
             Section::Artists => self.view_card_page("Исполнители", &self.liked_artists, ARTIST_COVER, true, "Здесь появятся исполнители, которые вам понравились"),
             Section::Search => self.view_search(),
             Section::Clips => self.view_clips(),
+            Section::Concerts => self.view_concerts(),
+            Section::Concert => self.view_concert(),
         };
         // Альбома, исполнителя или плейлиста нет у Яндекса: страница, как в оригинале, а не плашка.
         let missing = self.error.as_deref().is_some_and(|error| error.starts_with("Яндекс ответил 404")) && matches!(self.section, Section::Playlists | Section::Artist | Section::Landing | Section::Block);
@@ -6724,6 +6790,7 @@ impl App {
             Dialog::Account => return self.view_account(),
             Dialog::Unsafe(_, go, modal) => return self.view_unsafe(go, modal),
             Dialog::Vibe(kind) => return self.view_vibe(kind),
+            Dialog::ConcertCity => return self.view_concert_city(),
             Dialog::Logout => ("Выйти из аккаунта?".to_string(), "Выйти", true),
             Dialog::DownloadLikes => {
                 let left = self.liked_ids.iter().filter(|id| !self.download_ids.contains(*id)).count();
@@ -7397,6 +7464,7 @@ impl App {
                     item(ui::HEADPHONES, "Книги и подкасты", Section::Books),
                 ]
                 .extend(self.kids.then(|| item(ui::KIDS, "Детям", Section::Kids)))
+                .push(item(ui::CONCERTS, "Концерты", Section::Concerts))
                 .push(item(ui::COLLECTION, "Коллекция", Section::Collection))
                 .spacing(4),
                 Space::new().height(16),
@@ -8566,6 +8634,10 @@ impl App {
                 let label = if self.familiar_all { "Свернуть".to_string() } else { format!("Показать все {}", tracks.len()) };
                 page = page.push(shine(button(text(label).color(ui::c().text)).padding([7, 16]).style(ui::secondary).on_press(Message::FamiliarAll(!self.familiar_all)), 18.0));
             }
+        }
+        if !artist.concerts.is_empty() {
+            let concerts = self.shelf("artist:concerts", "Концерты", None, artist.concerts.len(), |shown| artist.concerts[shown].iter().map(|concert| self.concert_card(concert)).collect());
+            page = page.push(Space::new().height(8)).push(concerts);
         }
         if !artist.albums.is_empty() {
             let albums = self.shelf("artist:albums", "Альбомы", Some(Message::DiscographyOpen(false)), artist.albums.len(), |shown| self.album_cards(&artist.albums[shown], ALBUM_COVER, false, open_album));
@@ -10602,6 +10674,9 @@ fn main() -> iced::Result {
             "wave" => Preview::Wave,
             "wave-words" => Preview::WaveWords,
             "clips" => Preview::Clips,
+            "concerts" => Preview::Concerts(false),
+            "concerts-city" => Preview::Concerts(true),
+            what if what.starts_with("concert:") => Preview::Concert(what["concert:".len()..].to_string()),
             what if what.starts_with("clip:") => Preview::Clip(what["clip:".len()..].to_string()),
             "wave-wheel" => Preview::WaveWheel,
             "vibe-promo" => Preview::VibePromo,

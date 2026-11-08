@@ -956,6 +956,8 @@ pub struct Artist {
     pub modal: Option<Modal>,
     /// Альбом, который скоро выйдет: подпись карточки — дата выхода.
     pub upcoming: Option<Card>,
+    /// Ближайшие концерты исполнителя.
+    pub concerts: Vec<Concert>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1079,6 +1081,7 @@ fn parse_artist(v: &Value) -> Option<Artist> {
         disclaimer: Vec::new(),
         modal: None,
         upcoming: None,
+        concerts: Vec::new(),
         release: v["lastReleases"].as_array().and_then(|list| list.first()).and_then(album_card),
         playlists: v["playlists"].as_array().into_iter().flatten().filter_map(parse_home_playlist).collect(),
         clips: Vec::new(),
@@ -1164,6 +1167,7 @@ pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
     if let Ok(v) = get(&format!("artists/{id}/blocks/artist-clips"), &[("page", "0"), ("pageSize", "50")], token) {
         artist.clips = parse_clips(&result(&v)["items"]);
     }
+    artist.concerts = artist_concerts(id, None, token).unwrap_or_default();
     let limit = FAMILIAR_LIMIT.to_string();
     if let Ok(v) = get(&format!("artists/{id}/familiar-you"), &[("waveTracksLimit", &limit), ("collectionTracksLimit", &limit), ("collectionAlbumsLimit", "0")], token) {
         (artist.familiar_collection, artist.familiar_wave) = parse_familiar(result(&v));
@@ -3245,6 +3249,212 @@ pub fn file_info(track_id: &str, quality: &str, token: &str) -> Result<FileInfo,
     })
 }
 
+/// Концерт из ленты, со страницы исполнителя или своей страницы.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Concert {
+    pub id: String,
+    pub title: String,
+    pub city: String,
+    pub place: String,
+    /// Как прислал Яндекс: `2026-11-29T19:00:00+03:00`, время местное для площадки.
+    pub datetime: String,
+    pub cover: Option<String>,
+    pub rating: String,
+    /// `concert`, `festival`, `musical`, `tribute` или что-то своё.
+    pub kind: String,
+    /// «от 13 000 ₽».
+    pub price: Option<String>,
+    /// Сеанс Афиши: по нему продаются билеты.
+    pub session: Option<String>,
+}
+
+impl Concert {
+    /// Число и месяц для значка даты: «29» и «нояб».
+    pub fn day_month(&self) -> Option<(u32, &'static str)> {
+        const SHORT: [&str; 12] = ["янв", "февр", "март", "апр", "мая", "июня", "июля", "авг", "сент", "окт", "нояб", "дек"];
+        let month: usize = self.datetime.get(5..7)?.parse().ok()?;
+        Some((self.datetime.get(8..10)?.parse().ok()?, SHORT.get(month.checked_sub(1)?)?))
+    }
+
+    /// «29 ноября, сб, 19:00».
+    pub fn when(&self) -> String {
+        const MONTHS: [&str; 12] = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
+        const DAYS: [&str; 7] = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"];
+        let parts = || -> Option<String> {
+            let (year, month, day): (i32, usize, u32) = (self.datetime.get(0..4)?.parse().ok()?, self.datetime.get(5..7)?.parse().ok()?, self.datetime.get(8..10)?.parse().ok()?);
+            let time = self.datetime.get(11..16)?;
+            let weekday = DAYS[weekday(year, month as u32, day)];
+            Some(format!("{day} {}, {weekday}, {time}", MONTHS.get(month.checked_sub(1)?)?))
+        };
+        parts().unwrap_or_default()
+    }
+
+    /// «Москва · Duplex (Королёв)».
+    pub fn where_(&self) -> String {
+        [self.city.as_str(), self.place.as_str()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" · ")
+    }
+
+    /// «Концерт», «Фестиваль», как подписывает оригинал.
+    pub fn kind_name(&self) -> String {
+        match self.kind.as_str() {
+            "festival" => "Фестиваль".to_string(),
+            "musical" => "Мюзикл".to_string(),
+            "tribute" => "Трибьют".to_string(),
+            "" | "concert" | "unspecified" => "Концерт".to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    /// Страница Афиши с билетами — та же, что оригинал открывает у себя в окне.
+    pub fn tickets_url(&self) -> Option<String> {
+        self.session.as_ref().map(|session| format!("https://widget.afisha.yandex.ru/w/sessions/{session}?clientKey={AFISHA_CLIENT}"))
+    }
+}
+
+/// Ключ Афиши у оригинала для Windows.
+const AFISHA_CLIENT: &str = "0d8ab1a6-1667-42cb-a98f-2fe7eff4b137";
+
+/// День недели от понедельника (0) до воскресенья (6).
+fn weekday(year: i32, month: u32, day: u32) -> usize {
+    // Сакамото: 0 — воскресенье.
+    const T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let y = if month < 3 { year - 1 } else { year };
+    let sunday_first = (y + y / 4 - y / 100 + y / 400 + T[(month as usize - 1) % 12] + day as i32).rem_euclid(7);
+    ((sunday_first + 6) % 7) as usize
+}
+
+/// «13 000».
+fn thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push('\u{a0}');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// Концерт — объект `{concert, minPrice}`, как в ленте и у исполнителя.
+fn parse_concert(v: &Value) -> Option<Concert> {
+    let c = &v["concert"];
+    let price = &v["minPrice"];
+    Some(Concert {
+        id: c["id"].as_str()?.to_string(),
+        title: c["concertTitle"].as_str().unwrap_or_default().to_string(),
+        city: c["city"].as_str().unwrap_or_default().to_string(),
+        place: c["place"].as_str().unwrap_or_default().to_string(),
+        datetime: c["datetime"].as_str().unwrap_or_default().to_string(),
+        cover: c["cover"]["uri"].as_str().map(|uri| uri.trim_start_matches("https://").to_string()),
+        rating: c["contentRating"].as_str().unwrap_or_default().to_string(),
+        kind: c["eventInfo"]["type"].as_str().unwrap_or_default().to_string(),
+        price: price["value"].as_u64().map(|value| format!("от {} {}", thousands(value), price["currencySymbol"].as_str().unwrap_or("₽"))),
+        session: c["dataSessionId"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
+    })
+}
+
+fn locations_query(location: Option<u64>) -> Vec<(&'static str, String)> {
+    location.map(|id| ("locations", id.to_string())).into_iter().collect()
+}
+
+/// Лента концертов: без города — «рядом», как решит Яндекс.
+pub fn concerts_feed(location: Option<u64>, token: &str) -> Result<Vec<Concert>, String> {
+    let query = locations_query(location);
+    let query: Vec<(&str, &str)> = query.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let v = get("concerts/feed", &query, token)?;
+    Ok(result(&v)["items"].as_array().into_iter().flatten().filter(|item| item["type"].as_str() == Some("concert_item")).filter_map(|item| parse_concert(&item["data"])).collect())
+}
+
+/// Сколько первых концертов ленты — «Топ для вас» (`concerts/tab-config`).
+pub fn concerts_top(token: &str) -> usize {
+    get("concerts/tab-config", &[], token).ok().and_then(|v| result(&v)["config"]["top"]["limit"].as_u64()).map_or(5, |limit| limit as usize)
+}
+
+/// Города с концертами: номер и название.
+pub fn concert_cities(token: &str) -> Result<Vec<(u64, String)>, String> {
+    let v = get("concerts/locations", &[], token)?;
+    Ok(result(&v)["locations"].as_array().into_iter().flatten().filter_map(|city| Some((city["id"].as_u64()?, city["name"].as_str()?.to_string()))).collect())
+}
+
+/// Площадка: адрес, метро с цветом линии и карта.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Venue {
+    pub address: String,
+    pub metro: Vec<(String, Option<String>)>,
+    /// Картинка карты: `%%` — размер, «650,300».
+    pub map_image: Option<String>,
+    pub map_url: Option<String>,
+}
+
+/// Страница концерта.
+#[derive(Clone, Debug)]
+pub struct ConcertPage {
+    pub concert: Concert,
+    pub covers: Vec<String>,
+    pub about: String,
+    pub about_source: String,
+    pub artist: Option<String>,
+    pub venue: Venue,
+    /// Другие концерты исполнителя.
+    pub others: Vec<Concert>,
+    /// Популярные треки исполнителя.
+    pub tracks: Vec<Track>,
+    pub artist_name: String,
+}
+
+pub fn concert_page(id: &str, location: Option<u64>, token: &str) -> Result<ConcertPage, String> {
+    let v = get(&format!("concerts/{id}/info"), &[], token).map_err(|e| if e.contains("404") { NOT_FOUND.to_string() } else { e })?;
+    let info = result(&v);
+    let concert = parse_concert(info).ok_or_else(|| NOT_FOUND.to_string())?;
+    let artist = id_text(&info["leadArtistId"]);
+    let mut page = ConcertPage {
+        concert,
+        covers: info["covers"].as_array().into_iter().flatten().filter_map(|cover| cover["uri"].as_str().map(|uri| uri.trim_start_matches("https://").to_string())).collect(),
+        about: info["description"]["text"].as_str().unwrap_or_default().to_string(),
+        about_source: info["description"]["source"].as_str().unwrap_or_default().to_string(),
+        artist: artist.clone(),
+        venue: Venue::default(),
+        others: Vec::new(),
+        tracks: Vec::new(),
+        artist_name: String::new(),
+    };
+    // Площадка и исполнитель — дополнение: без них страница всё равно откроется.
+    if let Ok(v) = get(&format!("concerts/{id}/blocks/place"), &[], token) {
+        page.venue = parse_venue(result(&v));
+    }
+    if let Some(artist) = artist {
+        page.others = artist_concerts(&artist, location, token).unwrap_or_default().into_iter().filter(|other| other.id != id).collect();
+        if let Ok(v) = get(&format!("artists/{artist}/brief-info"), &[], token) {
+            if let Some(found) = parse_artist(result(&v)) {
+                page.artist_name = found.name;
+                page.tracks = found.popular;
+            }
+        }
+    }
+    Ok(page)
+}
+
+fn parse_venue(v: &Value) -> Venue {
+    Venue {
+        address: v["address"].as_str().unwrap_or_default().to_string(),
+        metro: v["metroStations"].as_array().into_iter().flatten().filter_map(|station| Some((station["title"].as_str()?.to_string(), station["line-color"].as_str().map(str::to_string)))).collect(),
+        map_image: v["map"]["imageUrl"].as_str().filter(|url| url.starts_with("https://")).map(str::to_string),
+        map_url: v["map"]["url"].as_str().filter(|url| url.starts_with("https://")).map(str::to_string),
+    }
+}
+
+/// Концерты исполнителя. Нет концертов — Яндекс отвечает 404, это пустой список.
+pub fn artist_concerts(artist: &str, location: Option<u64>, token: &str) -> Result<Vec<Concert>, String> {
+    let query = locations_query(location);
+    let query: Vec<(&str, &str)> = query.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    match get(&format!("artists/{artist}/blocks/artist-concerts"), &query, token) {
+        Ok(v) => Ok(result(&v)["concerts"].as_array().into_iter().flatten().filter_map(parse_concert).collect()),
+        Err(e) if e.contains("404") => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Обложка нужного размера, например 100x100. Нет сети — останется заглушка.
 pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
     let url = format!("https://{}", uri.trim_start_matches("https://").replace("%%", size));
@@ -3332,6 +3542,21 @@ mod tests {
     fn liked_ids_parse() {
         let v = serde_json::json!({"library": {"revision": 5, "tracks": [{"id": "1", "albumId": "2"}, {"id": 3}]}});
         assert_eq!(parse_liked_ids(&v), vec!["1".to_string(), "3".to_string()]);
+    }
+
+    #[test]
+    fn concert_reads_like_original() {
+        let v = serde_json::json!({"concert": {"id": "c1", "concertTitle": "madk1d", "city": "Москва", "place": "Duplex", "datetime": "2026-11-29T19:00:00+03:00", "dataSessionId": "S1", "cover": {"uri": "https://avatars.mds.yandex.net/get-afishanew/1/2/%%"}, "contentRating": "16+", "eventInfo": {"type": "festival"}}, "minPrice": {"value": 13000, "currency": "RUB", "currencySymbol": "₽"}});
+        let concert = parse_concert(&v).unwrap();
+        assert_eq!(concert.price.as_deref(), Some("от 13\u{a0}000 ₽"));
+        assert_eq!(concert.when(), "29 ноября, вс, 19:00");
+        assert_eq!(concert.day_month(), Some((29, "нояб")));
+        assert_eq!((concert.where_(), concert.kind_name()), ("Москва · Duplex".to_string(), "Фестиваль".to_string()));
+        assert_eq!(concert.cover.as_deref(), Some("avatars.mds.yandex.net/get-afishanew/1/2/%%"));
+        assert_eq!(concert.tickets_url().unwrap(), format!("https://widget.afisha.yandex.ru/w/sessions/S1?clientKey={AFISHA_CLIENT}"));
+        assert_eq!(thousands(950), "950");
+        let venue = parse_venue(&serde_json::json!({"address": "ул. 1", "metroStations": [{"title": "ЗИЛ", "line-color": "#ff4c4c"}], "map": {"imageUrl": "https://static-maps.yandex.ru/1.x/?size=%%", "url": "https://maps.yandex.ru/?z=16"}}));
+        assert_eq!(venue.metro, vec![("ЗИЛ".to_string(), Some("#ff4c4c".to_string()))]);
     }
 
     #[test]
