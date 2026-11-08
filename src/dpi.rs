@@ -122,6 +122,8 @@ unsafe fn settle(hwnd: HWND) {
         }
         let mut frame = RECT { left: 0, top: 0, right: want_width, bottom: want_height };
         AdjustWindowRectExForDpi(&mut frame, GetWindowLongPtrW(hwnd, GWL_STYLE) as u32, 0, GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32, dpi);
+        // Системного заголовка нет (`caption`): клиентская часть начинается от верха окна.
+        frame.top = 0;
         DEPTH.fetch_add(1, Ordering::Relaxed);
         SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, frame.right - frame.left, frame.bottom - frame.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         DEPTH.fetch_sub(1, Ordering::Relaxed);

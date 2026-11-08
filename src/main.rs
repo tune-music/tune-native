@@ -11,6 +11,7 @@ mod discord;
 mod shell;
 mod tray;
 mod dpi;
+mod caption;
 mod client;
 mod fonts;
 mod pipe;
@@ -1081,7 +1082,8 @@ struct App {
     /// Уведомление о громкости или скорости: при смене числа оно не мигает.
     notice_quick: bool,
     /// Скрыт ли сейчас текст в заголовке окна.
-    caption_hidden: bool,
+    /// Мышь над крестиком своей полосы заголовка: он краснеет, значок белеет.
+    caption_close_hover: bool,
     discord: Option<discord::Handle>,
     discord_sent: Option<(String, bool, Instant, f64)>,
     /// Открытая вкладка настроек.
@@ -1612,6 +1614,10 @@ enum Message {
     WindowSize(Size),
     /// Крестик окна: во время музыки окно уходит в трей, как у оригинала.
     CloseWindow,
+    CaptionMinimize,
+    CaptionCloseHover(bool),
+    /// Полосу заголовка надо перерисовать: наведение на «развернуть», фокус окна.
+    CaptionRefresh,
     Tray(tray::Event),
     Media(media::Event),
     Play(Section, usize),
@@ -1811,7 +1817,7 @@ impl App {
             speed_text: speed_label(saved.speed),
             reverb_text: saved.reverb.to_string(),
             notice_quick: false,
-            caption_hidden: false,
+            caption_close_hover: false,
             discord: None,
             discord_sent: None,
             settings_tab: SettingsTab::Main,
@@ -2097,17 +2103,20 @@ impl App {
     /// Шаг скорости, как у Tune Client: по ровной сетке шага; клик по кнопке — по кругу
     /// (после 2× снова 0,5×), колесо упирается в края. 0 — обычная скорость.
     fn speed_by(&mut self, direction: i8, wrap: bool) -> Task<Message> {
-        let (speed, step) = (f64::from(self.speed), f64::from(self.speed_step));
-        let (min, max) = (f64::from(settings::SPEED_MIN), f64::from(settings::SPEED_MAX));
+        // Считается в целых сотых: в f32 1,05 — это 1,0499999, и деление на шаг 0,05 давало
+        // 20,99999 вместо 21 — скорость застревала на одном значении.
+        let hundredths = |value: f32| (value * 100.0).round() as i32;
+        let (speed, step) = (hundredths(self.speed), hundredths(self.speed_step).max(1));
+        let (min, max) = (hundredths(settings::SPEED_MIN), hundredths(settings::SPEED_MAX));
         let next = match direction {
-            0 => 1.0,
+            0 => 100,
             up if up > 0 => {
-                let next = (speed / step + 1e-6).floor() * step + step;
-                if wrap && next > max + 1e-6 { min } else { next }
+                let next = (speed.div_euclid(step) + 1) * step;
+                if wrap && next > max { min } else { next }
             }
-            _ => (speed / step - 1e-6).ceil() * step - step,
+            _ => (speed + step - 1).div_euclid(step) * step - step,
         };
-        self.speed = ((next.clamp(min, max) * 100.0).round() / 100.0) as f32;
+        self.speed = next.clamp(min, max) as f32 / 100.0;
         self.speed_text = speed_label(self.speed);
         self.apply_speed();
         self.save_settings();
@@ -4084,12 +4093,6 @@ impl App {
             media.sync(track.as_ref(), playing, position);
         }
         tray::sync(self.is_playing(), ui::is_light());
-        // Трек нужен на панели задач, но не в заголовке: текст заголовка прячется, значок остаётся.
-        let hide = self.window_prefs.track_taskbar && !self.window_prefs.track_title;
-        if let Some(hwnd) = self.hwnd.filter(|_| hide != self.caption_hidden) {
-            caption_text(hwnd, !hide);
-            self.caption_hidden = hide;
-        }
         self.discord_sync(track.as_ref(), playing, position);
         Task::batch([task, snap, more, covers, lyrics])
     }
@@ -6847,6 +6850,7 @@ impl App {
                 if let Some(hwnd) = hwnd {
                     paint_caption(hwnd);
                     dpi::guard(hwnd);
+                    caption::install(hwnd);
                 }
                 self.media = hwnd.map(Media::new);
                 // У предпросмотров значка нет: их закрывают снаружи, и он оставался бы висеть.
@@ -6861,6 +6865,13 @@ impl App {
                 Some(hwnd) => hide_window(hwnd),
                 None => return self.update(Message::Quit),
             },
+            Message::CaptionMinimize => {
+                if let Some(hwnd) = self.hwnd {
+                    caption::minimize(hwnd);
+                }
+            }
+            Message::CaptionCloseHover(hover) => self.caption_close_hover = hover,
+            Message::CaptionRefresh => {}
             Message::Tray(event) => match event {
                 tray::Event::Show => {
                     if let Some(hwnd) = self.hwnd {
@@ -7223,7 +7234,7 @@ impl App {
         if let Some(error) = &self.error {
             content = content.push(text(human_error(error)).color(ui::c().danger));
         }
-        container(content).center(Length::Fill).style(ui::root).into()
+        stack![container(content).center(Length::Fill).style(ui::root), self.view_caption()].into()
     }
 
     fn view_main(&self) -> Element<'_, Message> {
@@ -7319,7 +7330,7 @@ impl App {
             main = main.push(bar);
         }
         let main: Element<'_, Message> = container(main).padding(Padding::ZERO.right(12).bottom(12)).width(Length::Fill).height(Length::Fill).into();
-        let columns = row![self.view_sidebar(), main];
+        let columns = column![Space::new().height(caption::HEIGHT), row![self.view_sidebar(), main]];
         let base = container(columns).width(Length::Fill).height(Length::Fill).style(ui::root);
         // Окно клипа непрозрачно и на всё окно: что под ним, не рисуем.
         let covered = self.clip.is_some();
@@ -7330,6 +7341,7 @@ impl App {
         if let Some(clip) = self.view_clip() {
             layers = layers.push(clip);
         }
+        layers = layers.push(self.view_caption());
         if self.menu.is_some() || self.eq_menu.is_some() || self.page_menu.is_some() || self.pin_menu.is_some() || self.devices_menu.is_some() {
             layers = layers.push(mouse_area(container(Space::new()).width(Length::Fill).height(Length::Fill)).on_press(Message::MenuClose).on_right_press(Message::MenuClose));
         }
@@ -7365,7 +7377,7 @@ impl App {
                     .height(Length::Fill)
                     .align_x(Alignment::Center)
                     .align_y(Alignment::Start)
-                    .padding(Padding::new(0.0).top(16)),
+                    .padding(Padding::new(0.0).top(16.0 + caption::HEIGHT)),
             );
         }
         smooth(layers)
@@ -8104,14 +8116,63 @@ impl App {
         self.discord_sent = Some((id, playing, Instant::now(), at));
     }
 
-    /// Заголовок окна: «Исполнитель — трек», как у Tune Client, или просто «Tune».
+    /// Текст окна — его Windows показывает на панели задач и в Alt+Tab: «Исполнитель — трек»,
+    /// если это включено, иначе «Tune». Полоса заголовка своя и подписывается отдельно.
     fn title(&self) -> String {
-        let prefs = self.window_prefs;
-        match self.current_track().filter(|_| prefs.track_title || prefs.track_taskbar) {
+        self.track_caption(self.window_prefs.track_taskbar)
+    }
+
+    fn track_caption(&self, with_track: bool) -> String {
+        match self.current_track().filter(|_| with_track) {
             Some(track) if !track.title.is_empty() && track.artists.is_empty() => track.title.clone(),
             Some(track) if !track.title.is_empty() => format!("{} — {}", track.artists, track.title),
             _ => "Tune".to_string(),
         }
+    }
+
+    /// Своя полоса заголовка: значок, «Tune» или трек и кнопки окна. Перетаскивание,
+    /// двойной щелчок, меню окна и раскладки над «развернуть» — от Windows (`caption`).
+    fn view_caption(&self) -> Element<'_, Message> {
+        static LOGO: std::sync::OnceLock<image::Handle> = std::sync::OnceLock::new();
+        let logo = LOGO.get_or_init(|| image::Handle::from_bytes(include_bytes!("../assets/tune.png").as_slice())).clone();
+        let active = caption::active();
+        let tint = if active { ui::c().text } else { ui::c().muted };
+        let label = self.track_caption(self.window_prefs.track_title);
+        let name = row![image(logo).width(16).height(16), text(label).size(12).color(tint).wrapping(Wrapping::None)].spacing(10).align_y(Alignment::Center);
+        let name = container(name).padding(Padding::ZERO.left(14)).width(Length::Fill).height(Length::Fill).align_y(Alignment::Center).clip(true);
+        let zoomed = self.hwnd.is_some_and(caption::zoomed);
+        let (max_hover, max_pressed) = caption::max_state();
+        let face = |glyph, color| container(ui::icon(glyph, 16.0, color)).center_x(caption::BUTTON).center_y(caption::HEIGHT);
+        let shade = |hover: bool, pressed: bool| match (hover, pressed) {
+            (_, true) => Some(iced::Background::Color(ui::c().text.scale_alpha(0.12))),
+            (true, _) => Some(iced::Background::Color(ui::c().text.scale_alpha(0.07))),
+            _ => None,
+        };
+        let plain = move |_: &iced::Theme, status: button::Status| button::Style {
+            background: shade(status == button::Status::Hovered, status == button::Status::Pressed),
+            ..button::Style::default()
+        };
+        // «Развернуть» нажимает Windows: наведение и нажатие iced тут не видит.
+        let maximize = move |_: &iced::Theme, _: button::Status| button::Style { background: shade(max_hover, max_pressed), ..button::Style::default() };
+        let close_hover = self.caption_close_hover;
+        let close = move |_: &iced::Theme, status: button::Status| button::Style {
+            background: match status {
+                button::Status::Pressed => Some(iced::Background::Color(iced::Color::from_rgb8(0x94, 0x1e, 0x14))),
+                button::Status::Hovered => Some(iced::Background::Color(iced::Color::from_rgb8(0xc4, 0x2b, 0x1c))),
+                _ => None,
+            },
+            ..button::Style::default()
+        };
+        let close_tint = if close_hover { iced::Color::WHITE } else { tint };
+        row![
+            name,
+            button(face(ui::WINDOW_MINIMIZE, tint)).padding(0).style(plain).on_press(Message::CaptionMinimize),
+            button(face(if zoomed { ui::WINDOW_RESTORE } else { ui::WINDOW_MAXIMIZE }, tint)).padding(0).style(maximize),
+            mouse_area(button(face(ui::WINDOW_CLOSE, close_tint)).padding(0).style(close).on_press(Message::CloseWindow)).on_enter(Message::CaptionCloseHover(true)).on_exit(Message::CaptionCloseHover(false)),
+        ]
+        .height(caption::HEIGHT)
+        .width(Length::Fill)
+        .into()
     }
 
     fn view_sidebar(&self) -> Element<'_, Message> {
@@ -8514,8 +8575,8 @@ impl App {
                         toggle("Сворачивать в трей при закрытии", "Музыка продолжит играть. Выйти совсем — из меню значка в трее", Some(prefs.close_to_tray), set(|p| p.close_to_tray = !p.close_to_tray)),
                     ]),
                     group("Вид", vec![
-                        toggle("Трек в заголовке окна", "Вместо «Tune» в верхней полосе окна — «Исполнитель — трек». Windows берёт этот текст и для панели задач, поэтому там трек тоже будет", Some(prefs.track_title), set(|p| p.track_title = !p.track_title)),
-                        toggle("Трек на панели задач и в Alt+Tab", "«Исполнитель — трек» на кнопке окна и в переключении окон. Windows берёт подпись для панели задач из заголовка окна, поэтому без первого пункта текст в заголовке скрывается — остаётся значок", Some(prefs.track_taskbar || prefs.track_title), (!prefs.track_title).then(|| Message::WindowPrefSet(settings::WindowPrefs { track_taskbar: !prefs.track_taskbar, ..prefs }))),
+                        toggle("Трек в заголовке окна", "Вместо «Tune» в верхней полосе окна — «Исполнитель — трек»", Some(prefs.track_title), set(|p| p.track_title = !p.track_title)),
+                        toggle("Трек на панели задач и в Alt+Tab", "«Исполнитель — трек» на кнопке окна и в переключении окон; в заголовке окна при этом может остаться «Tune»", Some(prefs.track_taskbar), set(|p| p.track_taskbar = !p.track_taskbar)),
                     ]),
                 ]
                 .spacing(28)
@@ -10479,17 +10540,6 @@ fn window_handle() -> Task<Message> {
         .map(Message::WindowReady)
 }
 
-/// Заголовок окна цвета боковой панели, как в оригинале: чёрный или светло-серый. Рамка
-/// остаётся системной: работают привязка к краям экрана и изменение размера.
-/// Показывает или прячет текст в заголовке окна; значок и кнопки остаются. На панели
-/// задач и в Alt+Tab текст окна виден всё равно.
-fn caption_text(hwnd: isize, visible: bool) {
-    use windows_sys::Win32::UI::Controls::{SetWindowThemeAttribute, WTA_NONCLIENT, WTA_OPTIONS, WTNCA_NODRAWCAPTION};
-    let options = WTA_OPTIONS { dwFlags: if visible { 0 } else { WTNCA_NODRAWCAPTION }, dwMask: WTNCA_NODRAWCAPTION };
-    // SAFETY: своё окно, структура живёт до конца вызова.
-    unsafe { SetWindowThemeAttribute(hwnd as _, WTA_NONCLIENT, std::ptr::from_ref(&options).cast(), std::mem::size_of::<WTA_OPTIONS>() as u32) };
-}
-
 /// Секунды по часам с первого вызова: для анимаций, которым нужно ровное время.
 fn clock_seconds() -> f32 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -10506,6 +10556,7 @@ fn parse_number(value: &str) -> Option<f32> {
     value.trim().trim_end_matches(['×', 'x', 'х']).trim().replace(',', ".").parse().ok()
 }
 
+/// Тёмная или светлая системная рамка и меню окна под тему Tune. Сам заголовок свой (`caption`).
 fn paint_caption(hwnd: isize) {
     use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE};
     // Цвет для Windows: 0x00BBGGRR.
@@ -10565,7 +10616,7 @@ impl PipeMedia for Subscription<Message> {
             Event::Keyboard(keyboard::Event::KeyPressed { key, physical_key, modifiers, .. }) if status == event::Status::Ignored => hotkey(&key, physical_key, modifiers),
             _ => None,
         });
-        Subscription::batch([self, back, Subscription::run(media::events).map(Message::Media), Subscription::run(pipe::links).map(Message::LinkFromOutside), Subscription::run(tray::events).map(Message::Tray)])
+        Subscription::batch([self, back, Subscription::run(media::events).map(Message::Media), Subscription::run(pipe::links).map(Message::LinkFromOutside), Subscription::run(tray::events).map(Message::Tray), Subscription::run(caption::events).map(|()| Message::CaptionRefresh)])
     }
 }
 
