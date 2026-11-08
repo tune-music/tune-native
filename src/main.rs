@@ -335,7 +335,6 @@ const QUEUE_SCROLL: f32 = 0.45;
 const QUEUE_SOURCE_INSET: f32 = 48.0;
 const QUEUE_SOURCE_SIZE: f32 = 14.0;
 const QUEUE_SOURCE_LABEL: usize = 60;
-const QUALITY_WIDTH: f32 = 250.0;
 const SKELETON_ROWS: usize = 10;
 const SKELETON_BLOCKS: usize = 3;
 /// Высота строк настоящей страницы, чтобы после загрузки ничего не сдвигалось.
@@ -691,6 +690,8 @@ enum Preview {
     History,
     /// История, прокрученная до доли высоты: середина или конец.
     HistoryAt(f32),
+    /// «Мне нравится», прокрученное до доли высоты.
+    LikesAt(f32),
     Dialog,
     Home,
     /// Вторая вкладка главной.
@@ -1047,7 +1048,6 @@ struct App {
     /// Страницы, с которых ушли кнопкой «назад».
     forward: Vec<Place>,
     /// Выбор качества открыт в этой точке.
-    quality_menu: Option<(f32, f32)>,
     /// Эквалайзер из трекбара открыт в этой точке.
     eq_menu: Option<(f32, f32)>,
     /// Что ещё закрывает новую страницу, от 1 до 0.
@@ -1073,7 +1073,6 @@ struct App {
     track_veil: f32,
     shown_track: Option<String>,
     menu_fade: Fade<(Track, f32, f32, bool, bool)>,
-    quality_fade: Fade<(f32, f32)>,
     eq_fade: Fade<(f32, f32)>,
     dialog_fade: Fade<Dialog>,
     /// Плеер на всё окно: открыт ли и как далеко выехал.
@@ -1290,7 +1289,6 @@ enum Message {
     ToggleMute,
     RepeatNext,
     ShuffleToggle,
-    QualityOpen,
     QualitySet(Quality),
     QueueToggle,
     QueueSource,
@@ -1712,7 +1710,6 @@ impl App {
             restart: None,
             unhold: false,
             forward: Vec::new(),
-            quality_menu: None,
             eq_menu: None,
             page_veil: 0.0,
             listen: None,
@@ -1727,7 +1724,6 @@ impl App {
             track_veil: 0.0,
             shown_track: None,
             menu_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
-            quality_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
             eq_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
             dialog_fade: Fade::new(DIALOG_OPEN, DIALOG_CLOSE),
             player_full: false,
@@ -1805,7 +1801,7 @@ impl App {
 
     /// Анимации интерфейса: им нужен каждый кадр монитора.
     fn ui_animating(&self) -> bool {
-        self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.quality_fade.busy() || self.eq_fade.busy() || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy() || self.wheel_turn != self.wheel_target || self.wheel_reveal != if self.wheel_open { 1.0 } else { 0.0 }
+        self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.eq_fade.busy() || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy() || self.wheel_turn != self.wheel_target || self.wheel_reveal != if self.wheel_open { 1.0 } else { 0.0 }
             || (self.wheel_ready() && self.wheel_arrow < 1.0)
             || self.word_now() != self.word_for
             || (self.word_for.is_some() && self.word_level < 1.0)
@@ -2191,7 +2187,6 @@ impl App {
         self.list_offset = 0.0;
         self.retry = None;
         self.unshuffled = None;
-        self.quality_menu = None;
         self.eq_menu = None;
         self.page_menu = None;
         self.pending = None;
@@ -2807,6 +2802,14 @@ impl App {
     }
 
     /// У скачанного трека перед исполнителем значок: он играет и без интернета.
+    /// Свой загруженный трек: значок, как в оригинале, — слушать его можете только вы.
+    fn ugc_mark<'a>(&self, track: &Track, line: iced::widget::Row<'a, Message>) -> iced::widget::Row<'a, Message> {
+        if !track.ugc {
+            return line;
+        }
+        line.push(hint(container(ui::icon(ui::PRIVATE, 18.0, ui::c().muted)).padding(4), "Этот трек можете слушать только вы"))
+    }
+
     fn download_mark<'a>(&self, track: &Track, names: Element<'a, Message>) -> Element<'a, Message> {
         if !self.download_ids.contains(&track.id) {
             return names;
@@ -3573,7 +3576,6 @@ impl App {
             });
             self.menu_fade.step(elapsed);
             self.pin_fade.step(elapsed);
-            self.quality_fade.step(elapsed);
             self.eq_fade.step(elapsed);
             self.page_menu_fade.step(elapsed);
             self.dialog_fade.step(elapsed);
@@ -3723,7 +3725,6 @@ impl App {
     /// Открытые меню и окна: каждое появляется само и дорисовывает исчезновение после закрытия.
     fn sync_overlays(&mut self) {
         self.menu_fade.sync(self.menu.as_ref().map(|(track, x, y)| (track.clone(), *x, *y, self.menu_artists, self.menu_lists)));
-        self.quality_fade.sync(self.quality_menu);
         self.eq_fade.sync(self.eq_menu);
         self.pin_fade.sync(self.pin_menu);
         self.dialog_fade.sync(self.dialog.clone());
@@ -3906,7 +3907,7 @@ impl App {
                         Task::batch([wave, self.update(Message::DialogOpen(Dialog::WaveTune))])
                     }
                     Some(Preview::WaveSeeded) => self.wave_load(vec!["artist:3121".to_string()], Some(wave_label("artist:3121", "Metallica")), false),
-                    Some(Preview::Likes | Preview::LikesEnd | Preview::Menu | Preview::Panels | Preview::TrackInfo | Preview::QueueJump) => self.update(Message::Open(Section::Likes)),
+                    Some(Preview::Likes | Preview::LikesEnd | Preview::LikesAt(_) | Preview::Menu | Preview::Panels | Preview::TrackInfo | Preview::QueueJump) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
                     // Превращается в обычный запуск ещё в `new`.
                     Some(Preview::CollectionEarly) => Task::none(),
@@ -5068,6 +5069,10 @@ impl App {
                             self.current = Some(20).filter(|i| *i < self.queue.len());
                             return self.update(Message::QueueToggle);
                         }
+                        if let Some(Preview::LikesAt(y)) = self.preview {
+                            self.preview = None;
+                            return operation::snap_to(Id::new(LIST), scrollable::RelativeOffset { x: 0.0, y });
+                        }
                         if matches!(self.preview, Some(Preview::LikesEnd)) {
                             self.preview = None;
                             return operation::snap_to(Id::new(LIST), scrollable::RelativeOffset { x: 0.0, y: 1.0 });
@@ -5581,7 +5586,7 @@ impl App {
             }
             Message::MenuClose => {
                 // Esc сначала закрывает меню и окна, потом плеер на всё окно, потом текст песни и очередь.
-                if self.menu.is_none() && self.pin_menu.is_none() && self.quality_menu.is_none() && self.eq_menu.is_none() && self.page_menu.is_none() && self.dialog.is_none() {
+                if self.menu.is_none() && self.pin_menu.is_none() && self.eq_menu.is_none() && self.page_menu.is_none() && self.dialog.is_none() {
                     if !self.player_full {
                         match self.section {
                             Section::Lyrics => return self.handle(Message::LyricsToggle),
@@ -5593,7 +5598,6 @@ impl App {
                 }
                 self.menu = None;
                 self.pin_menu = None;
-                self.quality_menu = None;
                 self.eq_menu = None;
                 self.devices_menu = None;
                 self.page_menu = None;
@@ -5932,11 +5936,10 @@ impl App {
                     Err(e) => eprintln!("история не догрузилась: {e}"),
                 }
             }
-            Message::QualityOpen => self.quality_menu = Some(*CURSOR.lock().unwrap()),
             Message::QualitySet(quality) => {
                 let changed = quality != self.quality;
                 self.quality = quality;
-                self.quality_menu = None;
+                // Меню остаётся открытым: рядом эквалайзер, его часто крутят следом.
                 self.save_settings();
                 // Играющий трек сразу переходит на новое качество с того же места.
                 if let (true, true, Some(index)) = (changed, self.active, self.current) {
@@ -6778,7 +6781,7 @@ impl App {
         if let Some(clip) = self.view_clip() {
             layers = layers.push(clip);
         }
-        if self.menu.is_some() || self.quality_menu.is_some() || self.eq_menu.is_some() || self.page_menu.is_some() || self.pin_menu.is_some() || self.devices_menu.is_some() {
+        if self.menu.is_some() || self.eq_menu.is_some() || self.page_menu.is_some() || self.pin_menu.is_some() || self.devices_menu.is_some() {
             layers = layers.push(mouse_area(container(Space::new()).width(Length::Fill).height(Length::Fill)).on_press(Message::MenuClose).on_right_press(Message::MenuClose));
         }
         if let Some((track, x, y, artists, lists)) = &self.menu_fade.item {
@@ -6786,9 +6789,6 @@ impl App {
         }
         if let Some((index, x, y)) = self.pin_fade.item {
             layers = layers.push(self.view_pin_menu(index, x, y));
-        }
-        if let Some((x, y)) = self.quality_fade.item {
-            layers = layers.push(self.view_quality(x, y));
         }
         if let Some(devices) = self.devices_menu.and_then(|x| self.view_devices(x)) {
             layers = layers.push(devices);
@@ -7274,27 +7274,6 @@ impl App {
         popup(items.into(), x, y, MENU_WIDTH, count * MENU_ITEM, alpha, live)
     }
 
-    /// Выбор качества. Новое качество действует со следующего трека.
-    fn view_quality(&self, x: f32, y: f32) -> Element<'_, Message> {
-        let (alpha, live) = (self.quality_fade.shown(), self.quality_fade.live);
-        let mut items = column![container(text("Качество звука").font(ui::font_medium()).color(ui::c().text.scale_alpha(alpha))).padding([6, 10])];
-        for quality in Quality::ALL {
-            let mark: Element<'_, Message> = if quality == self.quality { ui::icon(ui::CHECK, 20.0, ui::c().accent.scale_alpha(alpha)) } else { Space::new().width(20).into() };
-            items = items.push(
-                glow(button(row![mark, text(quality.label()).color(ui::c().text.scale_alpha(alpha))].spacing(12).align_y(Alignment::Center))
-                    .width(Length::Fill)
-                    .height(MENU_ITEM)
-                    .padding([9, 10])
-                    .style(ui::menu_item)
-                    .on_press(Message::QualitySet(quality)), 6.0),
-            );
-        }
-        if let Some(sound) = &self.sound {
-            items = items.push(container(text(format!("Сейчас играет: {}", sound.label)).size(13).color(ui::c().muted.scale_alpha(alpha))).padding([6, 10]));
-        }
-        popup(items.into(), x, y, QUALITY_WIDTH, 5.0 * MENU_ITEM, alpha, live)
-    }
-
     /// Страница очереди: что играет сейчас и что будет дальше.
     fn view_queue(&self) -> Element<'_, Message> {
         let back = back_button();
@@ -7377,13 +7356,8 @@ impl App {
             artist_links(&track.artist_list, 16.0, ui::font(), names_color)
         };
         let names = self.download_mark(track, names);
-        let mut line = row![
-            cover,
-            column![track_title(track, 16.0, ui::font_medium(), title_color, false), names].width(Length::Fill).clip(true),
-            self.like_button(track, 20.0),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center);
+        let line = row![cover, column![track_title(track, 16.0, ui::font_medium(), title_color, false), names].width(Length::Fill).clip(true)].spacing(12).align_y(Alignment::Center);
+        let mut line = self.ugc_mark(track, line).push(self.like_button(track, 20.0));
         if self.main_width() >= TRACK_TIME_WIDTH {
             let time_color = if track.duration.is_zero() { iced::Color::TRANSPARENT } else { names_color };
             line = line.push(text(clock(track.duration)).color(time_color));
@@ -7402,12 +7376,29 @@ impl App {
         if current { row } else { self.drag_target(row, DragList::Queue, index) }
     }
 
-    /// Эквалайзер, открытый из трекбара: тот же, что в настройках, пресеты списком.
+    /// «Настройки звука» из трекбара, как в оригинале: качество с описаниями, а под ним
+    /// эквалайзер, который раскрывается, когда включён.
     fn view_eq_popup(&self, x: f32) -> Element<'_, Message> {
         let (alpha, live) = (self.eq_fade.shown(), self.eq_fade.live);
         let eq = self.eq;
+        let tint = |color: iced::Color| color.scale_alpha(alpha);
+        let mut body = column![container(text("Качество звука").size(16).font(ui::font_medium()).color(tint(ui::c().text))).padding([6, 8])].spacing(2);
+        for quality in Quality::ALL {
+            let chosen = quality == self.quality;
+            let mark: Element<'_, Message> = if chosen { ui::icon(ui::CHECK, 20.0, tint(ui::c().accent)) } else { Space::new().width(20).into() };
+            let words = column![text(quality.label()).font(ui::font_medium()).color(tint(ui::c().text)), text(quality.about()).size(13).color(tint(ui::c().muted))].spacing(2).width(Length::Fill);
+            body = body.push(glow(button(row![words, mark].spacing(12).align_y(Alignment::Center)).width(Length::Fill).padding([8, 8]).style(ui::button_faded(ui::row, alpha)).on_press(Message::QualitySet(quality)), 8.0));
+        }
+        if let Some(sound) = &self.sound {
+            body = body.push(container(text(format!("Сейчас играет: {}", sound.label)).size(13).color(tint(ui::c().muted))).padding([4, 8]));
+        }
+        let line = tint(ui::c().control);
+        body = body.push(container(container(Space::new()).width(Length::Fill).height(1).style(move |_| container::Style::default().background(line))).padding([8, 8]));
         let head = row![text("Эквалайзер").size(16).font(ui::font_medium()).color(ui::c().text.scale_alpha(alpha)).width(Length::Fill), view_switch(Some(eq.enabled))].align_y(Alignment::Center);
         let head = glow(button(head).width(Length::Fill).padding([6, 8]).style(ui::button_faded(ui::row, alpha)).on_press(Message::EqToggle), 8.0);
+        if !eq.enabled {
+            return popup_above(body.push(head).into(), x, self.bar_top_y() - 12.0, EQ_POPUP_WIDTH, alpha, live);
+        }
         let presets: Vec<Preset> = (0..equalizer::PRESETS.len()).map(Preset).collect();
         let select = pick_list(presets, Some(Preset(eq.preset)), |preset: Preset| Message::EqPreset(preset.0))
             .width(Length::Fill)
@@ -7415,8 +7406,8 @@ impl App {
             .text_size(14)
             .style(ui::select_faded(alpha))
             .menu_style(ui::select_menu);
-        let body = column![head, container(select).padding([0, 8]), self.eq_bands(EQ_POPUP_SLIDER, alpha)].spacing(12);
-        popup_above(body.into(), x, self.bar_top_y() - 12.0, EQ_POPUP_WIDTH, alpha, live)
+        let eq_part = column![head, container(select).padding([0, 8]), self.eq_bands(EQ_POPUP_SLIDER, alpha)].spacing(12);
+        popup_above(body.push(eq_part).into(), x, self.bar_top_y() - 12.0, EQ_POPUP_WIDTH, alpha, live)
     }
 
     /// Верхний край трекбара в окне: под ним отступ окна, в нём строка с названием (в узком
@@ -7450,8 +7441,8 @@ impl App {
             if let Some(devices) = self.devices_tool(size) {
                 tools = tools.push(devices);
             }
-            tools = tools.push(tool(ui::EQUALIZER, self.eq.enabled, Message::EqOpen, "Эквалайзер"));
-            tools = tools.push(tool(ui::TUNE, self.quality == Quality::Lossless, Message::QualityOpen, "Настройки звука"));
+            // Качество и эквалайзер — одна кнопка, как в оригинале.
+            tools = tools.push(tool(ui::TUNE, self.quality == Quality::Lossless || self.eq.enabled, Message::EqOpen, "Настройки звука"));
         }
         if quality && self.current_track().is_some_and(|track| track.remember) {
             let label = format!("{}×", speed_label(self.speed));
@@ -8898,13 +8889,8 @@ impl App {
         };
         let names = self.download_mark(track, names);
         let play = if track.unavailable { Message::Unavailable } else { play };
-        let mut line = row![
-            cover,
-            column![track_title(track, 16.0, ui::font_medium(), title_color, false), names].width(Length::Fill).clip(true),
-            self.like_button(track, 20.0),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center);
+        let line = row![cover, column![track_title(track, 16.0, ui::font_medium(), title_color, false), names].width(Length::Fill).clip(true)].spacing(12).align_y(Alignment::Center);
+        let mut line = self.ugc_mark(track, line).push(self.like_button(track, 20.0));
         // У недоступных треков Яндекс длительности не присылает: вместо «00:00» пустое место той же ширины.
         if self.main_width() >= TRACK_TIME_WIDTH {
             let time_color = if track.duration.is_zero() { iced::Color::TRANSPARENT } else { names_color };
@@ -10734,6 +10720,7 @@ fn main() -> iced::Result {
             "lyrics" => Preview::Lyrics,
             "likes" => Preview::Likes,
             "likes-end" => Preview::LikesEnd,
+            what if what.starts_with("likes-at:") => Preview::LikesAt(what["likes-at:".len()..].parse().unwrap_or(0.0)),
             "history-mid" => Preview::HistoryAt(0.5),
             "history-end" => Preview::HistoryAt(1.0),
             "panels" => Preview::Panels,

@@ -72,6 +72,15 @@ impl Quality {
         }
     }
 
+    /// Подпись под качеством, как в меню оригинала.
+    pub fn about(self) -> &'static str {
+        match self {
+            Quality::Low => "Стабильное звучание при медленном интернете",
+            Quality::Normal => "Сбалансированный звук для большинства устройств",
+            Quality::Lossless => "Музыка в lossless и других высококачественных форматах для быстрого интернета и хорошей акустики",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Quality::Low => "Экономичное",
