@@ -207,7 +207,12 @@ impl<S: Source> Stretched<S> {
                 // Скорость вернулась к 1 или тон больше не нужен: дотекает буфер, дальше
                 // снова напрямую или растяжением.
                 if speed == 1.0 || !pitch {
-                    self.mode = Mode::Drain { next: pos.ceil() as u64 };
+                    // Место может быть дальше прочитанного: сперва дочитываем до него.
+                    let next = pos.ceil() as u64;
+                    if !self.fill(next) {
+                        self.ended = true;
+                    }
+                    self.mode = Mode::Drain { next };
                     return true;
                 }
                 let mut pos = pos;
@@ -236,7 +241,7 @@ impl<S: Source> Stretched<S> {
             }
             Mode::Drain { next } => {
                 // Дотекает буфер, дальше снова напрямую.
-                let at = self.at(next.max(self.buf_start));
+                let at = self.at(next.max(self.buf_start)).min(self.mono.len());
                 self.out.extend_from_slice(&self.buf[at * self.channels..]);
                 self.tick(next as f64);
                 self.forget(u64::MAX);
@@ -428,6 +433,25 @@ mod tests {
         let left: Vec<f32> = out.chunks(2).map(|frame| frame[0]).collect();
         let crossings = left.windows(2).filter(|pair| (pair[0] < 0.0) != (pair[1] < 0.0)).count() as f32 / seconds;
         assert!((crossings - 800.0).abs() < 30.0, "{crossings}");
+    }
+
+    #[test]
+    fn pitch_back_to_normal_speed_midway() {
+        // Так было с правым кликом по кнопке скорости: тон включён, скорость сбрасывается в 1×.
+        for start in [2.0, 1.75, 0.5, 0.55] {
+            let speed = Speed::default();
+            speed.set(start);
+            speed.set_pitch(true);
+            let mut stretched = Stretched::new(tone(2.0), speed.clone(), Clock::default());
+            let mut count = 0;
+            for (n, _) in stretched.by_ref().enumerate() {
+                count += 1;
+                if n == 6001 {
+                    speed.set(1.0);
+                }
+            }
+            assert!(count > 6001, "{start}");
+        }
     }
 
     #[test]

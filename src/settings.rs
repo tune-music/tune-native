@@ -164,12 +164,15 @@ pub const LYRICS_SIZES: [u8; 4] = [20, 26, 32, 38];
 
 /// Шаги кнопки скорости на выбор, как у Tune Client.
 pub const SPEED_STEPS: [f32; 3] = [0.05, 0.1, 0.25];
+pub const SPEED_STEP_MIN: f32 = 0.01;
+pub const SPEED_STEP_MAX: f32 = 0.5;
 /// Пределы скорости с кнопкой для любых треков.
 pub const SPEED_MIN: f32 = 0.5;
 pub const SPEED_MAX: f32 = 2.0;
 
-/// Шаги громкости на выбор, в процентах.
+/// Шаги громкости на выбор, в процентах; свой — от 1 до `VOLUME_STEP_MAX`.
 pub const VOLUME_STEPS: [u8; 4] = [1, 2, 5, 10];
+pub const VOLUME_STEP_MAX: u8 = 25;
 
 /// Окно и запуск — как во вкладке «Окно» у Tune Client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,13 +183,15 @@ pub struct WindowPrefs {
     pub start_minimized: bool,
     /// Крестик прячет окно в трей, музыка играет дальше.
     pub close_to_tray: bool,
-    /// «Исполнитель — трек» в заголовке окна: видно на панели задач и в Alt+Tab.
+    /// «Исполнитель — трек» в заголовке окна.
     pub track_title: bool,
+    /// «Исполнитель — трек» на панели задач и в Alt+Tab.
+    pub track_taskbar: bool,
 }
 
 impl Default for WindowPrefs {
     fn default() -> Self {
-        Self { autostart: false, start_minimized: false, close_to_tray: true, track_title: false }
+        Self { autostart: false, start_minimized: false, close_to_tray: true, track_title: false, track_taskbar: false }
     }
 }
 
@@ -219,7 +224,7 @@ fn parse(v: &Value) -> Settings {
         keep_track: v["keepTrack"].as_bool().unwrap_or(true),
         volume_wheel: v["volumeWheel"].as_bool().unwrap_or(true),
         speed_control: v["speedControl"].as_bool().unwrap_or(false),
-        speed_step: v["speedStep"].as_f64().map(|x| x as f32).filter(|x| SPEED_STEPS.contains(x)).unwrap_or(0.25),
+        speed_step: v["speedStep"].as_f64().map(|x| ((x * 100.0).round() / 100.0) as f32).filter(|x| (SPEED_STEP_MIN..=SPEED_STEP_MAX).contains(x)).unwrap_or(0.25),
         pitch: v["pitchWithSpeed"].as_bool().unwrap_or(false),
         reverb: v["reverb"].as_u64().map_or(0, |x| x.min(100) as u8),
         lyrics: {
@@ -234,7 +239,7 @@ fn parse(v: &Value) -> Settings {
             }
         },
         lyrics_size: v["lyricsSize"].as_u64().map(|x| x as u8).filter(|x| LYRICS_SIZES.contains(x)).unwrap_or(26),
-        volume_step: v["volumeStep"].as_u64().map(|step| step as u8).filter(|step| VOLUME_STEPS.contains(step)).unwrap_or(5),
+        volume_step: v["volumeStep"].as_u64().map(|step| step as u8).filter(|step| (1..=VOLUME_STEP_MAX).contains(step)).unwrap_or(5),
         window: {
             let base = WindowPrefs::default();
             let w = &v["window"];
@@ -245,6 +250,7 @@ fn parse(v: &Value) -> Settings {
                 // Ключ новый: прежний «trackTitle» был включён по умолчанию, а у Tune Client трека в
                 // заголовке нет — старое значение не переносится.
                 track_title: w["trackInTitle"].as_bool().unwrap_or(base.track_title),
+                track_taskbar: w["trackInTaskbar"].as_bool().unwrap_or(base.track_taskbar),
             }
         },
     }
@@ -278,7 +284,7 @@ pub fn save(settings: Settings) {
     let l = settings.lyrics;
     let lyrics = json!({ "enabled": l.enabled, "always": l.always, "lrclib": l.lrclib, "netease": l.netease, "neteaseFirst": l.netease_first });
     let w = settings.window;
-    let window = json!({ "autostart": w.autostart, "startMinimized": w.start_minimized, "closeToTray": w.close_to_tray, "trackInTitle": w.track_title });
+    let window = json!({ "autostart": w.autostart, "startMinimized": w.start_minimized, "closeToTray": w.close_to_tray, "trackInTitle": w.track_title, "trackInTaskbar": w.track_taskbar });
     let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "books": settings.books, "concerts": settings.concerts, "words": settings.words, "wheel": settings.wheel, "speed": settings.speed, "theme": settings.look.code(), "keepTrack": settings.keep_track, "window": window, "volumeWheel": settings.volume_wheel, "volumeStep": settings.volume_step, "speedControl": settings.speed_control, "speedStep": settings.speed_step, "pitchWithSpeed": settings.pitch, "reverb": settings.reverb, "lyrics": lyrics, "lyricsSize": settings.lyrics_size });
     let dir = api::data_dir();
     if fs::create_dir_all(&dir).is_ok() {
@@ -300,13 +306,14 @@ mod tests {
         assert!(!parse(&json!({ "kids": false })).kids);
         assert!(!parse(&json!({ "books": false })).books && !parse(&json!({ "concerts": false })).concerts);
         assert!(!parse(&json!({ "keepTrack": false })).keep_track);
-        assert_eq!((parse(&json!({ "volumeStep": 2 })).volume_step, parse(&json!({ "volumeStep": 7 })).volume_step), (2, 5));
+        assert_eq!((parse(&json!({ "volumeStep": 2 })).volume_step, parse(&json!({ "volumeStep": 7 })).volume_step, parse(&json!({ "volumeStep": 40 })).volume_step), (2, 7, 5));
         let window = parse(&json!({ "window": { "autostart": true, "closeToTray": false } })).window;
-        assert_eq!(window, WindowPrefs { autostart: true, start_minimized: false, close_to_tray: false, track_title: false });
+        assert_eq!(window, WindowPrefs { autostart: true, start_minimized: false, close_to_tray: false, track_title: false, track_taskbar: false });
         assert!(!parse(&json!({ "words": false })).words);
         assert_eq!((parse(&json!({ "theme": "system" })).look, parse(&json!({ "theme": "pink" })).look), (Look::System, Look::Dark));
         assert_eq!((parse(&json!({ "speed": 1.5 })).speed, parse(&json!({ "speed": 7 })).speed, parse(&json!({ "speed": 0.75 })).speed), (1.5, 1.0, 0.75));
         assert_eq!((parse(&json!({ "reverb": 250 })).reverb, parse(&json!({ "speedStep": 0.1 })).speed_step, parse(&json!({ "speedStep": 3 })).speed_step), (100, 0.1, 0.25));
+        assert_eq!(parse(&json!({ "speedStep": 0.05000000074505806 })).speed_step, 0.05);
         let eq = parse(&json!({ "equalizer": { "enabled": true, "preset": 14, "preamp": 9, "gains": [40, -3.5] } })).eq;
         assert_eq!((eq.enabled, eq.preset, eq.preamp, eq.gains[0], eq.gains[1], eq.gains[2]), (true, 14, 1.5, 12.0, -3.5, 0.0));
         assert_eq!(parse(&json!({ "volume": 7 })).volume, 1.0);

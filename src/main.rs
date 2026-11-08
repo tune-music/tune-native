@@ -102,6 +102,12 @@ const COVER_FADE: f32 = 0.25;
 const MENU_WIDTH: f32 = 270.0;
 const MENU_ITEM: f32 = 40.0;
 const NOTICE_TIME: Duration = Duration::from_secs(4);
+/// Сколько видно уведомление о громкости или скорости.
+const QUICK_NOTICE_TIME: Duration = Duration::from_millis(1200);
+/// Сколько пикселей прокрутки тачпадом считаются одним щелчком колеса.
+const WHEEL_PIXELS: f32 = 50.0;
+/// Сколько текст песни ждёт после прокрутки руками, прежде чем вернуться к звучащей строке.
+const LYRICS_HOLD: Duration = Duration::from_secs(5);
 /// Через сколько после наведения появляется подсказка у кнопки.
 const HINT_DELAY: Duration = Duration::from_millis(600);
 /// Сколько держится уведомление об удалении с кнопкой отмены.
@@ -1060,6 +1066,20 @@ struct App {
     lyrics_size: u8,
     /// Текст песни закрывается: насколько ушёл вниз и растаял, потом — «назад».
     lyrics_closing: Option<f32>,
+    /// Текст прокрутили руками: до этого времени он не возвращается к звучащей строке.
+    lyrics_hold: Option<Instant>,
+    /// Куда текст прокрутил сам Tune: отличить свою прокрутку от прокрутки руками.
+    lyrics_set: f32,
+    /// Колесо над плеером и кнопкой скорости: накопленные доли щелчка (тачпад шлёт мелко).
+    wheel_rest: f32,
+    /// Свои значения в полях настроек, пока их вводят.
+    volume_step_text: String,
+    speed_step_text: String,
+    speed_text: String,
+    /// Уведомление о громкости или скорости: при смене числа оно не мигает.
+    notice_quick: bool,
+    /// Скрыт ли сейчас текст в заголовке окна.
+    caption_hidden: bool,
     discord: Option<discord::Handle>,
     discord_sent: Option<(String, bool, Instant, f64)>,
     /// Открытая вкладка настроек.
@@ -1416,9 +1436,14 @@ enum Message {
     ReverbSet(u8),
     LyricsSourcesSet(lyrics::Sources),
     LyricsSizeSet(u8),
-    /// Кнопка скорости: шаг вверх или вниз (Shift, колесо), 0 — обычная скорость.
+    /// Кнопка скорости: шаг вверх или вниз (колесо), 0 — обычная скорость.
     SpeedStep(i8),
+    /// Колесо над кнопкой скорости: на сколько щелчков.
+    SpeedWheel(f32),
     VolumeStepSet(u8),
+    VolumeStepText(String),
+    SpeedStepText(String),
+    SpeedText(String),
     /// Колесо мыши над плеером: на сколько щелчков.
     VolumeWheel(f32),
     SettingsTabSet(SettingsTab),
@@ -1775,6 +1800,14 @@ impl App {
             lyrics_sources: saved.lyrics,
             lyrics_size: saved.lyrics_size,
             lyrics_closing: None,
+            lyrics_hold: None,
+            lyrics_set: 0.0,
+            wheel_rest: 0.0,
+            volume_step_text: saved.volume_step.to_string(),
+            speed_step_text: speed_label(saved.speed_step),
+            speed_text: speed_label(saved.speed),
+            notice_quick: false,
+            caption_hidden: false,
             discord: None,
             discord_sent: None,
             settings_tab: SettingsTab::Main,
@@ -1915,7 +1948,7 @@ impl App {
 
     /// Анимации интерфейса: им нужен каждый кадр монитора.
     fn ui_animating(&self) -> bool {
-        self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.eq_fade.busy() || self.devices_fade.busy() || self.chips_shown < 1.0 || self.lyrics_closing.is_some() || self.lyrics_dots() || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy() || self.wheel_turn != self.wheel_target || self.wheel_reveal != if self.wheel_open { 1.0 } else { 0.0 }
+        self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.eq_fade.busy() || self.devices_fade.busy() || self.chips_shown < 1.0 || self.lyrics_closing.is_some() || self.lyrics_dots() || (self.section == Section::Lyrics && self.lyrics_hold.is_some()) || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy() || self.wheel_turn != self.wheel_target || self.wheel_reveal != if self.wheel_open { 1.0 } else { 0.0 }
             || (self.wheel_ready() && self.wheel_arrow < 1.0)
             || self.word_now() != self.word_for
             || (self.word_for.is_some() && self.word_level < 1.0)
@@ -2057,6 +2090,44 @@ impl App {
     }
 
     /// Ускоряются только выпуски и книги: музыка всегда звучит как есть.
+    /// Шаг скорости, как у Tune Client: по ровной сетке шага; клик по кнопке — по кругу
+    /// (после 2× снова 0,5×), колесо упирается в края. 0 — обычная скорость.
+    fn speed_by(&mut self, direction: i8, wrap: bool) -> Task<Message> {
+        let (speed, step) = (f64::from(self.speed), f64::from(self.speed_step));
+        let (min, max) = (f64::from(settings::SPEED_MIN), f64::from(settings::SPEED_MAX));
+        let next = match direction {
+            0 => 1.0,
+            up if up > 0 => {
+                let next = (speed / step + 1e-6).floor() * step + step;
+                if wrap && next > max + 1e-6 { min } else { next }
+            }
+            _ => (speed / step - 1e-6).ceil() * step - step,
+        };
+        self.speed = ((next.clamp(min, max) * 100.0).round() / 100.0) as f32;
+        self.speed_text = speed_label(self.speed);
+        self.apply_speed();
+        self.save_settings();
+        self.notify_quick(format!("Скорость {}×", speed_label(self.speed)))
+    }
+
+    /// Колесо мыши: целые щелчки. Тачпад присылает прокрутку мелкими долями — они копятся,
+    /// и шаг делается, когда набрался щелчок; смена направления начинает счёт заново.
+    fn wheel_steps(&mut self, notches: f32) -> Option<f32> {
+        if notches == 0.0 {
+            return None;
+        }
+        if self.wheel_rest.signum() != notches.signum() {
+            self.wheel_rest = 0.0;
+        }
+        self.wheel_rest += notches;
+        if self.wheel_rest.abs() < 1.0 {
+            return None;
+        }
+        let steps = self.wheel_rest.trunc();
+        self.wheel_rest -= steps;
+        Some(steps.signum())
+    }
+
     /// С какой скоростью играет трек: книги и подкасты — всегда со своей, музыка — только с
     /// включённой кнопкой скорости, как у Tune Client.
     fn speed_for(&self, track: &Track) -> f32 {
@@ -3608,12 +3679,22 @@ impl App {
 
     /// Показывает уведомление и убирает его через несколько секунд.
     fn notify(&mut self, text: String) -> Task<Message> {
+        self.notice_quick = false;
         let id = self.notice.as_ref().map_or(1, |(id, _, _)| id + 1);
         self.notice = Some((id, text, false));
         Task::perform(
             background(|| std::thread::sleep(NOTICE_TIME)),
             move |()| Message::NoticeClear(id),
         )
+    }
+
+    /// Короткое уведомление о громкости или скорости, как у Tune Client: новое число
+    /// встаёт на место прежнего, не мигая.
+    fn notify_quick(&mut self, text: String) -> Task<Message> {
+        let id = self.notice.as_ref().map_or(1, |(id, _, _)| id + 1);
+        self.notice = Some((id, text, false));
+        self.notice_quick = true;
+        Task::perform(background(|| std::thread::sleep(QUICK_NOTICE_TIME)), move |()| Message::NoticeClear(id))
     }
 
     fn chips_place(&self) -> Option<String> {
@@ -3857,13 +3938,25 @@ impl App {
                 self.full_tint = if same_color(self.full_tint, target) { target } else { iced::Color::from_rgb(mix(self.full_tint.r, target.r), mix(self.full_tint.g, target.g), mix(self.full_tint.b, target.b)) };
             }
             self.notice_fade.step(elapsed);
-            let lyrics = if self.section == Section::Lyrics && (self.lyrics_shown != self.lyrics_target || self.lyrics_back < 1.0 || self.page_veil > 0.0) {
+            if self.lyrics_hold.is_some_and(|until| Instant::now() >= until) {
+                self.lyrics_release();
+            }
+            let held = self.lyrics_hold.is_some();
+            if self.section == Section::Lyrics && held {
+                // Пока текст листают руками, строка всё равно подсвечивается, но он не едет.
+                self.lyrics_shown += (self.lyrics_target - self.lyrics_shown) * (elapsed * LYRICS_SPEED).min(1.0);
+                if (self.lyrics_target - self.lyrics_shown).abs() < 0.002 {
+                    self.lyrics_shown = self.lyrics_target;
+                }
+            }
+            let lyrics = if self.section == Section::Lyrics && !held && (self.lyrics_shown != self.lyrics_target || self.lyrics_back < 1.0 || self.page_veil > 0.0) {
                 self.lyrics_shown += (self.lyrics_target - self.lyrics_shown) * (elapsed * LYRICS_SPEED).min(1.0);
                 if (self.lyrics_target - self.lyrics_shown).abs() < 0.002 {
                     self.lyrics_shown = self.lyrics_target;
                 }
                 self.lyrics_back = (self.lyrics_back + elapsed / LYRICS_RETURN).min(1.0);
                 let y = (self.lyrics_place() + self.lyrics_gap * (1.0 - smooth_step(self.lyrics_back))).clamp(0.0, 1.0);
+                self.lyrics_set = y;
                 operation::snap_to(Id::new(LIST), scrollable::RelativeOffset { x: 0.0, y })
             } else {
                 Task::none()
@@ -3984,6 +4077,12 @@ impl App {
             media.sync(track.as_ref(), playing, position);
         }
         tray::sync(self.is_playing(), ui::is_light());
+        // Трек нужен на панели задач, но не в заголовке: текст заголовка прячется, значок остаётся.
+        let hide = self.window_prefs.track_taskbar && !self.window_prefs.track_title;
+        if let Some(hwnd) = self.hwnd.filter(|_| hide != self.caption_hidden) {
+            caption_text(hwnd, !hide);
+            self.caption_hidden = hide;
+        }
         self.discord_sync(track.as_ref(), playing, position);
         Task::batch([task, snap, more, covers, lyrics])
     }
@@ -3996,7 +4095,11 @@ impl App {
         self.pin_fade.sync(self.pin_menu);
         self.dialog_fade.sync(self.dialog.clone());
         self.full_fade.sync(self.player_full.then_some(()));
-        self.notice_fade.sync(self.notice.as_ref().map(|(_, text, undo)| (text.clone(), *undo)));
+        let notice = self.notice.as_ref().map(|(_, text, undo)| (text.clone(), *undo));
+        if self.notice_quick && self.notice_fade.live && self.notice_fade.item.is_some() {
+            self.notice_fade.item.clone_from(&notice);
+        }
+        self.notice_fade.sync(notice);
         self.page_menu_fade.sync(self.page_menu);
         let track = self.current_track().map(|track| track.id.clone());
         if track != self.shown_track {
@@ -5098,6 +5201,10 @@ impl App {
             Message::LyricsScrolled(offset, place) => {
                 self.list_offset = offset;
                 self.lyrics_view = place;
+                // Прокрутили руками: текст стоит, пока его листают, и ещё немного после.
+                if self.section == Section::Lyrics && (place - self.lyrics_set).abs() > 0.002 && self.page_veil == 0.0 {
+                    self.lyrics_hold = Some(Instant::now() + LYRICS_HOLD);
+                }
             }
             Message::Retry => {
                 if let Some(message) = self.retry.take() {
@@ -5402,6 +5509,7 @@ impl App {
                 };
             }
             Message::LyricsSeek(time) => {
+                self.lyrics_release();
                 self.seeking = Some(time);
                 return self.update(Message::SeekDone);
             }
@@ -6615,7 +6723,7 @@ impl App {
             }
             Message::SpeedNext => {
                 if self.speed_control {
-                    return self.handle(Message::SpeedStep(1));
+                    return self.speed_by(1, true);
                 }
                 let at = settings::SPEEDS.iter().position(|&speed| speed == self.speed).unwrap_or(0);
                 self.speed = settings::SPEEDS[(at + 1) % settings::SPEEDS.len()];
@@ -6623,19 +6731,11 @@ impl App {
                 self.save_settings();
             }
             // Как у Tune Client: шаг вверх по кругу от 0,5× до 2×, вниз — до 0,5×, 0 — обычная.
-            Message::SpeedStep(direction) => {
-                let step = self.speed_step;
-                let next = match direction {
-                    0 => 1.0,
-                    up if up > 0 => {
-                        let next = (self.speed / step + 1e-4).floor() * step + step;
-                        if next > settings::SPEED_MAX + 1e-4 { settings::SPEED_MIN } else { next }
-                    }
-                    _ => (self.speed / step - 1e-4).ceil() * step - step,
-                };
-                self.speed = ((next.clamp(settings::SPEED_MIN, settings::SPEED_MAX) * 100.0).round()) / 100.0;
-                self.apply_speed();
-                self.save_settings();
+            Message::SpeedStep(direction) => return self.speed_by(direction, false),
+            Message::SpeedWheel(notches) => {
+                if let Some(steps) = self.wheel_steps(notches) {
+                    return self.speed_by(steps as i8, false);
+                }
             }
             Message::SpeedControlToggle => {
                 self.speed_control = !self.speed_control;
@@ -6648,6 +6748,7 @@ impl App {
             }
             Message::SpeedStepSet(index) => {
                 self.speed_step = settings::SPEED_STEPS[usize::from(index).min(settings::SPEED_STEPS.len() - 1)];
+                self.speed_step_text = speed_label(self.speed_step);
                 self.save_settings();
             }
             Message::PitchToggle => {
@@ -6986,13 +7087,17 @@ impl App {
                 return self.update(Message::SeekDone);
             }
             // Шагов, а не долей: размер шага — в настройках.
+            // Громкость встаёт на ровную сетку шага: с 26 % шагом 5 — на 30 %, а не на 31 %.
             Message::VolumeBy(steps) => {
-                let volume = (self.volume + steps * f32::from(self.volume_step) / 100.0).clamp(0.0, 1.0);
-                return self.handle(Message::Volume((volume * 100.0).round() / 100.0));
+                let (now, step) = ((self.volume * 100.0).round() as i32, i32::from(self.volume_step));
+                let next = if steps > 0.0 { now.div_euclid(step) * step + step } else { (now + step - 1).div_euclid(step) * step - step };
+                let volume = next.clamp(0, 100);
+                let task = self.handle(Message::Volume(volume as f32 / 100.0));
+                return Task::batch([task, self.notify_quick(format!("Громкость {volume} %"))]);
             }
-            Message::VolumeWheel(steps) => {
-                if self.volume_wheel && steps != 0.0 {
-                    return self.handle(Message::VolumeBy(steps.signum()));
+            Message::VolumeWheel(notches) => {
+                if let Some(steps) = self.wheel_steps(notches).filter(|_| self.volume_wheel) {
+                    return self.handle(Message::VolumeBy(steps));
                 }
             }
             Message::VolumeWheelToggle => {
@@ -7001,7 +7106,30 @@ impl App {
             }
             Message::VolumeStepSet(step) => {
                 self.volume_step = step;
+                self.volume_step_text = step.to_string();
                 self.save_settings();
+            }
+            Message::VolumeStepText(value) => {
+                if let Some(step) = value.trim().trim_end_matches('%').trim().parse::<u8>().ok().filter(|step| (1..=settings::VOLUME_STEP_MAX).contains(step)) {
+                    self.volume_step = step;
+                    self.save_settings();
+                }
+                self.volume_step_text = value;
+            }
+            Message::SpeedStepText(value) => {
+                if let Some(step) = parse_number(&value).filter(|step| (settings::SPEED_STEP_MIN..=settings::SPEED_STEP_MAX).contains(step)) {
+                    self.speed_step = (step * 100.0).round() / 100.0;
+                    self.save_settings();
+                }
+                self.speed_step_text = value;
+            }
+            Message::SpeedText(value) => {
+                if let Some(speed) = parse_number(&value).filter(|speed| (settings::SPEED_MIN..=settings::SPEED_MAX).contains(speed)) {
+                    self.speed = (speed * 100.0).round() / 100.0;
+                    self.apply_speed();
+                    self.save_settings();
+                }
+                self.speed_text = value;
             }
             Message::LikeCurrent => {
                 if let Some(track) = self.current_track().cloned() {
@@ -7514,8 +7642,9 @@ impl App {
                     let focus = (1.0 - distance).clamp(0.0, 1.0);
                     let dim = (LYRICS_DIM_NEAR - LYRICS_DIM_STEP * (distance - 1.0).max(0.0)).max(LYRICS_DIM_FAR);
                     let color = ui::c().strong.scale_alpha(dim + (1.0 - dim) * focus);
-                    let line = hover_line(container(line).width(Length::Fill).padding([2, 24]), color, ui::c().strong.scale_alpha(color.a.max(LYRICS_HOVER)), Message::LyricsSeek(*time));
-                    reveal(line).scale(1.0 + LYRICS_GROW * focus, 0.5, 0.5).into()
+                    // Подсветка и клик — только по самой строке, а не по пустому месту рядом.
+                    let line = hover_line(container(line.width(Length::Shrink)).padding([2, 4]), color, ui::c().strong.scale_alpha(color.a.max(LYRICS_HOVER)), Message::LyricsSeek(*time));
+                    container(reveal(line).scale(1.0 + LYRICS_GROW * focus, 0.5, 0.5)).width(Length::Fill).center_x(Length::Fill).padding([0, 20]).into()
                 }
                 None => container(line.color(ui::c().text)).padding([0, 24]).into(),
             };
@@ -7530,6 +7659,14 @@ impl App {
         lines = lines.push(Space::new().height(if lyrics.synced() { room } else { 0.0 }));
         let hidden = scrollable::Direction::Vertical(scrollable::Scrollbar::new().width(0).scroller_width(0));
         column![header, ui::scroll(lines).id(LIST).direction(hidden).on_scroll(|viewport| Message::LyricsScrolled(viewport.absolute_offset().y, viewport.relative_offset().y)).height(Length::Fill)].spacing(16).height(Length::Fill).into()
+    }
+
+    /// Конец паузы после прокрутки руками: текст плавно едет к звучащей строке.
+    fn lyrics_release(&mut self) {
+        if self.lyrics_hold.take().is_some() {
+            self.lyrics_gap = self.lyrics_view - self.lyrics_place();
+            self.lyrics_back = 0.0;
+        }
     }
 
     /// Можно ли открыть текст: он есть у Яндекса или его поищут в LRCLIB и NetEase.
@@ -7547,7 +7684,8 @@ impl App {
     /// Три точки паузы, как у Tune Client: у звучащей они по очереди подпрыгивают и светлеют.
     fn lyrics_gap_dots(&self, now: bool, size: f32) -> Element<'_, Message> {
         let dot = (size * 0.45).round();
-        let seconds = self.position.as_secs_f32();
+        // По часам, а не по месту в треке: оно обновляется редко, и точки дёргались бы.
+        let seconds = clock_seconds();
         (0..3)
             .fold(row![].spacing(dot * 0.8).align_y(Alignment::Center), |dots, index| {
                 // Полпериода — 0,6 с, у каждой следующей точки задержка 0,2 с.
@@ -7611,8 +7749,10 @@ impl App {
             self.lyrics_target = line.map_or(-1.0, |index| index as f32);
             self.lyrics_line = line;
             // Текст могли прокрутить: возвращаемся к строке от того места, где он стоит.
-            self.lyrics_gap = self.lyrics_view - self.lyrics_place();
-            self.lyrics_back = 0.0;
+            if self.lyrics_hold.is_none() {
+                self.lyrics_gap = self.lyrics_view - self.lyrics_place();
+                self.lyrics_back = 0.0;
+            }
         }
         if self.lyrics_fresh {
             self.lyrics_shown = self.lyrics_target;
@@ -7877,7 +8017,29 @@ impl App {
     }
 
     /// Качество и очередь: кнопки рядом с громкостью.
-    fn view_tools<'a>(&self, size: f32, quality: bool) -> Element<'a, Message> {
+    /// Кнопка скорости: у книг и подкастов всегда, у музыки — с кнопкой скорости в настройках.
+    fn speed_tool<'a>(&self, size: f32) -> Option<Element<'a, Message>> {
+        if !self.current_track().is_some_and(|track| track.remember || self.speed_control) {
+            return None;
+        }
+        let label = format!("{}×", speed_label(self.speed));
+        let face = container(text(label).size(14).font(ui::font_medium()).color(if self.speed == 1.0 { ui::c().muted } else { ui::c().accent }).wrapping(Wrapping::None)).center_y(size).width(SPEED_TOOL - 8.0).align_x(Alignment::Center);
+        let button = glow(button(face).padding(4).style(ui::ghost).on_press(Message::SpeedNext), 20.0);
+        if !self.speed_control {
+            return Some(hint(button, "Скорость"));
+        }
+        // Как у Tune Client: колесо — по шагу, правый клик — обычная скорость.
+        let control = mouse_area(button).on_right_press(Message::SpeedStep(0)).on_scroll(|delta| {
+            let y = match delta {
+                mouse::ScrollDelta::Lines { y, .. } => y,
+                mouse::ScrollDelta::Pixels { y, .. } => y / WHEEL_PIXELS,
+            };
+            Message::SpeedWheel(y)
+        });
+        Some(hint(control, "Скорость: клик — быстрее, колесо — по шагу, правый клик — 1×"))
+    }
+
+    fn view_tools<'a>(&self, size: f32, quality: bool, in_bar: bool) -> Element<'a, Message> {
         let tool = |icon, on: bool, message, label| hint(glow(button(ui::icon(icon, size, if on { ui::c().accent } else { ui::c().muted })).padding(4).style(ui::ghost).on_press(message), 20.0), label);
         let mut tools = row![].spacing(6).align_y(Alignment::Center);
         if quality {
@@ -7887,21 +8049,9 @@ impl App {
             // Качество и эквалайзер — одна кнопка, как в оригинале.
             tools = tools.push(tool(ui::TUNE, self.quality == Quality::Lossless || self.eq.enabled, Message::EqOpen, "Настройки звука"));
         }
-        if quality && self.current_track().is_some_and(|track| track.remember || self.speed_control) {
-            let label = format!("{}×", speed_label(self.speed));
-            let face = container(text(label).size(14).font(ui::font_medium()).color(if self.speed == 1.0 { ui::c().muted } else { ui::c().accent })).center_y(size).width(SPEED_TOOL - 8.0).align_x(Alignment::Center);
-            let button = glow(button(face).padding(4).style(ui::ghost).on_press(Message::SpeedNext), 20.0);
-            if self.speed_control {
-                // Как у Tune Client: колесо — по шагу, правый клик — обычная скорость.
-                let control = mouse_area(button).on_right_press(Message::SpeedStep(0)).on_scroll(|delta| {
-                    let y = match delta {
-                        mouse::ScrollDelta::Lines { y, .. } | mouse::ScrollDelta::Pixels { y, .. } => y,
-                    };
-                    Message::SpeedStep(if y > 0.0 { 1 } else if y < 0.0 { -1 } else { 0 })
-                });
-                tools = tools.push(hint(control, "Скорость: клик — быстрее, колесо — по шагу, правый клик — 1×"));
-            } else {
-                tools = tools.push(hint(button, "Скорость"));
+        if quality && !in_bar {
+            if let Some(speed) = self.speed_tool(size) {
+                tools = tools.push(speed);
             }
         }
         if self.current_track().is_some_and(|track| self.has_lyrics(track)) {
@@ -7936,7 +8086,8 @@ impl App {
 
     /// Заголовок окна: «Исполнитель — трек», как у Tune Client, или просто «Tune».
     fn title(&self) -> String {
-        match self.current_track().filter(|_| self.window_prefs.track_title) {
+        let prefs = self.window_prefs;
+        match self.current_track().filter(|_| prefs.track_title || prefs.track_taskbar) {
             Some(track) if !track.title.is_empty() && track.artists.is_empty() => track.title.clone(),
             Some(track) if !track.title.is_empty() => format!("{} — {}", track.artists, track.title),
             _ => "Tune".to_string(),
@@ -8178,7 +8329,7 @@ impl App {
         let collapse = hint(glow(button(ui::icon(ui::COLLAPSE, 32.0, ui::c().text)).padding(6).style(ui::ghost).on_press(Message::FullToggle), 20.0), "Свернуть");
         let label = text(clipped(&source, WAVE_LABEL)).size(16).font(ui::font_medium()).color(ui::c().muted).wrapping(Wrapping::None);
         let head = row![collapse, container(label).center_x(Length::Fill), Space::new().width(44)].align_y(Alignment::Center);
-        let tools = row![Space::new().width(Length::Fill), self.view_tools(22.0, true), self.view_volume(22.0, Some(120.0))].spacing(10).align_y(Alignment::Center);
+        let tools = row![Space::new().width(Length::Fill), self.view_tools(22.0, true, false), self.view_volume(22.0, Some(120.0))].spacing(10).align_y(Alignment::Center);
         let page = column![head, container(self.player_body(track, art, line, top)).center(Length::Fill), tools].padding(24).width(Length::Fill).height(Length::Fill);
         let back = move |_: &iced::Theme| container::Style {
             background: Some(iced::Background::Gradient(iced::Gradient::Linear(iced::gradient::Linear::new(iced::Radians(std::f32::consts::PI)).add_stop(0.0, top).add_stop(0.35, shade(FULL_TINT * 0.72)).add_stop(0.7, shade(FULL_TINT * 0.42)).add_stop(1.0, shade(FULL_TINT * 0.22))))),
@@ -8342,7 +8493,10 @@ impl App {
                         toggle("Запускать свёрнутым", "Окно не появится при обычном запуске — откройте его из трея", Some(prefs.start_minimized), set(|p| p.start_minimized = !p.start_minimized)),
                         toggle("Сворачивать в трей при закрытии", "Музыка продолжит играть. Выйти совсем — из меню значка в трее", Some(prefs.close_to_tray), set(|p| p.close_to_tray = !p.close_to_tray)),
                     ]),
-                    group("Вид", vec![toggle("Трек в заголовке окна", "Вместо «Tune» — «Исполнитель — трек»: видно на панели задач и в Alt+Tab", Some(prefs.track_title), set(|p| p.track_title = !p.track_title))]),
+                    group("Вид", vec![
+                        toggle("Трек в заголовке окна", "Вместо «Tune» в верхней полосе окна — «Исполнитель — трек». Windows берёт этот текст и для панели задач, поэтому там трек тоже будет", Some(prefs.track_title), set(|p| p.track_title = !p.track_title)),
+                        toggle("Трек на панели задач и в Alt+Tab", "«Исполнитель — трек» на кнопке окна и в переключении окон. Без первого пункта в верхней полосе окна остаётся только значок", Some(prefs.track_taskbar || prefs.track_title), (!prefs.track_title).then(|| Message::WindowPrefSet(settings::WindowPrefs { track_taskbar: !prefs.track_taskbar, ..prefs }))),
+                    ]),
                 ]
                 .spacing(28)
                 .into()
@@ -8352,6 +8506,8 @@ impl App {
                 let steps = settings::VOLUME_STEPS.into_iter().fold(row![].spacing(8), |line, step| {
                     line.push(shine(button(text(format!("{step} %")).size(14)).padding([7, 16]).style(ui::chip(step == self.volume_step)).on_press(Message::VolumeStepSet(step)), 18.0))
                 });
+                // Свой шаг — числом, от 1 до 25 %.
+                let steps = steps.push(number_field("свой, %", &self.volume_step_text, Message::VolumeStepText)).wrap().vertical_spacing(8);
                 let sources = self.lyrics_sources;
                 let set = |change: fn(&mut lyrics::Sources)| {
                     let mut next = sources;
@@ -8386,6 +8542,7 @@ impl App {
                         let steps = settings::SPEED_STEPS.iter().enumerate().fold(row![].spacing(8), |line, (index, step)| {
                             line.push(shine(button(text(format!("{}×", speed_label(*step))).size(14)).padding([7, 16]).style(ui::chip(*step == self.speed_step)).on_press(Message::SpeedStepSet(index as u8)), 18.0))
                         });
+                        let steps = steps.push(number_field("свой", &self.speed_step_text, Message::SpeedStepText));
                         let reverbs = [0u8, 15, 30, 50, 75].into_iter().fold(row![].spacing(8), |line, reverb| {
                             let label = if reverb == 0 { "Выключен".to_string() } else { format!("{reverb} %") };
                             line.push(shine(button(text(label).size(14)).padding([7, 16]).style(ui::chip(reverb == self.reverb)).on_press(Message::ReverbSet(reverb)), 18.0))
@@ -8397,7 +8554,8 @@ impl App {
                         .spacing(8);
                         if self.speed_control {
                             effects = effects
-                                .push(container(column![text("Шаг скорости").color(ui::c().text), steps.wrap().vertical_spacing(8)].spacing(10)).padding(8))
+                                .push(container(column![column![text("Скорость").color(ui::c().text), text("От 0,5 до 2, например 1,15").size(13).color(ui::c().muted)].spacing(2), number_field("1", &self.speed_text, Message::SpeedText)].spacing(10)).padding(8))
+                                .push(container(column![column![text("Шаг скорости").color(ui::c().text), text("Свой — от 0,01 до 0,5").size(13).color(ui::c().muted)].spacing(2), steps.wrap().vertical_spacing(8)].spacing(10)).padding(8))
                                 .push(toggle("Тон вместе со скоростью", "Быстрее — выше, как в найткоре; медленнее — ниже, как в слоуде. Иначе голос звучит своим тоном на любой скорости", Some(self.pitch), Some(Message::PitchToggle)));
                         }
                         effects.push(container(column![column![text("Реверб").color(ui::c().text), text("Эхо большого зала поверх трека — с замедлением получается slowed + reverb").size(13).color(ui::c().muted)].spacing(2), reverbs.wrap().vertical_spacing(8)].spacing(10)).padding(8))
@@ -9716,9 +9874,13 @@ impl App {
         let speed = if track.remember || self.speed_control { SPEED_TOOL + 6.0 } else { 0.0 };
         let tools = lyrics + speed + 3.0 * BAR_TOOL + 12.0;
         let slider_room = (zone - tools - BAR_VOLUME_ICON - 14.0).clamp(BAR_SLIDER_MIN, BAR_SLIDER_MAX);
-        let mut right = row![self.view_tools(22.0, true)].spacing(8).align_y(Alignment::Center);
-        // В узком окне громкость уезжает наверх вместе с названием: внизу ей не хватает места.
+        let mut right = row![self.view_tools(22.0, true, true)].spacing(8).align_y(Alignment::Center);
+        // В узком окне скорость и громкость уезжают наверх вместе с названием: внизу им не
+        // хватает места.
         if shown < 1.0 {
+            if let Some(speed) = self.speed_tool(22.0) {
+                right = right.push(container(speed).width(SPEED_TOOL * (1.0 - shown)).clip(true));
+            }
             let volume = container(self.view_volume(24.0, Some(slider_room))).width((BAR_VOLUME_ICON + 6.0 + slider_room) * (1.0 - shown)).clip(true);
             right = right.push(volume);
         }
@@ -9735,7 +9897,11 @@ impl App {
             .spacing(6)
             .align_y(Alignment::Center);
             let volume = container(self.view_volume(BAR_TOP_VOLUME_ICON, Some(BAR_TOP_SLIDER))).width((BAR_TOP_VOLUME_ICON + 14.0 + BAR_TOP_SLIDER) * shown).clip(true);
-            let line = row![container(about).width(Length::Fill).clip(true), volume].spacing(12).align_y(Alignment::Center);
+            let mut line = row![container(about).width(Length::Fill).clip(true)].spacing(12).align_y(Alignment::Center);
+            if let Some(speed) = self.speed_tool(20.0) {
+                line = line.push(container(speed).width(SPEED_TOOL * shown).clip(true));
+            }
+            let line = line.push(volume);
             mouse_area(container(line).width(Length::Fill).height(BAR_TOP_LINE * shown).padding([0, 8]).clip(true).align_y(Alignment::Center)).on_right_press(Message::MenuOpen(track.clone())).into()
         } else {
             Space::new().height(0).into()
@@ -9757,7 +9923,7 @@ impl App {
                 .on_scroll(|delta| {
                     let y = match delta {
                         mouse::ScrollDelta::Lines { y, .. } => y,
-                        mouse::ScrollDelta::Pixels { y, .. } => y / 40.0,
+                        mouse::ScrollDelta::Pixels { y, .. } => y / WHEEL_PIXELS,
                     };
                     Message::VolumeWheel(y)
                 })
@@ -10294,6 +10460,31 @@ fn window_handle() -> Task<Message> {
 
 /// Заголовок окна цвета боковой панели, как в оригинале: чёрный или светло-серый. Рамка
 /// остаётся системной: работают привязка к краям экрана и изменение размера.
+/// Показывает или прячет текст в заголовке окна; значок и кнопки остаются. На панели
+/// задач и в Alt+Tab текст окна виден всё равно.
+fn caption_text(hwnd: isize, visible: bool) {
+    use windows_sys::Win32::UI::Controls::{SetWindowThemeAttribute, WTA_NONCLIENT, WTA_OPTIONS, WTNCA_NODRAWCAPTION};
+    let options = WTA_OPTIONS { dwFlags: if visible { 0 } else { WTNCA_NODRAWCAPTION }, dwMask: WTNCA_NODRAWCAPTION };
+    // SAFETY: своё окно, структура живёт до конца вызова.
+    unsafe { SetWindowThemeAttribute(hwnd as _, WTA_NONCLIENT, std::ptr::from_ref(&options).cast(), std::mem::size_of::<WTA_OPTIONS>() as u32) };
+}
+
+/// Секунды по часам с первого вызова: для анимаций, которым нужно ровное время.
+fn clock_seconds() -> f32 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f32()
+}
+
+/// Узкое поле для числа в настройках.
+fn number_field<'a>(hint: &str, value: &str, on_input: fn(String) -> Message) -> Element<'a, Message> {
+    text_input(hint, value).on_input(on_input).width(110).padding([7, 14]).size(14).style(ui::input).into()
+}
+
+/// Число из поля ввода: с запятой или точкой, можно со знаком «×».
+fn parse_number(value: &str) -> Option<f32> {
+    value.trim().trim_end_matches(['×', 'x', 'х']).trim().replace(',', ".").parse().ok()
+}
+
 fn paint_caption(hwnd: isize) {
     use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE};
     // Цвет для Windows: 0x00BBGGRR.
