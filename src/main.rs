@@ -17,6 +17,7 @@ mod pipe;
 mod icons;
 mod glow;
 mod login;
+mod lyrics;
 mod media;
 mod heaac;
 mod player;
@@ -159,7 +160,10 @@ const LIST: &str = "list";
 /// Ширина окна настроек волны.
 const TUNE_WIDTH: f32 = 560.0;
 /// Страница текста: размер строк и как быстро она догоняет звучащую строку.
-const LYRICS_SIZE: f32 = 26.0;
+/// Насколько текст песни всплывает при открытии и уходит вниз при закрытии, как у Tune Client.
+const LYRICS_RISE: f32 = 16.0;
+/// Сколько длится закрытие текста.
+const LYRICS_CLOSE: f32 = 0.25;
 const LYRICS_SPEED: f32 = 5.0;
 /// За сколько секунд текст возвращается к звучащей строке, если его прокрутили.
 const LYRICS_RETURN: f32 = 0.7;
@@ -690,6 +694,8 @@ enum Preview {
     Clips,
     /// Волна с открытым списком устройств.
     Devices,
+    /// Страница текста: у трека без текста Яндекса (`true`) или с ним, на такой секунде.
+    LyricsOf(bool, u64),
     /// Раздел «Концерты»; с `city` — окно выбора города.
     Concerts(bool),
     /// Страница концерта по номеру.
@@ -1050,6 +1056,10 @@ struct App {
     speed_step: f32,
     pitch: bool,
     reverb: u8,
+    lyrics_sources: lyrics::Sources,
+    lyrics_size: u8,
+    /// Текст песни закрывается: насколько ушёл вниз и растаял, потом — «назад».
+    lyrics_closing: Option<f32>,
     discord: Option<discord::Handle>,
     discord_sent: Option<(String, bool, Instant, f64)>,
     /// Открытая вкладка настроек.
@@ -1404,6 +1414,8 @@ enum Message {
     SpeedStepSet(u8),
     PitchToggle,
     ReverbSet(u8),
+    LyricsSourcesSet(lyrics::Sources),
+    LyricsSizeSet(u8),
     /// Кнопка скорости: шаг вверх или вниз (Shift, колесо), 0 — обычная скорость.
     SpeedStep(i8),
     VolumeStepSet(u8),
@@ -1760,6 +1772,9 @@ impl App {
             speed_step: saved.speed_step,
             pitch: saved.pitch,
             reverb: saved.reverb,
+            lyrics_sources: saved.lyrics,
+            lyrics_size: saved.lyrics_size,
+            lyrics_closing: None,
             discord: None,
             discord_sent: None,
             settings_tab: SettingsTab::Main,
@@ -1900,7 +1915,7 @@ impl App {
 
     /// Анимации интерфейса: им нужен каждый кадр монитора.
     fn ui_animating(&self) -> bool {
-        self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.eq_fade.busy() || self.devices_fade.busy() || self.chips_shown < 1.0 || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy() || self.wheel_turn != self.wheel_target || self.wheel_reveal != if self.wheel_open { 1.0 } else { 0.0 }
+        self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.eq_fade.busy() || self.devices_fade.busy() || self.chips_shown < 1.0 || self.lyrics_closing.is_some() || self.lyrics_dots() || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy() || self.wheel_turn != self.wheel_target || self.wheel_reveal != if self.wheel_open { 1.0 } else { 0.0 }
             || (self.wheel_ready() && self.wheel_arrow < 1.0)
             || self.word_now() != self.word_for
             || (self.word_for.is_some() && self.word_level < 1.0)
@@ -2064,7 +2079,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, keep_track: self.keep_track, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, keep_track: self.keep_track, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb, lyrics: self.lyrics_sources, lyrics_size: self.lyrics_size });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -3790,6 +3805,17 @@ impl App {
             self.eq_fade.step(elapsed);
             self.devices_fade.step(elapsed);
             self.chips_shown = (self.chips_shown + elapsed / APPEAR).min(1.0);
+            if let Some(level) = self.lyrics_closing {
+                let level = level + elapsed / LYRICS_CLOSE;
+                if level >= 1.0 {
+                    self.lyrics_closing = None;
+                    if self.section == Section::Lyrics {
+                        return self.update(Message::Back);
+                    }
+                } else {
+                    self.lyrics_closing = Some(level);
+                }
+            }
             self.page_menu_fade.step(elapsed);
             self.dialog_fade.step(elapsed);
             self.full_fade.step(elapsed);
@@ -3898,6 +3924,11 @@ impl App {
             self.lyrics_fresh = true;
             let down = back || (self.section as u8) < rank;
             self.page_shift = (0.0, if down { -PAGE_SHIFT } else { PAGE_SHIFT });
+            self.lyrics_closing = None;
+            // Текст песни, как у Tune Client, всплывает снизу.
+            if self.section == Section::Lyrics {
+                self.page_shift = (0.0, LYRICS_RISE);
+            }
             let scroll = match restore {
                 Some(y) => operation::scroll_to(Id::new(LIST), scrollable::AbsoluteOffset { x: 0.0, y }),
                 None => operation::snap_to(Id::new(LIST), scrollable::RelativeOffset::START),
@@ -4135,7 +4166,7 @@ impl App {
                         let wave = self.wave_load(vec![api::MY_WAVE.to_string()], None, false);
                         Task::batch([wave, Task::perform(background(|| std::thread::sleep(Duration::from_secs(4))), |()| Message::DevicesOpen)])
                     }
-                    Some(Preview::Lyrics) => self.wave_load(vec!["artist:3121".to_string()], None, false),
+                    Some(Preview::Lyrics | Preview::LyricsOf(..)) => self.wave_load(vec!["artist:3121".to_string()], None, false),
                     Some(Preview::WaveTune) => {
                         self.preview = None;
                         self.section = Section::Wave;
@@ -5335,8 +5366,12 @@ impl App {
                 return self.update(Message::WaveStartSeeds(self.wave_base.clone(), self.wave_title.clone()));
             }
             Message::LyricsToggle => {
+                // Как у Tune Client: текст сперва уходит вниз и тает, потом закрывается.
                 if self.section == Section::Lyrics {
-                    return self.handle(Message::Back);
+                    if self.lyrics_closing.is_none() {
+                        self.lyrics_closing = Some(0.0);
+                    }
+                    return Task::none();
                 }
                 return self.handle(Message::Open(Section::Lyrics));
             }
@@ -5671,7 +5706,7 @@ impl App {
                         return self.notify("Для этой волны у Яндекса нет треков".to_string());
                     }
                     // Пока грузилась фоновая волна, пользователь мог включить свой список.
-                    Ok(_) if !autoplay && self.current.is_some() && !matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded | Preview::Lyrics | Preview::WaveWords | Preview::WaveWheel | Preview::WaveWheelHalf)) => {}
+                    Ok(_) if !autoplay && self.current.is_some() && !matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded | Preview::Lyrics | Preview::LyricsOf(..) | Preview::WaveWords | Preview::WaveWheel | Preview::WaveWheelHalf)) => {}
                     Ok(wave) => {
                         if let Some(p) = &self.player {
                             p.stop();
@@ -5698,7 +5733,13 @@ impl App {
                             self.current = self.queue.iter().position(|track| track.lyrics).or(self.current);
                             self.position = Duration::from_secs(180);
                         }
-                        if matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded | Preview::Lyrics)) {
+                        // Текст из LRCLIB и NetEase — у трека без текста Яндекса; или начало трека.
+                        if let Some(Preview::LyricsOf(external, seconds)) = self.preview {
+                            self.section = Section::Lyrics;
+                            self.current = self.queue.iter().position(|track| track.lyrics != external).or(self.current);
+                            self.position = Duration::from_secs(seconds);
+                        }
+                        if matches!(self.preview, Some(Preview::Wave | Preview::WaveSeek | Preview::WaveSeeded | Preview::Lyrics | Preview::LyricsOf(..))) {
                             self.preview = None;
                         }
                         let words = Task::batch([self.words_load(0), self.wheel_load()]);
@@ -6614,6 +6655,16 @@ impl App {
                 self.apply_speed();
                 self.save_settings();
             }
+            Message::LyricsSourcesSet(sources) => {
+                self.lyrics_sources = sources;
+                // Текст играющего трека ищется заново уже по новым правилам.
+                self.lyrics = None;
+                self.save_settings();
+            }
+            Message::LyricsSizeSet(size) => {
+                self.lyrics_size = size;
+                self.save_settings();
+            }
             Message::ReverbSet(reverb) => {
                 self.reverb = reverb;
                 self.apply_speed();
@@ -7057,9 +7108,14 @@ impl App {
         let page = if missing { view_missing() } else { page };
         // Вместо затухания самой страницы её на миг закрывает фон и плавно уходит.
         let rest = 1.0 - anim::ease_out(1.0 - self.page_veil);
+        // Закрывающийся текст уходит вниз и тает, разгоняясь, как у Tune Client.
+        let (rest, shift) = match self.lyrics_closing.filter(|_| self.section == Section::Lyrics) {
+            Some(level) => (level * level, (0.0, LYRICS_RISE)),
+            None => (rest, self.page_shift),
+        };
         let back = ui::c().content;
         // Сдвинутая страница обрезается по своему месту: на трекбар и боковую панель не заезжает.
-        let page: Element<'_, Message> = reveal(page).shift(self.page_shift.0 * rest, self.page_shift.1 * rest).veil(back.scale_alpha(rest)).clip().into();
+        let page: Element<'_, Message> = reveal(page).shift(shift.0 * rest, shift.1 * rest).veil(back.scale_alpha(rest)).clip().into();
         let page: Element<'_, Message> = match &self.red_alert {
             // Как у оригинала: заметная полоса над страницей, кнопка ведёт на сайт Плюса.
             Some(alert) => {
@@ -7442,8 +7498,15 @@ impl App {
         // Запас сверху и снизу на половину страницы: первая и последняя строки тоже встают посередине.
         let room = ((WINDOW.lock().unwrap().1 - LYRICS_CHROME) / 2.0).max(0.0);
         let mut lines = column![Space::new().height(if lyrics.synced() { room } else { 0.0 })].spacing(14).width(Length::Fill).align_x(Alignment::Center);
+        let size = f32::from(self.lyrics_size);
         for (index, (time, words)) in lyrics.lines.iter().enumerate() {
-            let line = text(words).size(LYRICS_SIZE).font(ui::font_headline()).width(Length::Fill).align_x(Alignment::Center);
+            // Пауза без слов: три точки, которые пульсируют, пока она звучит.
+            if words.is_empty() {
+                let now = self.lyrics_line == Some(index);
+                lines = lines.push(container(self.lyrics_gap_dots(now, size)).width(Length::Fill).center_x(Length::Fill).height(size * 1.6).center_y(size * 1.6));
+                continue;
+            }
+            let line = text(words).size(size).font(ui::font_headline()).width(Length::Fill).align_x(Alignment::Center);
             let line: Element<'_, Message> = match time {
                 Some(time) => {
                     // Всё считается от дробного положения фокуса, поэтому переход идёт сам.
@@ -7461,9 +7524,43 @@ impl App {
         if !lyrics.authors.is_empty() {
             lines = lines.push(container(text(format!("Авторы: {}", lyrics.authors.join(", "))).size(14).color(ui::c().muted).width(Length::Fill).align_x(Alignment::Center)).padding([0, 24]));
         }
+        if lyrics.source != "Яндекс Музыка" {
+            lines = lines.push(container(text(format!("Текст: {}", lyrics.source)).size(13).color(ui::c().muted.scale_alpha(0.7)).width(Length::Fill).align_x(Alignment::Center)).padding([0, 24]));
+        }
         lines = lines.push(Space::new().height(if lyrics.synced() { room } else { 0.0 }));
         let hidden = scrollable::Direction::Vertical(scrollable::Scrollbar::new().width(0).scroller_width(0));
         column![header, ui::scroll(lines).id(LIST).direction(hidden).on_scroll(|viewport| Message::LyricsScrolled(viewport.absolute_offset().y, viewport.relative_offset().y)).height(Length::Fill)].spacing(16).height(Length::Fill).into()
+    }
+
+    /// Можно ли открыть текст: он есть у Яндекса или его поищут в LRCLIB и NetEase.
+    fn has_lyrics(&self, track: &Track) -> bool {
+        track.lyrics || (self.lyrics_sources.enabled && (self.lyrics_sources.lrclib || self.lyrics_sources.netease) && !track.remember)
+    }
+
+    /// Звучит пауза без слов: её точки пульсируют, им нужны кадры.
+    fn lyrics_dots(&self) -> bool {
+        self.section == Section::Lyrics
+            && self.is_playing()
+            && self.lyrics.as_ref().and_then(|(_, lyrics)| lyrics.as_ref()).zip(self.lyrics_line).is_some_and(|(lyrics, index)| lyrics.lines.get(index).is_some_and(|(_, words)| words.is_empty()))
+    }
+
+    /// Три точки паузы, как у Tune Client: у звучащей они по очереди подпрыгивают и светлеют.
+    fn lyrics_gap_dots(&self, now: bool, size: f32) -> Element<'_, Message> {
+        let dot = (size * 0.45).round();
+        let seconds = self.position.as_secs_f32();
+        (0..3)
+            .fold(row![].spacing(dot * 0.8).align_y(Alignment::Center), |dots, index| {
+                // Полпериода — 0,6 с, у каждой следующей точки задержка 0,2 с.
+                let phase = if now { ((seconds - 0.2 * index as f32) / 0.6).rem_euclid(2.0) } else { 0.0 };
+                let swing = if phase < 1.0 { phase } else { 2.0 - phase };
+                let alpha = if now { 0.1 + 0.4 * swing } else { 0.1 };
+                let scale = if now { 1.0 + 0.3 * (1.0 - (2.0 * swing - 1.0).abs()) } else { 1.0 };
+                let lift = if now { dot * (0.5 - swing) } else { 0.0 };
+                let color = ui::c().strong.scale_alpha(alpha);
+                let body = container(Space::new()).width(dot).height(dot).style(move |_| container::Style::default().background(color).border(iced::border::rounded(dot / 2.0)));
+                dots.push(reveal(body).shift(0.0, lift).scale(scale, 0.5, 0.5))
+            })
+            .into()
     }
 
     /// Запрашивает текст, когда открыта его страница и сменился трек.
@@ -7471,7 +7568,7 @@ impl App {
         if self.section != Section::Lyrics {
             return Task::none();
         }
-        let (Some(track), Some(token)) = (self.current_track(), self.token()) else { return Task::none() };
+        let (Some(track), Some(token)) = (self.current_track().cloned(), self.token()) else { return Task::none() };
         let id = track.id.clone();
         if self.lyrics.as_ref().is_some_and(|(known, _)| *known == id) || self.lyrics_loading.as_ref() == Some(&id) {
             return Task::none();
@@ -7479,7 +7576,8 @@ impl App {
         self.lyrics_loading = Some(id.clone());
         self.lyrics_line = None;
         let wanted = id.clone();
-        Task::perform(background(move || api::lyrics(&id, &token)), move |result| Message::LyricsLoaded(wanted.clone(), result))
+        let sources = self.lyrics_sources;
+        Task::perform(background(move || lyrics::find(&track, sources, &token)), move |result| Message::LyricsLoaded(wanted.clone(), result))
     }
 
     /// Находит звучащую строку и задаёт, куда прокрутить страницу.
@@ -7585,7 +7683,7 @@ impl App {
             }
         }
         // Страница текста показывает только играющий трек.
-        if track.lyrics && self.section != Section::Lyrics && self.current_track().is_some_and(|current| current.id == track.id) {
+        if self.has_lyrics(track) && self.section != Section::Lyrics && self.current_track().is_some_and(|current| current.id == track.id) {
             items = items.push(item(ui::LYRICS, "Текст песни", Message::MenuLyrics));
             count += 1.0;
         }
@@ -7806,7 +7904,7 @@ impl App {
                 tools = tools.push(hint(button, "Скорость"));
             }
         }
-        if self.current_track().is_some_and(|track| track.lyrics) {
+        if self.current_track().is_some_and(|track| self.has_lyrics(track)) {
             tools = tools.push(tool(ui::LYRICS, self.section == Section::Lyrics, Message::LyricsToggle, "Показать текст песни"));
         }
         tools.push(tool(ui::QUEUE, self.section == Section::Queue, Message::QueueToggle, "Открыть очередь")).into()
@@ -8222,7 +8320,6 @@ impl App {
                 let looks = Look::ALL.into_iter().fold(row![].spacing(8), |line, look| line.push(choice(look.label(), look == self.look, Message::LookSet(look))));
                 column![
                     column![title("Оформление"), looks, toggle("Включить lite-версию", "Визуальные эффекты и анимации будут загружаться в облегчённом формате", Some(self.lite), Some(Message::LiteToggle))].spacing(12),
-                    group("Плеер", vec![toggle("Помнить последний трек", "После запуска в плеере трек и очередь, что играли при выходе, — даже если сервер Яндекса их не вернул", Some(self.keep_track), Some(Message::KeepTrackToggle))]),
                     group("Боковая панель", vec![
                         toggle("Книги и подкасты", "Пункт «Книги и подкасты» в боковой панели: аудиокниги, подкасты и выпуски", Some(self.books_tab), Some(Message::BooksToggle)),
                         toggle("Детский раздел", "Пункт «Детям» в боковой панели: сказки, песни и аудиокниги для детей", Some(self.kids), Some(Message::KidsToggle)),
@@ -8251,21 +8348,40 @@ impl App {
                 .into()
             }
             SettingsTab::Discord => self.view_discord_settings(),
-            SettingsTab::Sound => {
-                let quality = Quality::ALL.into_iter().fold(row![].spacing(8), |line, quality| line.push(choice(quality.label(), quality == self.quality, Message::QualitySet(quality))));
-                let mut sound = column![title("Качество звука"), quality].spacing(12);
-                if let Some(playing) = &self.sound {
-                    sound = sound.push(text(format!("Сейчас играет: {}", playing.label)).size(13).color(ui::c().muted));
-                    if playing.below(self.quality.code()) {
-                        sound = sound.push(text("Яндекс не дал этот трек в выбранном качестве: играет лучшее, что есть для вашего аккаунта").size(13).color(ui::c().muted));
-                    }
-                }
+            SettingsTab::Player => {
                 let steps = settings::VOLUME_STEPS.into_iter().fold(row![].spacing(8), |line, step| {
                     line.push(shine(button(text(format!("{step} %")).size(14)).padding([7, 16]).style(ui::chip(step == self.volume_step)).on_press(Message::VolumeStepSet(step)), 18.0))
                 });
+                let sources = self.lyrics_sources;
+                let set = |change: fn(&mut lyrics::Sources)| {
+                    let mut next = sources;
+                    change(&mut next);
+                    Some(Message::LyricsSourcesSet(next))
+                };
+                let mut lyrics = column![
+                    title("Текст песен"),
+                    toggle("Синхронный текст из LRCLIB и NetEase", "Когда у Яндекса нет текста со временем строк, Tune ищет его в открытых базах — только у того же трека", Some(sources.enabled), set(|s| s.enabled = !s.enabled)),
+                ]
+                .spacing(8);
+                if sources.enabled {
+                    lyrics = lyrics
+                        .push(toggle("LRCLIB", "Открытая база синхронных текстов", Some(sources.lrclib), set(|s| s.lrclib = !s.lrclib)))
+                        .push(toggle("NetEase Cloud Music", "Много синхронных текстов, в том числе русских", Some(sources.netease), set(|s| s.netease = !s.netease)))
+                        .push(toggle("Сначала NetEase", "Иначе сначала LRCLIB", Some(sources.netease_first), set(|s| s.netease_first = !s.netease_first)))
+                        .push(toggle("Искать и там, где у Яндекса есть свой текст", "Брать текст из LRCLIB и NetEase даже для треков с текстом Яндекса", Some(sources.always), set(|s| s.always = !s.always)));
+                }
+                let sizes = settings::LYRICS_SIZES.into_iter().fold(row![].spacing(8), |line, size| {
+                    let label = match size {
+                        20 => "Мелкий",
+                        26 => "Обычный",
+                        32 => "Крупный",
+                        _ => "Очень крупный",
+                    };
+                    line.push(shine(button(text(label).size(14)).padding([7, 16]).style(ui::chip(size == self.lyrics_size)).on_press(Message::LyricsSizeSet(size)), 18.0))
+                });
+                lyrics = lyrics.push(container(column![text("Размер текста").color(ui::c().text), sizes.wrap().vertical_spacing(8)].spacing(10)).padding(8));
                 column![
-                    sound,
-                    self.view_equalizer(),
+                    lyrics,
                     {
                         let steps = settings::SPEED_STEPS.iter().enumerate().fold(row![].spacing(8), |line, (index, step)| {
                             line.push(shine(button(text(format!("{}×", speed_label(*step))).size(14)).padding([7, 16]).style(ui::chip(*step == self.speed_step)).on_press(Message::SpeedStepSet(index as u8)), 18.0))
@@ -8292,6 +8408,23 @@ impl App {
                         container(column![column![text("Шаг громкости").color(ui::c().text), text("Для колеса мыши и стрелок ↑ и ↓").size(13).color(ui::c().muted)].spacing(2), steps].spacing(10)).padding(8),
                     ]
                     .spacing(8),
+                    group("Треки", vec![toggle("Помнить последний трек", "После запуска в плеере трек и очередь, что играли при выходе, — даже если сервер синхронизации Яндекса (Ynison) их не вернул", Some(self.keep_track), Some(Message::KeepTrackToggle))]),
+                ]
+                .spacing(28)
+                .into()
+            }
+            SettingsTab::Sound => {
+                let quality = Quality::ALL.into_iter().fold(row![].spacing(8), |line, quality| line.push(choice(quality.label(), quality == self.quality, Message::QualitySet(quality))));
+                let mut sound = column![title("Качество звука"), quality].spacing(12);
+                if let Some(playing) = &self.sound {
+                    sound = sound.push(text(format!("Сейчас играет: {}", playing.label)).size(13).color(ui::c().muted));
+                    if playing.below(self.quality.code()) {
+                        sound = sound.push(text("Яндекс не дал этот трек в выбранном качестве: играет лучшее, что есть для вашего аккаунта").size(13).color(ui::c().muted));
+                    }
+                }
+                column![
+                    sound,
+                    self.view_equalizer(),
                     group("Воспроизведение", vec![
                         toggle("Плавные переходы между треками", "Конец трека перетекает в начало следующего", Some(self.crossfade), Some(Message::CrossfadeToggle)),
                         toggle("Одинаковая громкость треков", "Тихие и громкие записи звучат на одном уровне, по данным Яндекса о громкости трека", Some(self.normalize), Some(Message::NormalizeToggle)),
@@ -8376,22 +8509,21 @@ impl App {
                 .into()
         };
         let displays = discord::Display::ALL.into_iter().fold(row![].spacing(8), |line, display| line.push(choice(display.label(), display == prefs.display, with(&|p| p.display = display)))).wrap().vertical_spacing(8);
-        let mut page = column![column![
+        let status = column![
             title("Статус"),
             toggle("Показывать трек в статусе Discord", "Discord на этом компьютере покажет «Слушает …» с треком и обложкой", prefs.enabled, with(&|p| p.enabled = !p.enabled)),
         ]
-        .spacing(8)]
-        .spacing(28);
+        .spacing(8);
         if !prefs.enabled {
-            return page.into();
+            return status.into();
         }
-        page = page
-            .push(column![
-                labeled("Название активности", "Discord покажет «Слушает …»", field(&prefs.name, "Tune Music", |p, v| p.name = v)),
-                labeled("Подпись в списке участников", "Что видно рядом с ником, без открытия профиля", displays.into()),
-                toggle("Полоса времени", "Сколько прошло и сколько осталось", prefs.show_progress, with(&|p| p.show_progress = !p.show_progress)),
-                toggle("Оставлять статус на паузе", "Иначе статус пропадает, пока музыка на паузе", prefs.show_paused, with(&|p| p.show_paused = !p.show_paused)),
-            ].spacing(8))
+        let status = status
+            .push(labeled("Название активности", "Discord покажет «Слушает …»", field(&prefs.name, "Tune Music", |p, v| p.name = v)))
+            .push(labeled("Подпись в списке участников", "Что видно рядом с ником, без открытия профиля", displays.into()))
+            .push(toggle("Полоса времени", "Сколько прошло и сколько осталось", prefs.show_progress, with(&|p| p.show_progress = !p.show_progress)))
+            .push(toggle("Оставлять статус на паузе", "Иначе статус пропадает, пока музыка на паузе", prefs.show_paused, with(&|p| p.show_paused = !p.show_paused)));
+        let page = column![status]
+            .spacing(28)
             .push(column![
                 title("Картинки"),
                 toggle("Обложка трека", "Иначе вместо обложки — значок", prefs.show_cover, with(&|p| p.show_cover = !p.show_cover)),
@@ -9580,7 +9712,7 @@ impl App {
             buttons = buttons.push(mode(icon, self.repeat != Repeat::Off, Message::RepeatNext, repeat_hint(self.repeat)));
         }
 
-        let lyrics = if track.lyrics { BAR_TOOL + 6.0 } else { 0.0 };
+        let lyrics = if self.has_lyrics(track) { BAR_TOOL + 6.0 } else { 0.0 };
         let speed = if track.remember || self.speed_control { SPEED_TOOL + 6.0 } else { 0.0 };
         let tools = lyrics + speed + 3.0 * BAR_TOOL + 12.0;
         let slider_room = (zone - tools - BAR_VOLUME_ICON - 14.0).clamp(BAR_SLIDER_MIN, BAR_SLIDER_MAX);
@@ -10357,6 +10489,7 @@ fn eq_place((x, y): (f32, f32)) -> (f32, f32) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsTab {
     Main,
+    Player,
     Window,
     Discord,
     Sound,
@@ -10367,11 +10500,12 @@ enum SettingsTab {
 }
 
 impl SettingsTab {
-    const ALL: [SettingsTab; 8] = [SettingsTab::Main, SettingsTab::Window, SettingsTab::Discord, SettingsTab::Sound, SettingsTab::Recommendations, SettingsTab::Downloads, SettingsTab::Hotkeys, SettingsTab::Account];
+    const ALL: [SettingsTab; 9] = [SettingsTab::Main, SettingsTab::Player, SettingsTab::Sound, SettingsTab::Window, SettingsTab::Discord, SettingsTab::Recommendations, SettingsTab::Downloads, SettingsTab::Hotkeys, SettingsTab::Account];
 
     fn label(self) -> &'static str {
         match self {
             SettingsTab::Main => "Основные",
+            SettingsTab::Player => "Плеер",
             SettingsTab::Window => "Окно",
             SettingsTab::Discord => "Discord",
             SettingsTab::Sound => "Звук",
@@ -11323,6 +11457,8 @@ fn main() -> iced::Result {
             "wave-seeded" => Preview::WaveSeeded,
             "wave-tune" => Preview::WaveTune,
             "lyrics" => Preview::Lyrics,
+            "lyrics-ext" => Preview::LyricsOf(true, 60),
+            "lyrics-start" => Preview::LyricsOf(false, 1),
             "likes" => Preview::Likes,
             "likes-end" => Preview::LikesEnd,
             what if what.starts_with("likes-at:") => Preview::LikesAt(what["likes-at:".len()..].parse().unwrap_or(0.0)),

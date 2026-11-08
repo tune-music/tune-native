@@ -153,7 +153,14 @@ pub struct Settings {
     pub pitch: bool,
     /// Реверб, 0–100 %: доля зала в звуке.
     pub reverb: u8,
+    /// Откуда брать текст песен.
+    pub lyrics: crate::lyrics::Sources,
+    /// Размер строк текста песен.
+    pub lyrics_size: u8,
 }
+
+/// Размеры текста песен на выбор.
+pub const LYRICS_SIZES: [u8; 4] = [20, 26, 32, 38];
 
 /// Шаги кнопки скорости на выбор, как у Tune Client.
 pub const SPEED_STEPS: [f32; 3] = [0.05, 0.1, 0.25];
@@ -215,6 +222,18 @@ fn parse(v: &Value) -> Settings {
         speed_step: v["speedStep"].as_f64().map(|x| x as f32).filter(|x| SPEED_STEPS.contains(x)).unwrap_or(0.25),
         pitch: v["pitchWithSpeed"].as_bool().unwrap_or(false),
         reverb: v["reverb"].as_u64().map_or(0, |x| x.min(100) as u8),
+        lyrics: {
+            let base = crate::lyrics::Sources::default();
+            let l = &v["lyrics"];
+            crate::lyrics::Sources {
+                enabled: l["enabled"].as_bool().unwrap_or(base.enabled),
+                always: l["always"].as_bool().unwrap_or(base.always),
+                lrclib: l["lrclib"].as_bool().unwrap_or(base.lrclib),
+                netease: l["netease"].as_bool().unwrap_or(base.netease),
+                netease_first: l["neteaseFirst"].as_bool().unwrap_or(base.netease_first),
+            }
+        },
+        lyrics_size: v["lyricsSize"].as_u64().map(|x| x as u8).filter(|x| LYRICS_SIZES.contains(x)).unwrap_or(26),
         volume_step: v["volumeStep"].as_u64().map(|step| step as u8).filter(|step| VOLUME_STEPS.contains(step)).unwrap_or(5),
         window: {
             let base = WindowPrefs::default();
@@ -223,7 +242,9 @@ fn parse(v: &Value) -> Settings {
                 autostart: w["autostart"].as_bool().unwrap_or(base.autostart),
                 start_minimized: w["startMinimized"].as_bool().unwrap_or(base.start_minimized),
                 close_to_tray: w["closeToTray"].as_bool().unwrap_or(base.close_to_tray),
-                track_title: w["trackTitle"].as_bool().unwrap_or(base.track_title),
+                // Ключ новый: прежний «trackTitle» был включён по умолчанию, а у Tune Client трека в
+                // заголовке нет — старое значение не переносится.
+                track_title: w["trackInTitle"].as_bool().unwrap_or(base.track_title),
             }
         },
     }
@@ -254,9 +275,11 @@ pub fn save(settings: Settings) {
     };
     let eq = settings.eq;
     let equalizer = json!({ "enabled": eq.enabled, "preset": eq.preset, "preamp": eq.preamp, "gains": eq.gains });
+    let l = settings.lyrics;
+    let lyrics = json!({ "enabled": l.enabled, "always": l.always, "lrclib": l.lrclib, "netease": l.netease, "neteaseFirst": l.netease_first });
     let w = settings.window;
-    let window = json!({ "autostart": w.autostart, "startMinimized": w.start_minimized, "closeToTray": w.close_to_tray, "trackTitle": w.track_title });
-    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "books": settings.books, "concerts": settings.concerts, "words": settings.words, "wheel": settings.wheel, "speed": settings.speed, "theme": settings.look.code(), "keepTrack": settings.keep_track, "window": window, "volumeWheel": settings.volume_wheel, "volumeStep": settings.volume_step, "speedControl": settings.speed_control, "speedStep": settings.speed_step, "pitchWithSpeed": settings.pitch, "reverb": settings.reverb });
+    let window = json!({ "autostart": w.autostart, "startMinimized": w.start_minimized, "closeToTray": w.close_to_tray, "trackInTitle": w.track_title });
+    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "books": settings.books, "concerts": settings.concerts, "words": settings.words, "wheel": settings.wheel, "speed": settings.speed, "theme": settings.look.code(), "keepTrack": settings.keep_track, "window": window, "volumeWheel": settings.volume_wheel, "volumeStep": settings.volume_step, "speedControl": settings.speed_control, "speedStep": settings.speed_step, "pitchWithSpeed": settings.pitch, "reverb": settings.reverb, "lyrics": lyrics, "lyricsSize": settings.lyrics_size });
     let dir = api::data_dir();
     if fs::create_dir_all(&dir).is_ok() {
         let _ = fs::write(dir.join("settings.json"), value.to_string());
@@ -270,9 +293,9 @@ mod tests {
     #[test]
     fn reads_saved_and_broken_values() {
         let saved = parse(&json!({ "volume": 0.25, "muted": true, "repeat": "one", "shuffle": true, "quality": "lossless", "normalize": true }));
-        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default(), crossfade: true, normalize: true, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, keep_track: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0 });
+        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default(), crossfade: true, normalize: true, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, keep_track: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0, lyrics: crate::lyrics::Sources::default(), lyrics_size: 26 });
         let empty = parse(&Value::Null);
-        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default(), crossfade: true, normalize: false, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, keep_track: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0 });
+        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default(), crossfade: true, normalize: false, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, keep_track: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0, lyrics: crate::lyrics::Sources::default(), lyrics_size: 26 });
         assert!(!parse(&json!({ "crossfade": false })).crossfade);
         assert!(!parse(&json!({ "kids": false })).kids);
         assert!(!parse(&json!({ "books": false })).books && !parse(&json!({ "concerts": false })).concerts);

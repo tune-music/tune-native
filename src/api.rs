@@ -3136,7 +3136,12 @@ pub struct Lyrics {
     pub authors: Vec<String>,
     /// Что нужно для отчёта о просмотре текста.
     pub view: Option<LyricView>,
+    /// Откуда текст: «Яндекс Музыка», «LRCLIB» или «NetEase».
+    pub source: &'static str,
 }
+
+/// Пауза без слов, после которой вместо пустоты показываются точки, как у Tune Client.
+pub const LYRICS_GAP: f32 = 4.0;
 
 /// Номера текста у Яндекса и правообладателя: с ними уходит отчёт о просмотре.
 #[derive(Clone, Debug, PartialEq)]
@@ -3171,8 +3176,29 @@ impl Lyrics {
     }
 }
 
-/// Строка LRC: `[01:23.45] текст`. Без метки времени остаётся обычным текстом.
-fn parse_lrc(text: &str) -> Vec<(Option<f32>, String)> {
+/// Строка LRC: `[01:23.45] текст`. Без метки времени остаётся обычным текстом. Пустая строка
+/// со временем — пауза: заметная (от `LYRICS_GAP`) остаётся строкой без слов, на её месте
+/// точки. Такая же пауза добавляется перед первой строкой, если петь начинают не сразу.
+pub fn parse_lrc(text: &str) -> Vec<(Option<f32>, String)> {
+    let lines = parse_lrc_lines(text);
+    let mut out: Vec<(Option<f32>, String)> = Vec::new();
+    for (index, (time, words)) in lines.iter().enumerate() {
+        if words.is_empty() {
+            let next = lines[index + 1..].iter().find_map(|(time, words)| time.filter(|_| !words.is_empty()));
+            let long = matches!((time, next), (Some(time), Some(next)) if next - time >= LYRICS_GAP);
+            if !long || out.last().is_some_and(|(_, words)| words.is_empty()) {
+                continue;
+            }
+        }
+        out.push((*time, words.clone()));
+    }
+    if out.first().is_some_and(|(time, words)| time.is_some_and(|time| time >= LYRICS_GAP) && !words.is_empty()) {
+        out.insert(0, (Some(0.0), String::new()));
+    }
+    out
+}
+
+fn parse_lrc_lines(text: &str) -> Vec<(Option<f32>, String)> {
     text.lines()
         .filter_map(|line| {
             let line = line.trim();
@@ -3181,7 +3207,6 @@ fn parse_lrc(text: &str) -> Vec<(Option<f32>, String)> {
                 Some((minutes.parse::<f32>().ok()? * 60.0 + seconds.parse::<f32>().ok()?, words.trim()))
             });
             match timed {
-                Some((_, "")) => None,
                 Some((time, words)) => Some((Some(time), words.to_string())),
                 None if line.is_empty() => None,
                 None => Some((None, line.to_string())),
@@ -3203,7 +3228,7 @@ fn lyrics_in(id: &str, format: &'static str, token: &str) -> Result<Option<Lyric
     let Some(url) = v["downloadUrl"].as_str() else { return Ok(None) };
     let text = agent().get(url).call().map_err(|e| format!("Не удалось загрузить текст: {e}"))?.into_body().read_to_string().map_err(|e| e.to_string())?;
     let authors = v["writers"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(str::to_string)).collect();
-    Ok(Some(Lyrics { lines: parse_lrc(&text), authors, view: parse_lyric_view(v, format) }).filter(|lyrics| !lyrics.lines.is_empty()))
+    Ok(Some(Lyrics { lines: parse_lrc(&text), authors, view: parse_lyric_view(v, format), source: "Яндекс Музыка" }).filter(|lyrics| lyrics.lines.iter().any(|(_, words)| !words.is_empty())))
 }
 
 /// Сначала синхронный текст, потом обычный. У многих треков есть только один из них.
@@ -3910,15 +3935,18 @@ mod tests {
     #[test]
     fn parses_lyrics() {
         let lines = parse_lrc("[00:01.50] раз\n[00:03.00]\n[01:00.00] два\n\nбез времени");
-        assert_eq!(lines, [(Some(1.5), "раз".to_string()), (Some(60.0), "два".to_string()), (None, "без времени".to_string())]);
-        let lyrics = Lyrics { lines, authors: Vec::new(), view: None };
+        assert_eq!(lines, [(Some(1.5), "раз".to_string()), (Some(3.0), String::new()), (Some(60.0), "два".to_string()), (None, "без времени".to_string())]);
+        // Короткая пауза — без точек; долгое вступление — с точками в начале.
+        assert_eq!(parse_lrc("[00:01.00]раз\n[00:02.00]\n[00:03.00]два").len(), 2);
+        assert_eq!(parse_lrc("[00:12.00]раз\n[00:14.00]два")[0], (Some(0.0), String::new()));
+        let lyrics = Lyrics { lines, authors: Vec::new(), view: None, source: "Яндекс Музыка" };
         let view = parse_lyric_view(&json!({"lyricId": 5, "externalLyricId": "e1", "major": {"id": 9}}), "LRC").unwrap();
         assert_eq!((view.lyric.as_str(), view.external.as_str(), view.major.as_str()), ("5", "e1", "9"));
         assert!(lyrics.synced());
         assert_eq!(lyrics.line_at(0.5), None);
         assert_eq!(lyrics.line_at(2.0), Some(0));
-        assert_eq!(lyrics.line_at(90.0), Some(1));
-        assert!(!Lyrics { lines: parse_lrc("текст"), authors: Vec::new(), view: None }.synced());
+        assert_eq!(lyrics.line_at(90.0), Some(2));
+        assert!(!Lyrics { lines: parse_lrc("текст"), authors: Vec::new(), view: None, source: "Яндекс Музыка" }.synced());
     }
 
     #[test]
