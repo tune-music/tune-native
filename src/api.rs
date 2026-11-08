@@ -559,9 +559,18 @@ fn parse_liked_ids(v: &Value) -> Vec<String> {
 pub fn likes_since(uid: &str, revision: u64, token: &str) -> Result<Option<(Vec<String>, u64)>, String> {
     let since = revision.to_string();
     let v = get(&format!("users/{uid}/likes/tracks"), &[("if-modified-since-revision", &since)], token)?;
-    let v = result(&v);
-    if v.as_str() == Some("no-updates") {
+    parse_likes_since(&v, revision)
+}
+
+fn parse_likes_since(v: &Value, revision: u64) -> Result<Option<(Vec<String>, u64)>, String> {
+    // `result` здесь бывает строкой, а `result()` отдаёт строку целым ответом — смотрим сами.
+    if v["result"].as_str() == Some("no-updates") {
         return Ok(None);
+    }
+    let v = result(v);
+    // Без списка треков это не «лайков нет», а непонятный ответ: старый список не трогаем.
+    if !v["library"]["tracks"].is_array() {
+        return Err("сверка лайков: в ответе нет списка треков".to_string());
     }
     Ok(Some((parse_liked_ids(v), v["library"]["revision"].as_u64().unwrap_or(revision))))
 }
@@ -3323,6 +3332,19 @@ mod tests {
     fn liked_ids_parse() {
         let v = serde_json::json!({"library": {"revision": 5, "tracks": [{"id": "1", "albumId": "2"}, {"id": 3}]}});
         assert_eq!(parse_liked_ids(&v), vec!["1".to_string(), "3".to_string()]);
+    }
+
+    #[test]
+    fn likes_since_keeps_list() {
+        // Так Яндекс отвечает, когда лайки не менялись: список трогать нельзя.
+        let same = serde_json::json!({"invocationInfo": {}, "result": "no-updates"});
+        assert_eq!(parse_likes_since(&same, 436), Ok(None));
+        let odd = serde_json::json!({"invocationInfo": {}, "result": {}});
+        assert!(parse_likes_since(&odd, 436).is_err());
+        let fresh = serde_json::json!({"result": {"library": {"revision": 437, "tracks": [{"id": "1"}]}}});
+        assert_eq!(parse_likes_since(&fresh, 436), Ok(Some((vec!["1".to_string()], 437))));
+        let empty = serde_json::json!({"result": {"library": {"revision": 438, "tracks": []}}});
+        assert_eq!(parse_likes_since(&empty, 437), Ok(Some((vec![], 438))));
     }
 
     #[test]
