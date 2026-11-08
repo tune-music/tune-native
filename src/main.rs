@@ -7,6 +7,7 @@ mod concerts;
 mod sync;
 mod video;
 mod ynison;
+mod discord;
 mod shell;
 mod tray;
 mod dpi;
@@ -28,6 +29,7 @@ mod stretch;
 use fit::{fit, fit_row};
 mod pick;
 mod equalizer;
+mod reverb;
 mod settings;
 mod ui;
 mod vibe;
@@ -175,7 +177,6 @@ const SESSION_SAVE: Duration = Duration::from_secs(10);
 const SEEK_STEP: f32 = 5.0;
 /// Сколько других альбомов исполнителя показать под альбомом.
 const ALBUM_OTHERS: usize = 8;
-const VOLUME_STEP: f32 = 0.05;
 const DIALOG_INPUT: &str = "dialog";
 const DIALOG_WIDTH: f32 = 400.0;
 /// Сколько окна остаётся вокруг сведений о треке.
@@ -1040,6 +1041,17 @@ struct App {
     keep_track: bool,
     /// Запуск, трей и заголовок окна.
     window_prefs: settings::WindowPrefs,
+    /// Статус в Discord: настройки, поток связи и что ему отправлено последним —
+    /// трек, играл ли, когда и с какой секунды.
+    discord_prefs: discord::Prefs,
+    volume_wheel: bool,
+    volume_step: u8,
+    speed_control: bool,
+    speed_step: f32,
+    pitch: bool,
+    reverb: u8,
+    discord: Option<discord::Handle>,
+    discord_sent: Option<(String, bool, Instant, f64)>,
     /// Открытая вкладка настроек.
     settings_tab: SettingsTab,
     /// Раскрыто ли колесо и насколько оно уже выехало, от 0 до 1.
@@ -1386,6 +1398,17 @@ enum Message {
     /// Клик по вкладке боковой панели.
     TabOpen(Section),
     WindowPrefSet(settings::WindowPrefs),
+    DiscordSet(discord::Prefs),
+    VolumeWheelToggle,
+    SpeedControlToggle,
+    SpeedStepSet(u8),
+    PitchToggle,
+    ReverbSet(u8),
+    /// Кнопка скорости: шаг вверх или вниз (Shift, колесо), 0 — обычная скорость.
+    SpeedStep(i8),
+    VolumeStepSet(u8),
+    /// Колесо мыши над плеером: на сколько щелчков.
+    VolumeWheel(f32),
     SettingsTabSet(SettingsTab),
     /// Раскрыть колесо или вернуться к волне.
     WheelShow(bool),
@@ -1730,6 +1753,15 @@ impl App {
             wheel_on: saved.wheel,
             keep_track: saved.keep_track,
             window_prefs: saved.window,
+            discord_prefs: discord::load(),
+            volume_wheel: saved.volume_wheel,
+            volume_step: saved.volume_step,
+            speed_control: saved.speed_control,
+            speed_step: saved.speed_step,
+            pitch: saved.pitch,
+            reverb: saved.reverb,
+            discord: None,
+            discord_sent: None,
             settings_tab: SettingsTab::Main,
             wheel_open: false,
             wheel_reveal: 0.0,
@@ -1853,6 +1885,7 @@ impl App {
             preview,
         };
         app.apply_volume();
+        app.apply_speed();
         if let Some(player) = &app.player {
             player.set_eq(app.eq);
         }
@@ -2009,9 +2042,17 @@ impl App {
     }
 
     /// Ускоряются только выпуски и книги: музыка всегда звучит как есть.
+    /// С какой скоростью играет трек: книги и подкасты — всегда со своей, музыка — только с
+    /// включённой кнопкой скорости, как у Tune Client.
+    fn speed_for(&self, track: &Track) -> f32 {
+        if track.remember || self.speed_control { self.speed } else { 1.0 }
+    }
+
     fn apply_speed(&self) {
         if let Some(p) = &self.player {
-            p.set_speed(if self.current_track().is_some_and(|track| track.remember) { self.speed } else { 1.0 });
+            p.set_speed(self.current_track().map_or(1.0, |track| self.speed_for(track)));
+            p.set_pitch(self.speed_control && self.pitch);
+            p.set_reverb(f32::from(self.reverb) / 100.0);
         }
     }
 
@@ -2023,7 +2064,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, keep_track: self.keep_track, window: self.window_prefs });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, keep_track: self.keep_track, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -3186,7 +3227,7 @@ impl App {
             (Some(out), Some(fade)) if restart.is_none() && resume.is_none() => player.crossfade(out, (fade.in_start, fade.in_stop)),
             _ => player.stop(),
         };
-        player.set_speed(if track.remember { self.speed } else { 1.0 });
+        player.set_speed(self.speed_for(&track));
         self.play_id = generation;
         self.current = Some(index);
         self.active = false;
@@ -3912,6 +3953,7 @@ impl App {
             media.sync(track.as_ref(), playing, position);
         }
         tray::sync(self.is_playing(), ui::is_light());
+        self.discord_sync(track.as_ref(), playing, position);
         Task::batch([task, snap, more, covers, lyrics])
     }
 
@@ -5471,6 +5513,15 @@ impl App {
                 self.keep_track = !self.keep_track;
                 self.save_settings();
             }
+            Message::DiscordSet(prefs) => {
+                discord::save(&prefs);
+                if let Some(handle) = &self.discord {
+                    handle.configure(&prefs);
+                }
+                self.discord_prefs = prefs;
+                // Новые настройки — статус собирается заново.
+                self.discord_sent = None;
+            }
             Message::WindowPrefSet(prefs) => {
                 if prefs.autostart != self.window_prefs.autostart {
                     if let Err(e) = set_autostart(prefs.autostart) {
@@ -6522,8 +6573,49 @@ impl App {
                 }
             }
             Message::SpeedNext => {
+                if self.speed_control {
+                    return self.handle(Message::SpeedStep(1));
+                }
                 let at = settings::SPEEDS.iter().position(|&speed| speed == self.speed).unwrap_or(0);
                 self.speed = settings::SPEEDS[(at + 1) % settings::SPEEDS.len()];
+                self.apply_speed();
+                self.save_settings();
+            }
+            // Как у Tune Client: шаг вверх по кругу от 0,5× до 2×, вниз — до 0,5×, 0 — обычная.
+            Message::SpeedStep(direction) => {
+                let step = self.speed_step;
+                let next = match direction {
+                    0 => 1.0,
+                    up if up > 0 => {
+                        let next = (self.speed / step + 1e-4).floor() * step + step;
+                        if next > settings::SPEED_MAX + 1e-4 { settings::SPEED_MIN } else { next }
+                    }
+                    _ => (self.speed / step - 1e-4).ceil() * step - step,
+                };
+                self.speed = ((next.clamp(settings::SPEED_MIN, settings::SPEED_MAX) * 100.0).round()) / 100.0;
+                self.apply_speed();
+                self.save_settings();
+            }
+            Message::SpeedControlToggle => {
+                self.speed_control = !self.speed_control;
+                // Без кнопки музыка снова с обычной скоростью; у книг скорость своя из списка.
+                if !self.speed_control && !settings::SPEEDS.contains(&self.speed) {
+                    self.speed = 1.0;
+                }
+                self.apply_speed();
+                self.save_settings();
+            }
+            Message::SpeedStepSet(index) => {
+                self.speed_step = settings::SPEED_STEPS[usize::from(index).min(settings::SPEED_STEPS.len() - 1)];
+                self.save_settings();
+            }
+            Message::PitchToggle => {
+                self.pitch = !self.pitch;
+                self.apply_speed();
+                self.save_settings();
+            }
+            Message::ReverbSet(reverb) => {
+                self.reverb = reverb;
                 self.apply_speed();
                 self.save_settings();
             }
@@ -6586,8 +6678,10 @@ impl App {
                 }
                 self.media = hwnd.map(Media::new);
                 // У предпросмотров значка нет: их закрывают снаружи, и он оставался бы висеть.
+                // Статуса в Discord у них тоже нет: он затёр бы статус настоящего Tune.
                 if self.preview.is_none() {
                     tray::start();
+                    self.discord = Some(discord::spawn(self.discord_prefs.clone()));
                 }
             }
             // Как у Tune Client: крестик прячет окно в трей, если это не выключено в настройках.
@@ -6840,7 +6934,24 @@ impl App {
                 self.seeking = Some((from + step).clamp(0.0, (end - 1.0).max(0.0)));
                 return self.update(Message::SeekDone);
             }
-            Message::VolumeBy(step) => return self.handle(Message::Volume((self.volume + step).clamp(0.0, 1.0))),
+            // Шагов, а не долей: размер шага — в настройках.
+            Message::VolumeBy(steps) => {
+                let volume = (self.volume + steps * f32::from(self.volume_step) / 100.0).clamp(0.0, 1.0);
+                return self.handle(Message::Volume((volume * 100.0).round() / 100.0));
+            }
+            Message::VolumeWheel(steps) => {
+                if self.volume_wheel && steps != 0.0 {
+                    return self.handle(Message::VolumeBy(steps.signum()));
+                }
+            }
+            Message::VolumeWheelToggle => {
+                self.volume_wheel = !self.volume_wheel;
+                self.save_settings();
+            }
+            Message::VolumeStepSet(step) => {
+                self.volume_step = step;
+                self.save_settings();
+            }
             Message::LikeCurrent => {
                 if let Some(track) = self.current_track().cloned() {
                     return self.handle(Message::Like(track));
@@ -7678,10 +7789,22 @@ impl App {
             // Качество и эквалайзер — одна кнопка, как в оригинале.
             tools = tools.push(tool(ui::TUNE, self.quality == Quality::Lossless || self.eq.enabled, Message::EqOpen, "Настройки звука"));
         }
-        if quality && self.current_track().is_some_and(|track| track.remember) {
+        if quality && self.current_track().is_some_and(|track| track.remember || self.speed_control) {
             let label = format!("{}×", speed_label(self.speed));
             let face = container(text(label).size(14).font(ui::font_medium()).color(if self.speed == 1.0 { ui::c().muted } else { ui::c().accent })).center_y(size).width(SPEED_TOOL - 8.0).align_x(Alignment::Center);
-            tools = tools.push(hint(glow(button(face).padding(4).style(ui::ghost).on_press(Message::SpeedNext), 20.0), "Скорость"));
+            let button = glow(button(face).padding(4).style(ui::ghost).on_press(Message::SpeedNext), 20.0);
+            if self.speed_control {
+                // Как у Tune Client: колесо — по шагу, правый клик — обычная скорость.
+                let control = mouse_area(button).on_right_press(Message::SpeedStep(0)).on_scroll(|delta| {
+                    let y = match delta {
+                        mouse::ScrollDelta::Lines { y, .. } | mouse::ScrollDelta::Pixels { y, .. } => y,
+                    };
+                    Message::SpeedStep(if y > 0.0 { 1 } else if y < 0.0 { -1 } else { 0 })
+                });
+                tools = tools.push(hint(control, "Скорость: клик — быстрее, колесо — по шагу, правый клик — 1×"));
+            } else {
+                tools = tools.push(hint(button, "Скорость"));
+            }
         }
         if self.current_track().is_some_and(|track| track.lyrics) {
             tools = tools.push(tool(ui::LYRICS, self.section == Section::Lyrics, Message::LyricsToggle, "Показать текст песни"));
@@ -7691,6 +7814,26 @@ impl App {
 
     fn more_button<'a>(&self, track: &Track, size: f32) -> Element<'a, Message> {
         hint(glow(button(container(ui::icon(ui::MORE, size, ui::c().muted)).center(LIKE)).padding(0).style(ui::ghost).on_press(Message::MenuOpen(track.clone())), 20.0), "Ещё")
+    }
+
+    /// Отправляет трек в Discord, только когда меняется что-то видное там: трек, пауза
+    /// или место в треке (перемотка), — а не на каждый кадр.
+    fn discord_sync(&mut self, track: Option<&Track>, playing: bool, position: Duration) {
+        let Some(handle) = &self.discord else { return };
+        let id = track.map_or_else(String::new, |track| track.id.clone());
+        let at = position.as_secs_f64();
+        let fresh = match &self.discord_sent {
+            Some((sent, was, when, from)) => {
+                let expected = if *was { from + when.elapsed().as_secs_f64() } else { *from };
+                *sent == id && *was == playing && (!playing || (expected - at).abs() < 3.0)
+            }
+            None => false,
+        };
+        if fresh {
+            return;
+        }
+        handle.update(track.map(|track| discord::Track::of(track, playing, position)));
+        self.discord_sent = Some((id, playing, Instant::now(), at));
     }
 
     /// Заголовок окна: «Исполнитель — трек», как у Tune Client, или просто «Tune».
@@ -8107,6 +8250,7 @@ impl App {
                 .spacing(28)
                 .into()
             }
+            SettingsTab::Discord => self.view_discord_settings(),
             SettingsTab::Sound => {
                 let quality = Quality::ALL.into_iter().fold(row![].spacing(8), |line, quality| line.push(choice(quality.label(), quality == self.quality, Message::QualitySet(quality))));
                 let mut sound = column![title("Качество звука"), quality].spacing(12);
@@ -8116,9 +8260,38 @@ impl App {
                         sound = sound.push(text("Яндекс не дал этот трек в выбранном качестве: играет лучшее, что есть для вашего аккаунта").size(13).color(ui::c().muted));
                     }
                 }
+                let steps = settings::VOLUME_STEPS.into_iter().fold(row![].spacing(8), |line, step| {
+                    line.push(shine(button(text(format!("{step} %")).size(14)).padding([7, 16]).style(ui::chip(step == self.volume_step)).on_press(Message::VolumeStepSet(step)), 18.0))
+                });
                 column![
                     sound,
                     self.view_equalizer(),
+                    {
+                        let steps = settings::SPEED_STEPS.iter().enumerate().fold(row![].spacing(8), |line, (index, step)| {
+                            line.push(shine(button(text(format!("{}×", speed_label(*step))).size(14)).padding([7, 16]).style(ui::chip(*step == self.speed_step)).on_press(Message::SpeedStepSet(index as u8)), 18.0))
+                        });
+                        let reverbs = [0u8, 15, 30, 50, 75].into_iter().fold(row![].spacing(8), |line, reverb| {
+                            let label = if reverb == 0 { "Выключен".to_string() } else { format!("{reverb} %") };
+                            line.push(shine(button(text(label).size(14)).padding([7, 16]).style(ui::chip(reverb == self.reverb)).on_press(Message::ReverbSet(reverb)), 18.0))
+                        });
+                        let mut effects = column![
+                            title("Скорость и эффекты"),
+                            toggle("Кнопка скорости для музыки", "У громкости, от 0,5× до 2×: клик — быстрее, колесо над кнопкой — по шагу, правый клик — обычная скорость. У книг и подкастов кнопка есть всегда", Some(self.speed_control), Some(Message::SpeedControlToggle)),
+                        ]
+                        .spacing(8);
+                        if self.speed_control {
+                            effects = effects
+                                .push(container(column![text("Шаг скорости").color(ui::c().text), steps.wrap().vertical_spacing(8)].spacing(10)).padding(8))
+                                .push(toggle("Тон вместе со скоростью", "Быстрее — выше, как в найткоре; медленнее — ниже, как в слоуде. Иначе голос звучит своим тоном на любой скорости", Some(self.pitch), Some(Message::PitchToggle)));
+                        }
+                        effects.push(container(column![column![text("Реверб").color(ui::c().text), text("Эхо большого зала поверх трека — с замедлением получается slowed + reverb").size(13).color(ui::c().muted)].spacing(2), reverbs.wrap().vertical_spacing(8)].spacing(10)).padding(8))
+                    },
+                    column![
+                        title("Управление"),
+                        toggle("Громкость колесом мыши", "Над панелью плеера", Some(self.volume_wheel), Some(Message::VolumeWheelToggle)),
+                        container(column![column![text("Шаг громкости").color(ui::c().text), text("Для колеса мыши и стрелок ↑ и ↓").size(13).color(ui::c().muted)].spacing(2), steps].spacing(10)).padding(8),
+                    ]
+                    .spacing(8),
                     group("Воспроизведение", vec![
                         toggle("Плавные переходы между треками", "Конец трека перетекает в начало следующего", Some(self.crossfade), Some(Message::CrossfadeToggle)),
                         toggle("Одинаковая громкость треков", "Тихие и громкие записи звучат на одном уровне, по данным Яндекса о громкости трека", Some(self.normalize), Some(Message::NormalizeToggle)),
@@ -8153,6 +8326,94 @@ impl App {
         let body = container(content).max_width(700).padding(Padding::ZERO.right(20));
         let scroll = ui::scroll(body).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill);
         column![head, scroll].spacing(24).height(Length::Fill).into()
+    }
+
+    /// Вкладка «Discord»: те же пункты, что у Tune Client.
+    fn view_discord_settings(&self) -> Element<'_, Message> {
+        let prefs = &self.discord_prefs;
+        let title = |label| text(label).size(20).font(ui::font_medium()).color(ui::c().text);
+        let with = |change: &dyn Fn(&mut discord::Prefs)| {
+            let mut next = prefs.clone();
+            change(&mut next);
+            Message::DiscordSet(next)
+        };
+        let toggle = |label: &'static str, about: &'static str, on: bool, press: Message| -> Element<'_, Message> {
+            let line = row![column![text(label).color(ui::c().text), text(about).size(13).color(ui::c().muted)].spacing(2).width(Length::Fill), view_switch(Some(on))].spacing(16).align_y(Alignment::Center);
+            glow(button(line).width(Length::Fill).padding(8).style(ui::row).on_press(press), 8.0)
+        };
+        let choice = |label: &'static str, chosen: bool, press: Message| shine(button(text(label).size(14)).padding([7, 16]).style(ui::chip(chosen)).on_press(press), 18.0);
+        // Строка с подписью сверху и полем или выбором под ней.
+        let labeled = |label: &'static str, about: &'static str, control: Element<'static, Message>| -> Element<'static, Message> {
+            let mut head = column![text(label).color(ui::c().text)].spacing(2);
+            if !about.is_empty() {
+                head = head.push(text(about).size(13).color(ui::c().muted));
+            }
+            container(column![head, control].spacing(10)).padding(8).into()
+        };
+        let field = |value: &str, hint: &str, apply: fn(&mut discord::Prefs, String)| -> Element<'static, Message> {
+            let base = prefs.clone();
+            text_input(hint, value)
+                .on_input(move |value| {
+                    let mut next = base.clone();
+                    apply(&mut next, value);
+                    Message::DiscordSet(next)
+                })
+                .padding([9, 14])
+                .size(14)
+                .style(ui::input)
+                .into()
+        };
+        let targets = |current: discord::Target, apply: fn(&mut discord::Prefs, discord::Target)| -> Element<'static, Message> {
+            discord::Target::ALL
+                .into_iter()
+                .fold(row![].spacing(8), |line, target| {
+                    let mut next = prefs.clone();
+                    apply(&mut next, target);
+                    line.push(choice(target.label(), target == current, Message::DiscordSet(next)))
+                })
+                .wrap()
+                .vertical_spacing(8)
+                .into()
+        };
+        let displays = discord::Display::ALL.into_iter().fold(row![].spacing(8), |line, display| line.push(choice(display.label(), display == prefs.display, with(&|p| p.display = display)))).wrap().vertical_spacing(8);
+        let mut page = column![column![
+            title("Статус"),
+            toggle("Показывать трек в статусе Discord", "Discord на этом компьютере покажет «Слушает …» с треком и обложкой", prefs.enabled, with(&|p| p.enabled = !p.enabled)),
+        ]
+        .spacing(8)]
+        .spacing(28);
+        if !prefs.enabled {
+            return page.into();
+        }
+        page = page
+            .push(column![
+                labeled("Название активности", "Discord покажет «Слушает …»", field(&prefs.name, "Tune Music", |p, v| p.name = v)),
+                labeled("Подпись в списке участников", "Что видно рядом с ником, без открытия профиля", displays.into()),
+                toggle("Полоса времени", "Сколько прошло и сколько осталось", prefs.show_progress, with(&|p| p.show_progress = !p.show_progress)),
+                toggle("Оставлять статус на паузе", "Иначе статус пропадает, пока музыка на паузе", prefs.show_paused, with(&|p| p.show_paused = !p.show_paused)),
+            ].spacing(8))
+            .push(column![
+                title("Картинки"),
+                toggle("Обложка трека", "Иначе вместо обложки — значок", prefs.show_cover, with(&|p| p.show_cover = !p.show_cover)),
+                toggle("Значок на обложке", "Маленький значок в углу обложки, при наведении — «Играет» или «Пауза»", prefs.small_icon, with(&|p| p.small_icon = !p.small_icon)),
+                labeled("Картинка значка", "Ссылка на картинку в интернете (https://…). Пусто — значок Tune", field(&prefs.icon_url, "https://…", |p, v| p.icon_url = v)),
+            ].spacing(8))
+            .push(column![
+                title("Ссылки при клике"),
+                labeled("Название трека", "", targets(prefs.title_link, |p, t| p.title_link = t)),
+                labeled("Исполнитель", "", targets(prefs.artist_link, |p, t| p.artist_link = t)),
+                labeled("Обложка и альбом", "Discord открывает одну ссылку и по обложке, и по строке с альбомом", targets(prefs.cover_link, |p, t| p.cover_link = t)),
+                labeled("Значок на обложке", "", targets(prefs.icon_link, |p, t| p.icon_link = t)),
+            ].spacing(8))
+            .push(column![
+                title("Кнопка"),
+                toggle("Кнопка «Tune Music»", "Под статусом, ведёт на сайт Tune. Её видят другие в Discord для компьютера, в своём профиле Discord её не показывает", prefs.site_button, with(&|p| p.site_button = !p.site_button)),
+            ].spacing(8))
+            .push(column![
+                title("Дополнительно"),
+                labeled("Своё приложение Discord (ID)", "Необязательно: название и так задаётся выше. Пусто — встроенное", field(&prefs.app_id, "1300258490815741952", |p, v| p.app_id = v)),
+            ].spacing(8));
+        page.into()
     }
 
     /// Сколько скачано и сколько места занимает, с переходом к списку и очисткой.
@@ -9320,7 +9581,7 @@ impl App {
         }
 
         let lyrics = if track.lyrics { BAR_TOOL + 6.0 } else { 0.0 };
-        let speed = if track.remember { SPEED_TOOL + 6.0 } else { 0.0 };
+        let speed = if track.remember || self.speed_control { SPEED_TOOL + 6.0 } else { 0.0 };
         let tools = lyrics + speed + 3.0 * BAR_TOOL + 12.0;
         let slider_room = (zone - tools - BAR_VOLUME_ICON - 14.0).clamp(BAR_SLIDER_MIN, BAR_SLIDER_MAX);
         let mut right = row![self.view_tools(22.0, true)].spacing(8).align_y(Alignment::Center);
@@ -9347,16 +9608,28 @@ impl App {
         } else {
             Space::new().height(0).into()
         };
+        let bar = container(column![
+            top,
+            container(self.seek_line(track, Length::Fill)).padding([0, 8]).height(SEEK_HEIGHT),
+            container(controls).padding([0, 8]).center_y(BAR_HEIGHT - 4.0).width(Length::Fill),
+        ])
+        .padding(Padding::ZERO.top(4))
+        .width(Length::Fill)
+        .style(ui::player);
+        if !self.volume_wheel {
+            return Some(bar.into());
+        }
+        // Как у Tune Client: колесо над плеером меняет громкость.
         Some(
-            container(column![
-                top,
-                container(self.seek_line(track, Length::Fill)).padding([0, 8]).height(SEEK_HEIGHT),
-                container(controls).padding([0, 8]).center_y(BAR_HEIGHT - 4.0).width(Length::Fill),
-            ])
-            .padding(Padding::ZERO.top(4))
-            .width(Length::Fill)
-            .style(ui::player)
-            .into(),
+            mouse_area(bar)
+                .on_scroll(|delta| {
+                    let y = match delta {
+                        mouse::ScrollDelta::Lines { y, .. } => y,
+                        mouse::ScrollDelta::Pixels { y, .. } => y / 40.0,
+                    };
+                    Message::VolumeWheel(y)
+                })
+                .into(),
         )
     }
 }
@@ -10002,8 +10275,8 @@ fn hotkey(key: &keyboard::Key, physical: keyboard::key::Physical, modifiers: key
             Named::Space => Message::Toggle,
             Named::ArrowRight => Message::SeekBy(SEEK_STEP),
             Named::ArrowLeft => Message::SeekBy(-SEEK_STEP),
-            Named::ArrowUp => Message::VolumeBy(VOLUME_STEP),
-            Named::ArrowDown => Message::VolumeBy(-VOLUME_STEP),
+            Named::ArrowUp => Message::VolumeBy(1.0),
+            Named::ArrowDown => Message::VolumeBy(-1.0),
             _ => return None,
         };
         return Some(message);
@@ -10085,6 +10358,7 @@ fn eq_place((x, y): (f32, f32)) -> (f32, f32) {
 enum SettingsTab {
     Main,
     Window,
+    Discord,
     Sound,
     Recommendations,
     Downloads,
@@ -10093,12 +10367,13 @@ enum SettingsTab {
 }
 
 impl SettingsTab {
-    const ALL: [SettingsTab; 7] = [SettingsTab::Main, SettingsTab::Window, SettingsTab::Sound, SettingsTab::Recommendations, SettingsTab::Downloads, SettingsTab::Hotkeys, SettingsTab::Account];
+    const ALL: [SettingsTab; 8] = [SettingsTab::Main, SettingsTab::Window, SettingsTab::Discord, SettingsTab::Sound, SettingsTab::Recommendations, SettingsTab::Downloads, SettingsTab::Hotkeys, SettingsTab::Account];
 
     fn label(self) -> &'static str {
         match self {
             SettingsTab::Main => "Основные",
             SettingsTab::Window => "Окно",
+            SettingsTab::Discord => "Discord",
             SettingsTab::Sound => "Звук",
             SettingsTab::Recommendations => "Рекомендации",
             SettingsTab::Downloads => "Скачанное",

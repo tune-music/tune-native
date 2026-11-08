@@ -141,7 +141,28 @@ pub struct Settings {
     /// а не на сервере: Ynison у части аккаунтов их не отдаёт.
     pub keep_track: bool,
     pub window: WindowPrefs,
+    /// Громкость колесом мыши над плеером, как у Tune Client.
+    pub volume_wheel: bool,
+    /// Шаг громкости в процентах: для колеса и стрелок.
+    pub volume_step: u8,
+    /// Кнопка скорости для любых треков, а не только книг и подкастов, как у Tune Client.
+    pub speed_control: bool,
+    /// Шаг кнопки скорости.
+    pub speed_step: f32,
+    /// Тон меняется вместе со скоростью: найткор и слоуд.
+    pub pitch: bool,
+    /// Реверб, 0–100 %: доля зала в звуке.
+    pub reverb: u8,
 }
+
+/// Шаги кнопки скорости на выбор, как у Tune Client.
+pub const SPEED_STEPS: [f32; 3] = [0.05, 0.1, 0.25];
+/// Пределы скорости с кнопкой для любых треков.
+pub const SPEED_MIN: f32 = 0.5;
+pub const SPEED_MAX: f32 = 2.0;
+
+/// Шаги громкости на выбор, в процентах.
+pub const VOLUME_STEPS: [u8; 4] = [1, 2, 5, 10];
 
 /// Окно и запуск — как во вкладке «Окно» у Tune Client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,9 +207,15 @@ fn parse(v: &Value) -> Settings {
         concerts: v["concerts"].as_bool().unwrap_or(true),
         words: v["words"].as_bool().unwrap_or(true),
         wheel: v["wheel"].as_bool().unwrap_or(true),
-        speed: v["speed"].as_f64().map(|x| x as f32).filter(|x| SPEEDS.contains(x)).unwrap_or(1.0),
+        speed: v["speed"].as_f64().map(|x| ((x * 100.0).round() / 100.0) as f32).filter(|x| (SPEED_MIN..=SPEED_MAX).contains(x)).unwrap_or(1.0),
         look: Look::ALL.into_iter().find(|look| v["theme"].as_str() == Some(look.code())).unwrap_or(Look::Dark),
         keep_track: v["keepTrack"].as_bool().unwrap_or(true),
+        volume_wheel: v["volumeWheel"].as_bool().unwrap_or(true),
+        speed_control: v["speedControl"].as_bool().unwrap_or(false),
+        speed_step: v["speedStep"].as_f64().map(|x| x as f32).filter(|x| SPEED_STEPS.contains(x)).unwrap_or(0.25),
+        pitch: v["pitchWithSpeed"].as_bool().unwrap_or(false),
+        reverb: v["reverb"].as_u64().map_or(0, |x| x.min(100) as u8),
+        volume_step: v["volumeStep"].as_u64().map(|step| step as u8).filter(|step| VOLUME_STEPS.contains(step)).unwrap_or(5),
         window: {
             let base = WindowPrefs::default();
             let w = &v["window"];
@@ -229,7 +256,7 @@ pub fn save(settings: Settings) {
     let equalizer = json!({ "enabled": eq.enabled, "preset": eq.preset, "preamp": eq.preamp, "gains": eq.gains });
     let w = settings.window;
     let window = json!({ "autostart": w.autostart, "startMinimized": w.start_minimized, "closeToTray": w.close_to_tray, "trackTitle": w.track_title });
-    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "books": settings.books, "concerts": settings.concerts, "words": settings.words, "wheel": settings.wheel, "speed": settings.speed, "theme": settings.look.code(), "keepTrack": settings.keep_track, "window": window });
+    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "books": settings.books, "concerts": settings.concerts, "words": settings.words, "wheel": settings.wheel, "speed": settings.speed, "theme": settings.look.code(), "keepTrack": settings.keep_track, "window": window, "volumeWheel": settings.volume_wheel, "volumeStep": settings.volume_step, "speedControl": settings.speed_control, "speedStep": settings.speed_step, "pitchWithSpeed": settings.pitch, "reverb": settings.reverb });
     let dir = api::data_dir();
     if fs::create_dir_all(&dir).is_ok() {
         let _ = fs::write(dir.join("settings.json"), value.to_string());
@@ -243,18 +270,20 @@ mod tests {
     #[test]
     fn reads_saved_and_broken_values() {
         let saved = parse(&json!({ "volume": 0.25, "muted": true, "repeat": "one", "shuffle": true, "quality": "lossless", "normalize": true }));
-        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default(), crossfade: true, normalize: true, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, keep_track: true, window: WindowPrefs::default() });
+        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default(), crossfade: true, normalize: true, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, keep_track: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0 });
         let empty = parse(&Value::Null);
-        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default(), crossfade: true, normalize: false, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, keep_track: true, window: WindowPrefs::default() });
+        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default(), crossfade: true, normalize: false, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, keep_track: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0 });
         assert!(!parse(&json!({ "crossfade": false })).crossfade);
         assert!(!parse(&json!({ "kids": false })).kids);
         assert!(!parse(&json!({ "books": false })).books && !parse(&json!({ "concerts": false })).concerts);
         assert!(!parse(&json!({ "keepTrack": false })).keep_track);
+        assert_eq!((parse(&json!({ "volumeStep": 2 })).volume_step, parse(&json!({ "volumeStep": 7 })).volume_step), (2, 5));
         let window = parse(&json!({ "window": { "autostart": true, "closeToTray": false } })).window;
         assert_eq!(window, WindowPrefs { autostart: true, start_minimized: false, close_to_tray: false, track_title: false });
         assert!(!parse(&json!({ "words": false })).words);
         assert_eq!((parse(&json!({ "theme": "system" })).look, parse(&json!({ "theme": "pink" })).look), (Look::System, Look::Dark));
-        assert_eq!((parse(&json!({ "speed": 1.5 })).speed, parse(&json!({ "speed": 7 })).speed), (1.5, 1.0));
+        assert_eq!((parse(&json!({ "speed": 1.5 })).speed, parse(&json!({ "speed": 7 })).speed, parse(&json!({ "speed": 0.75 })).speed), (1.5, 1.0, 0.75));
+        assert_eq!((parse(&json!({ "reverb": 250 })).reverb, parse(&json!({ "speedStep": 0.1 })).speed_step, parse(&json!({ "speedStep": 3 })).speed_step), (100, 0.1, 0.25));
         let eq = parse(&json!({ "equalizer": { "enabled": true, "preset": 14, "preamp": 9, "gains": [40, -3.5] } })).eq;
         assert_eq!((eq.enabled, eq.preset, eq.preamp, eq.gains[0], eq.gains[1], eq.gains[2]), (true, 14, 1.5, 12.0, -3.5, 0.0));
         assert_eq!(parse(&json!({ "volume": 7 })).volume, 1.0);

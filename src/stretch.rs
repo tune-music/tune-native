@@ -2,8 +2,11 @@
 //! с перекрытием в половину; при ускорении окна берутся из входа чаще, чем выходят, и каждое
 //! сдвигается в пределах нескольких миллисекунд туда, где оно лучше всего ложится на предыдущее.
 //! На скорости 1 звук проходит как есть.
+//!
+//! Если тон должен меняться вместе со скоростью (найткор и слоуд, как у Tune Client), звук не
+//! растягивается, а пересчитывается на другую частоту: быстрее — выше, медленнее — ниже.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,13 +20,14 @@ const SEEK_SECS: f64 = 0.012;
 /// Сравниваются не все отсчёты, а каждый N-й: на слух не отличить, а считать вчетверо меньше.
 const STRIDE: usize = 4;
 
-/// Скорость, общая для плеера и играющего трека: меняется на ходу.
+/// Скорость, общая для плеера и играющего трека: меняется на ходу. Вторая половина —
+/// меняется ли с ней тон.
 #[derive(Clone)]
-pub struct Speed(Arc<AtomicU32>);
+pub struct Speed(Arc<AtomicU32>, Arc<AtomicBool>);
 
 impl Default for Speed {
     fn default() -> Self {
-        Self(Arc::new(AtomicU32::new(1.0f32.to_bits())))
+        Self(Arc::new(AtomicU32::new(1.0f32.to_bits())), Arc::new(AtomicBool::new(false)))
     }
 }
 
@@ -35,7 +39,18 @@ impl Speed {
     pub fn get(&self) -> f32 {
         f32::from_bits(self.0.load(Ordering::Acquire))
     }
+
+    pub fn set_pitch(&self, pitch: bool) {
+        self.1.store(pitch, Ordering::Release);
+    }
+
+    pub fn pitch(&self) -> bool {
+        self.1.load(Ordering::Acquire)
+    }
 }
+
+/// Сколько кадров пересчитывается за раз в режиме с тоном.
+const RESAMPLE_FRAMES: usize = 512;
 
 /// Место в треке: при ускорении на выходе меньше отсчётов, чем прошло трека, поэтому счётчик
 /// вывода врёт, а это место — нет.
@@ -60,6 +75,8 @@ enum Mode {
     Stretch { prev: u64, nominal: f64 },
     /// Скорость вернулась к 1: дотекает то, что уже лежит в буфере, начиная с кадра `next`.
     Drain { next: u64 },
+    /// Тон вместе со скоростью: `pos` — дробный номер кадра входа, который звучит сейчас.
+    Resample { pos: f64 },
 }
 
 pub struct Stretched<S> {
@@ -182,9 +199,41 @@ impl<S: Source> Stretched<S> {
         self.out.clear();
         self.out_at = 0;
         let speed = self.speed.get() as f64;
+        let pitch = self.speed.pitch();
         let hop = self.hop as u64;
         match self.mode {
             Mode::Direct => unreachable!(),
+            Mode::Resample { pos } => {
+                // Скорость вернулась к 1 или тон больше не нужен: дотекает буфер, дальше
+                // снова напрямую или растяжением.
+                if speed == 1.0 || !pitch {
+                    self.mode = Mode::Drain { next: pos.ceil() as u64 };
+                    return true;
+                }
+                let mut pos = pos;
+                for _ in 0..RESAMPLE_FRAMES {
+                    let frame = pos.floor() as u64;
+                    if !self.fill(frame + 1) {
+                        self.ended = true;
+                        break;
+                    }
+                    let part = (pos - frame as f64) as f32;
+                    let (a, b) = (self.at(frame) * self.channels, self.at(frame + 1) * self.channels);
+                    for c in 0..self.channels {
+                        self.out.push(self.buf[a + c] * (1.0 - part) + self.buf[b + c] * part);
+                    }
+                    pos += speed;
+                }
+                self.tick(pos);
+                self.forget(pos.floor() as u64);
+                if self.ended {
+                    self.forget(u64::MAX);
+                    self.mode = Mode::Direct;
+                    return !self.out.is_empty();
+                }
+                self.mode = Mode::Resample { pos };
+                return true;
+            }
             Mode::Drain { next } => {
                 // Дотекает буфер, дальше снова напрямую.
                 let at = self.at(next.max(self.buf_start));
@@ -195,6 +244,8 @@ impl<S: Source> Stretched<S> {
                 return !self.out.is_empty() || !self.ended;
             }
             Mode::Stretch { prev, nominal } => {
+                // Включили тон: растяжение доигрывает окно, как при возврате к скорости 1.
+                let speed = if pitch { 1.0 } else { speed };
                 let natural = prev + hop;
                 let nominal = if speed == 1.0 { natural as f64 } else { nominal + hop as f64 * speed };
                 let around = nominal.round() as u64;
@@ -240,6 +291,11 @@ impl<S: Source> Iterator for Stretched<S> {
             }
             if matches!(self.mode, Mode::Direct) {
                 // Скорость меняется только на границе кадра, чтобы каналы не съехали.
+                if self.channel == 0 && self.speed.get() != 1.0 && !self.ended && self.speed.pitch() {
+                    self.buf_start = self.taken;
+                    self.mode = Mode::Resample { pos: self.taken as f64 };
+                    continue;
+                }
                 if self.channel == 0 && self.speed.get() != 1.0 && !self.ended {
                     let start = self.taken;
                     self.buf_start = start;
@@ -355,6 +411,43 @@ mod tests {
         let left: Vec<f32> = out.chunks(2).map(|frame| frame[0]).collect();
         let crossings = left.windows(2).filter(|pair| (pair[0] < 0.0) != (pair[1] < 0.0)).count() as f32 / seconds;
         assert!((crossings - 400.0).abs() < 20.0, "{crossings}");
+    }
+
+    #[test]
+    fn pitch_mode_raises_tone_with_speed() {
+        let speed = Speed::default();
+        speed.set(2.0);
+        speed.set_pitch(true);
+        let clock = Clock::default();
+        let out: Vec<f32> = Stretched::new(tone(2.0), speed, clock.clone()).collect();
+        let seconds = out.len() as f32 / 2.0 / 8000.0;
+        assert!((seconds - 1.0).abs() < 0.02, "{seconds}");
+        assert!(clock.get().as_secs_f32() > 1.95, "{:?}", clock.get());
+        assert!(out.chunks(2).all(|frame| (frame[0] + frame[1]).abs() < 1e-4));
+        // Тон вдвое выше: синус 200 Гц звучит как 400 Гц — 800 переходов через ноль в секунду.
+        let left: Vec<f32> = out.chunks(2).map(|frame| frame[0]).collect();
+        let crossings = left.windows(2).filter(|pair| (pair[0] < 0.0) != (pair[1] < 0.0)).count() as f32 / seconds;
+        assert!((crossings - 800.0).abs() < 30.0, "{crossings}");
+    }
+
+    #[test]
+    fn pitch_switches_midway_without_losing_samples() {
+        let speed = Speed::default();
+        speed.set(0.5);
+        let mut stretched = Stretched::new(tone(2.0), speed.clone(), Clock::default());
+        let mut count = 0;
+        for (n, _) in stretched.by_ref().enumerate() {
+            count += 1;
+            if n == 8000 {
+                speed.set_pitch(true);
+            }
+            if n == 24000 {
+                speed.set_pitch(false);
+            }
+        }
+        // Вдвое медленнее и так и эдак: около четырёх секунд.
+        let seconds = count as f32 / 2.0 / 8000.0;
+        assert!(seconds > 3.7 && seconds < 4.3, "{seconds}");
     }
 
     #[test]

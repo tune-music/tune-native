@@ -251,6 +251,7 @@ pub struct Player {
     eq: Shared,
     /// Скорость и место играющего трека: при ускорении счётчик вывода отстаёт от трека.
     speed: Speed,
+    reverb: crate::reverb::Amount,
     clock: Arc<Mutex<Option<Clock>>>,
     _device: Arc<Mutex<Option<SendDevice>>>,
     /// Сигнал, что устройство пропало и его надо открыть заново.
@@ -428,6 +429,7 @@ impl Player {
             hold: Arc::default(),
             eq: Shared::default(),
             speed: Speed::default(),
+            reverb: crate::reverb::Amount::default(),
             clock: Arc::default(),
             _device: slot,
             device_lost: signal,
@@ -562,7 +564,8 @@ impl Player {
         let output = self.output();
         let clock = Clock::default();
         *self.clock.lock().unwrap() = Some(clock.clone());
-        output.append(Stretched::new(Faded::new(Equalized::new(decoder, self.eq.clone()), fade_in, fade_out), self.speed.clone(), clock));
+        let stretched = Stretched::new(Faded::new(Equalized::new(decoder, self.eq.clone()), fade_in, fade_out), self.speed.clone(), clock);
+        output.append(crate::reverb::Reverb::new(stretched, self.reverb.clone()));
         // Если переход начинается не с нуля, новый трек сразу встаёт на свою точку.
         if let Some((start, _)) = fade_in.filter(|(start, _)| *start > 0.05) {
             let _ = output.try_seek(Duration::from_secs_f32(start));
@@ -624,6 +627,16 @@ impl Player {
     /// Скорость слышна сразу, в том числе в играющем треке; высота голоса не меняется.
     pub fn set_speed(&self, speed: f32) {
         self.speed.set(speed);
+    }
+
+    /// Тон вместе со скоростью: быстрее — выше, медленнее — ниже.
+    pub fn set_pitch(&self, pitch: bool) {
+        self.speed.set_pitch(pitch);
+    }
+
+    /// Доля зала 0…1; слышна сразу, в том числе в играющем треке.
+    pub fn set_reverb(&self, amount: f32) {
+        self.reverb.set(amount);
     }
 
     /// Новые настройки эквалайзера слышны сразу, в том числе в играющем треке.
