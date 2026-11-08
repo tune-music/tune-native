@@ -1100,6 +1100,8 @@ struct App {
     /// Город для концертов; `None` — «Рядом», как определит Яндекс.
     concert_city: Option<(u64, String)>,
     concert: Option<api::ConcertPage>,
+    /// Важное сообщение Плюса над страницей.
+    red_alert: Option<api::RedAlert>,
     clip_feed: Option<api::ClipFeed>,
     /// Средний цвет крупной обложки трека: им окрашен фон плеера на всё окно.
     cover_tints: HashMap<String, iced::Color>,
@@ -1203,6 +1205,7 @@ enum Message {
     ConcertCities(Result<Vec<(u64, String)>, String>),
     ConcertCityPick(Option<(u64, String)>),
     ConcertOpen(String),
+    RedAlert(Result<Option<api::RedAlert>, String>),
     ConcertLoaded(String, Result<api::ConcertPage, String>),
     ClipFeed(Result<api::ClipFeed, String>),
     ClipFeedStart,
@@ -1746,6 +1749,7 @@ impl App {
             concert_cities: Vec::new(),
             concert_city: concerts::load_city(),
             concert: None,
+            red_alert: None,
             clip_feed: None,
             cover_tints: HashMap::new(),
             full_tint: ui::c().tile,
@@ -3836,6 +3840,10 @@ impl App {
                 | Message::ClipFeedLoaded(..)
             ) => return self.clip_handle(message),
             Message::ConcertsLoaded(..) | Message::ConcertCities(_) | Message::ConcertCityPick(_) | Message::ConcertOpen(_) | Message::ConcertLoaded(..) => return self.concert_handle(message),
+            Message::RedAlert(result) => match result {
+                Ok(alert) => self.red_alert = alert,
+                Err(error) => api::log(&format!("сообщения Плюса: {error}")),
+            },
             Message::LoginOpen => {
                 if matches!(self.screen, Screen::Login(true)) {
                     return Task::none();
@@ -3879,6 +3887,11 @@ impl App {
                 let words = self.words_load(self.current.unwrap_or(0));
                 let pins = Task::batch([pins, avatar, self.liked_pages_load(), wizard, self.wheel_load(), words, self.vibe_rooms_load()]);
                 self.ynison_start();
+                let alert = match self.token() {
+                    Some(token) if !self.offline => Task::perform(background(move || api::red_alert(&token)), Message::RedAlert),
+                    _ => Task::none(),
+                };
+                let pins = Task::batch([pins, alert]);
                 let page = match self.preview.clone() {
                     Some(Preview::Wave | Preview::WaveSeek | Preview::WaveWords | Preview::WaveWheel | Preview::WaveWheelHalf) => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
                     Some(Preview::Devices) => {
@@ -6699,6 +6712,28 @@ impl App {
         let back = ui::c().content;
         // Сдвинутая страница обрезается по своему месту: на трекбар и боковую панель не заезжает.
         let page: Element<'_, Message> = reveal(page).shift(self.page_shift.0 * rest, self.page_shift.1 * rest).veil(back.scale_alpha(rest)).clip().into();
+        let page: Element<'_, Message> = match &self.red_alert {
+            // Как у оригинала: заметная полоса над страницей, кнопка ведёт на сайт Плюса.
+            Some(alert) => {
+                let white = |_: &iced::Theme, status: button::Status| button::Style {
+                    background: Some(iced::Background::Color(if status == button::Status::Hovered { iced::Color::from_rgb(0.9, 0.9, 0.9) } else { iced::Color::WHITE })),
+                    text_color: iced::Color::BLACK,
+                    border: iced::border::rounded(24),
+                    ..button::Style::default()
+                };
+                let line = row![
+                    ui::icon(ui::INFO, 20.0, iced::Color::WHITE),
+                    text(alert.text.clone()).color(iced::Color::WHITE).width(Length::Fill),
+                    shine(button(text(alert.button.clone()).font(ui::font_medium()).color(iced::Color::BLACK)).padding([6, 14]).style(white).on_press(Message::OpenUrl(alert.href.clone())), 24.0),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center);
+                let red = ui::c().danger;
+                let bar = container(line).width(Length::Fill).padding([10, 16]).style(move |_| container::Style::default().background(red).border(iced::border::rounded(12)));
+                column![bar, page].spacing(12).height(Length::Fill).into()
+            }
+            None => page,
+        };
         let mut page = column![page].spacing(12).height(Length::Fill);
         if self.offline {
             let mut line = row![ui::icon(ui::OFFLINE, 20.0, ui::c().muted), text("Нет подключения к интернету. Скачанное слушать можно, остальное загрузится, когда связь вернётся").color(ui::c().text).width(Length::Fill)].spacing(12).align_y(Alignment::Center);

@@ -3455,6 +3455,35 @@ pub fn artist_concerts(artist: &str, location: Option<u64>, token: &str) -> Resu
     }
 }
 
+/// Важное сообщение Плюса над страницей: текст, надпись кнопки и куда она ведёт.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RedAlert {
+    pub text: String,
+    pub button: String,
+    pub href: String,
+}
+
+/// Оригинал показывает только `music-grace` — подписка не продлилась, идёт льготный период.
+pub fn red_alert(token: &str) -> Result<Option<RedAlert>, String> {
+    // Для проверки вида: своё сообщение вместо ответа Яндекса.
+    if let Ok(text) = std::env::var("TUNE_RED_ALERT") {
+        return Ok(Some(RedAlert { text, button: "Продлить".to_string(), href: "https://plus.yandex.ru/".to_string() }));
+    }
+    let v = get("proxy/plus-red-alert/v1/alerts", &[("service", "music"), ("client", "music-web"), ("platform", "web"), ("language", "ru")], token)?;
+    Ok(parse_red_alert(result(&v)))
+}
+
+fn parse_red_alert(v: &Value) -> Option<RedAlert> {
+    let alert = v["alerts"].as_array()?.iter().find(|alert| alert["id"].as_str() == Some("music-grace"))?;
+    Some(RedAlert {
+        text: alert["texts"]["bar-text"].as_str()?.to_string(),
+        button: alert["texts"]["bar-button-text"].as_str().unwrap_or("Подробнее").to_string(),
+        href: alert["clickUrl"].as_str().filter(|url| url.starts_with("https://")).unwrap_or(PLUS_PAGE).to_string(),
+    })
+}
+
+const PLUS_PAGE: &str = "https://plus.yandex.ru/";
+
 /// Обложка нужного размера, например 100x100. Нет сети — останется заглушка.
 pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
     let url = format!("https://{}", uri.trim_start_matches("https://").replace("%%", size));
@@ -3557,6 +3586,13 @@ mod tests {
         assert_eq!(thousands(950), "950");
         let venue = parse_venue(&serde_json::json!({"address": "ул. 1", "metroStations": [{"title": "ЗИЛ", "line-color": "#ff4c4c"}], "map": {"imageUrl": "https://static-maps.yandex.ru/1.x/?size=%%", "url": "https://maps.yandex.ru/?z=16"}}));
         assert_eq!(venue.metro, vec![("ЗИЛ".to_string(), Some("#ff4c4c".to_string()))]);
+    }
+
+    #[test]
+    fn red_alert_only_grace() {
+        let v = serde_json::json!({"alerts": [{"id": "other", "texts": {"bar-text": "x"}}, {"id": "music-grace", "texts": {"bar-text": "Не получилось продлить Плюс", "bar-button-text": "Оплатить"}, "clickUrl": "https://plus.yandex.ru/pay"}]});
+        assert_eq!(parse_red_alert(&v), Some(RedAlert { text: "Не получилось продлить Плюс".to_string(), button: "Оплатить".to_string(), href: "https://plus.yandex.ru/pay".to_string() }));
+        assert_eq!(parse_red_alert(&serde_json::json!({"alerts": []})), None);
     }
 
     #[test]
