@@ -1,12 +1,12 @@
-# Значок Tune Native: значок Tune Client (ползунки на тёмном квадрате), только ручки
-# ползунков — жёлтые кружки цвета акцента Native вместо белых черт.
+# Значок Tune Native: значок Tune Client (ползунки на тёмном квадрате) в его цветах, только
+# ручки ползунков — белые кружки вместо черт.
 # Запуск: python make_icon.py — рядом появятся tune.ico и tune.png (256×256).
 from pathlib import Path
 from PIL import Image, ImageDraw
 
 OUT = Path(__file__).parent
 S = 4  # рисуем крупнее и уменьшаем: края сглаживаются
-BG, TRACK, KNOB = "#18181b", "#fafafa", "#ffee00"
+BG, TRACK, KNOB = "#18181b", "#facc15", "#fafafa"
 
 
 def draw(size):

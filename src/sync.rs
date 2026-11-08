@@ -251,9 +251,11 @@ impl App {
     /// Окно со списком устройств над трекбаром.
     pub(crate) fn view_devices(&self, x: f32) -> Option<Element<'_, Message>> {
         let y = self.ynison.as_ref()?;
+        let (alpha, live) = (self.devices_fade.shown(), self.devices_fade.live);
+        let fade = |color: iced::Color| color.scale_alpha(alpha);
         let me = y.device_id();
         let active = self.ynison_state.active.as_deref();
-        let mut list = column![text("Устройства").size(16).font(ui::font_medium()).color(ui::c().text)].spacing(4);
+        let mut list = column![text("Устройства").size(16).font(ui::font_medium()).color(fade(ui::c().text))].spacing(4);
         let connected = y.connected();
         let mut devices: Vec<ynison::Device> = if connected { self.ynison_state.devices.iter().filter(|device| device.id != me && device.can_play).cloned().collect() } else { Vec::new() };
         let note = match (connected, devices.is_empty()) {
@@ -264,20 +266,20 @@ impl App {
         devices.insert(0, ynison::Device { id: me.to_string(), title: "Это устройство".to_string(), kind: "WEB_DESKTOP".to_string(), can_play: true });
         for device in devices {
             let playing = active == Some(device.id.as_str());
-            let tint = if playing { ui::c().accent } else { ui::c().text };
+            let tint = fade(if playing { ui::c().accent } else { ui::c().text });
             let mut words = column![text(device.title.clone()).size(14).color(tint)];
             let kind = if playing { "Играет сейчас".to_string() } else { device_kind(&device.kind).to_string() };
             if !kind.is_empty() {
-                words = words.push(text(kind).size(12).color(ui::c().muted));
+                words = words.push(text(kind).size(12).color(fade(ui::c().muted)));
             }
             let line = row![ui::icon(ui::DEVICES, 22.0, tint), words].spacing(10).align_y(Alignment::Center);
-            list = list.push(glow(button(line).width(Length::Fill).padding([8, 8]).style(ui::row).on_press(Message::DeviceSelect(device.id.clone())), 8.0));
+            list = list.push(glow(button(line).width(Length::Fill).padding([8, 8]).style(ui::button_faded(ui::row, alpha)).on_press(Message::DeviceSelect(device.id.clone())), 8.0));
         }
         if let Some(note) = note {
-            list = list.push(container(text(note).size(13).color(ui::c().muted)).padding([4, 8]));
+            list = list.push(container(text(note).size(13).color(fade(ui::c().muted))).padding([4, 8]));
         }
         let bottom = self.bar_top_y() - 12.0;
-        Some(popup_above(list.into(), x - DEVICES_WIDTH / 2.0, bottom, DEVICES_WIDTH, 1.0, true))
+        Some(popup_above(list.into(), x - DEVICES_WIDTH / 2.0, bottom, DEVICES_WIDTH, alpha, live))
     }
 }
 

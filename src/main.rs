@@ -7,6 +7,7 @@ mod concerts;
 mod sync;
 mod video;
 mod ynison;
+mod shell;
 mod tray;
 mod dpi;
 mod client;
@@ -653,6 +654,23 @@ impl SearchTab {
     }
 }
 
+/// Вкладка боковой панели, из которой ушли: открытая страница и её история.
+struct TabMemory {
+    here: Place,
+    history: Vec<Place>,
+    forward: Vec<Place>,
+}
+
+/// Корни вкладок боковой панели: у каждой своя история, как у вкладок браузера.
+fn is_tab(section: Section) -> bool {
+    matches!(section, Section::Home | Section::Search | Section::Wave | Section::Books | Section::Kids | Section::Concerts | Section::Collection | Section::Settings)
+}
+
+/// Текст песни и очередь открываются поверх страницы и сменяют друг друга, а не копятся в истории.
+fn is_overlay(section: Section) -> bool {
+    matches!(section, Section::Lyrics | Section::Queue)
+}
+
 /// Куда возвращает кнопка «назад».
 #[derive(Clone)]
 struct Place {
@@ -897,6 +915,18 @@ struct App {
     chips: Vec<(String, String, Vec<String>)>,
     /// Для какого списка фильтры: «likes» или «владелец:номер» плейлиста.
     chips_key: String,
+    /// Фильтры уже открывавшихся страниц: при возврате они на месте сразу, а не грузятся заново.
+    chips_cache: HashMap<String, Vec<(String, String, Vec<String>)>>,
+    /// Выбранный фильтр каждой страницы: возвращается вместе с ней.
+    chip_places: HashMap<String, String>,
+    /// Фильтр, который надо выбрать, когда фильтры страницы будут готовы.
+    chip_restore: Option<(String, String)>,
+    /// Насколько раскрылись фильтры, появившись впервые.
+    chips_shown: f32,
+    /// Вкладка боковой панели, в которой открыта страница.
+    tab: Section,
+    /// Остальные вкладки: где каждую оставили и куда из неё ведёт «назад».
+    tabs: HashMap<Section, TabMemory>,
     /// Выбранный фильтр; нет — «Всё».
     chip: Option<String>,
     filter_loading: bool,
@@ -964,6 +994,9 @@ struct App {
     vibe_levels: [f32; 3],
     /// Показывать пункт «Детям» в боковой панели.
     kids: bool,
+    /// Пункты «Книги и подкасты» и «Концерты» в боковой панели.
+    books_tab: bool,
+    concerts_tab: bool,
     /// Показывать ли карточки «Слов в волне».
     words_on: bool,
     /// Скорость подкастов и книг.
@@ -1083,6 +1116,8 @@ struct App {
     shown_track: Option<String>,
     menu_fade: Fade<(Track, f32, f32, bool, bool)>,
     eq_fade: Fade<(f32, f32)>,
+    /// Список устройств появляется и исчезает, как остальные всплывающие меню.
+    devices_fade: Fade<f32>,
     dialog_fade: Fade<Dialog>,
     /// Плеер на всё окно: открыт ли и как далеко выехал.
     player_full: bool,
@@ -1348,6 +1383,8 @@ enum Message {
     WheelSpin(f32),
     WheelToggle,
     KeepTrackToggle,
+    /// Клик по вкладке боковой панели.
+    TabOpen(Section),
     WindowPrefSet(settings::WindowPrefs),
     SettingsTabSet(SettingsTab),
     /// Раскрыть колесо или вернуться к волне.
@@ -1464,6 +1501,8 @@ enum Message {
     DownloadLikes,
     LikesForDownload(Result<Vec<Track>, String>),
     KidsToggle,
+    BooksToggle,
+    ConcertsToggle,
     /// Следующая скорость подкаста или книги по кругу.
     SpeedNext,
     LookSet(Look),
@@ -1629,6 +1668,12 @@ impl App {
             trailer: None,
             unsafe_ok: HashSet::new(),
             chips_key: String::new(),
+            chips_cache: HashMap::new(),
+            chip_places: HashMap::new(),
+            chip_restore: None,
+            chips_shown: 1.0,
+            tab: Section::Wave,
+            tabs: HashMap::new(),
             chip: None,
             filter_loading: false,
             filter_id: 0,
@@ -1720,6 +1765,8 @@ impl App {
             vibe_speed: 0.0,
             vibe_levels: [0.0; 3],
             kids: saved.kids,
+            books_tab: saved.books,
+            concerts_tab: saved.concerts,
             words_on: saved.words,
             speed: saved.speed,
             look: saved.look,
@@ -1743,6 +1790,7 @@ impl App {
             shown_track: None,
             menu_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
             eq_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
+            devices_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
             dialog_fade: Fade::new(DIALOG_OPEN, DIALOG_CLOSE),
             player_full: false,
             full_fade: Fade::new(FULL_OPEN, FULL_CLOSE),
@@ -1819,7 +1867,7 @@ impl App {
 
     /// Анимации интерфейса: им нужен каждый кадр монитора.
     fn ui_animating(&self) -> bool {
-        self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.eq_fade.busy() || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy() || self.wheel_turn != self.wheel_target || self.wheel_reveal != if self.wheel_open { 1.0 } else { 0.0 }
+        self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.eq_fade.busy() || self.devices_fade.busy() || self.chips_shown < 1.0 || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy() || self.wheel_turn != self.wheel_target || self.wheel_reveal != if self.wheel_open { 1.0 } else { 0.0 }
             || (self.wheel_ready() && self.wheel_arrow < 1.0)
             || self.word_now() != self.word_for
             || (self.word_for.is_some() && self.word_level < 1.0)
@@ -1975,7 +2023,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, keep_track: self.keep_track, window: self.window_prefs });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, keep_track: self.keep_track, window: self.window_prefs });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -2167,6 +2215,10 @@ impl App {
         self.section = Section::Wave;
         self.history.clear();
         self.forward.clear();
+        self.tab = Section::Wave;
+        self.tabs.clear();
+        self.chips_cache.clear();
+        self.chip_places.clear();
         self.profile = None;
         self.results.clear();
         self.history_tracks.clear();
@@ -3315,6 +3367,78 @@ impl App {
         self.retry = None;
     }
 
+    /// Открывает раздел без записи в историю: загрузка, фокус и прочее, что ему нужно.
+    fn section_enter(&mut self, section: Section) -> Task<Message> {
+        self.section = section;
+        self.error = None;
+        self.retry = None;
+        if section == Section::Playlists {
+            self.playlist = None;
+        }
+        match section {
+            Section::Home | Section::Books | Section::Kids if self.home_page != section || (self.home.blocks.is_empty() && !self.home_loading) => {
+                let tab = self.landing_tabs[landing_index(section)];
+                self.home_load(section, tab)
+            }
+            Section::Dislikes => {
+                let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
+                self.history_loading = true;
+                Task::perform(background(move || api::disliked_tracks(&uid, HISTORY_LIMIT, &token)), Message::DislikesLoaded)
+            }
+            Section::History => {
+                let Some(token) = self.token() else { return Task::none() };
+                self.history_loading = true;
+                Task::perform(background(move || api::history(HISTORY_LIMIT, &token)), Message::HistoryLoaded)
+            }
+            Section::Collection => {
+                let likes = if self.liked.is_empty() { self.likes_more() } else { Task::none() };
+                let lists = if self.playlists.is_empty() { self.playlists_load() } else { Task::none() };
+                Task::batch([likes, lists, self.vibe_rooms_load()])
+            }
+            Section::Likes => {
+                let likes = if self.liked.is_empty() { self.likes_more() } else { Task::none() };
+                let ids = self.liked_ids.clone();
+                Task::batch([likes, self.chips_load("likes".to_string(), ids)])
+            }
+            Section::Playlists if self.playlists.is_empty() => self.playlists_load(),
+            Section::Search => operation::focus(Id::new(SEARCH_INPUT)),
+            Section::Wave => Task::batch([self.wheel_load(), self.words_load(self.current.unwrap_or(0))]),
+            Section::Discography => self.discography_load(0),
+            Section::Clips => {
+                let covers = Task::batch([self.clip_covers(&self.clips_liked), self.clip_covers(&self.clips_like)]);
+                Task::batch([covers, self.clips_load(), self.clip_feed_load()])
+            }
+            Section::Concerts if !self.concerts_loading => self.concerts_load(),
+            Section::Settings if self.ai_less.is_none() => {
+                let Some(token) = self.token() else { return Task::none() };
+                Task::perform(background(move || api::ai_reduction(&token)), Message::AiLessLoaded)
+            }
+            _ => Task::none(),
+        }
+    }
+
+    /// Переход в другую вкладку боковой панели: эта запоминается как есть, другая
+    /// открывается там, где её оставили, а впервые — с начала.
+    fn tab_switch(&mut self, root: Section) -> Task<Message> {
+        self.player_full = false;
+        let mut history = std::mem::take(&mut self.history);
+        let forward = std::mem::take(&mut self.forward);
+        // Текст и очередь — поверх страницы: вкладка запоминает страницу под ними.
+        let here = if is_overlay(self.section) { history.pop().unwrap_or_else(|| self.here()) } else { self.here() };
+        self.tabs.insert(self.tab, TabMemory { here, history, forward });
+        self.tab = root;
+        self.error = None;
+        self.retry = None;
+        match self.tabs.remove(&root) {
+            Some(memory) => {
+                self.history = memory.history;
+                self.forward = memory.forward;
+                self.go(memory.here)
+            }
+            None => self.section_enter(root),
+        }
+    }
+
     fn here(&self) -> Place {
         Place { section: self.section, playlist: self.playlist.clone(), artist: self.artist.clone(), block: self.block.clone(), landing: self.landing.clone(), concert: self.concert.clone() }
     }
@@ -3363,6 +3487,10 @@ impl App {
         self.prune_covers();
         if place.section == Section::Discography {
             return self.discography_load(0);
+        }
+        if place.section == Section::Likes {
+            let ids = self.liked_ids.clone();
+            return self.chips_load("likes".to_string(), ids);
         }
         Task::none()
     }
@@ -3462,11 +3590,18 @@ impl App {
     /// Фильтры для списка, как в оригинале: по жанрам и настроениям его треков.
     fn chips_load(&mut self, key: String, ids: Vec<String>) -> Task<Message> {
         let Some(token) = self.token() else { return Task::none() };
-        if key == self.chips_key || ids.len() < CHIP_TRACKS * 2 {
+        if (key == self.chips_key && !self.chips.is_empty()) || ids.len() < CHIP_TRACKS * 2 {
             return Task::none();
         }
         self.chips_key = key.clone();
-        self.chips.clear();
+        // Уже открывавшаяся страница: фильтры сразу на месте, а свежие тихо заменят их.
+        match self.chips_cache.get(&key) {
+            Some(cached) => {
+                self.chips = cached.clone();
+                self.chips_shown = 1.0;
+            }
+            None => self.chips.clear(),
+        }
         Task::perform(background(move || api::track_filters(&ids, &token)), move |r| Message::ChipsLoaded(key.clone(), r))
     }
 
@@ -3510,6 +3645,21 @@ impl App {
             }
             self.liked.retain(|t| t.id != track.id);
         }
+    }
+
+    /// Возвращает странице фильтр, выбранный на ней до ухода, если её фильтры уже готовы.
+    fn chip_restored(&mut self) -> Option<Task<Message>> {
+        let (key, id) = self.chip_restore.as_ref()?;
+        if self.chips_place().as_ref() != Some(key) {
+            self.chip_restore = None;
+            return None;
+        }
+        if !self.chips.iter().any(|chip| chip.0 == *id) {
+            return None;
+        }
+        let id = id.clone();
+        self.chip_restore = None;
+        Some(self.update(Message::Chip(Some(id))))
     }
 
     fn filtering(&self) -> bool {
@@ -3597,6 +3747,8 @@ impl App {
             self.menu_fade.step(elapsed);
             self.pin_fade.step(elapsed);
             self.eq_fade.step(elapsed);
+            self.devices_fade.step(elapsed);
+            self.chips_shown = (self.chips_shown + elapsed / APPEAR).min(1.0);
             self.page_menu_fade.step(elapsed);
             self.dialog_fade.step(elapsed);
             self.full_fade.step(elapsed);
@@ -3658,7 +3810,13 @@ impl App {
         let place = self.list_place();
         let offset = self.list_offset;
         let back = matches!(message, Message::Back);
-        let travel = matches!(message, Message::Back | Message::Forward);
+        let travel = match &message {
+            Message::Back | Message::Forward => true,
+            // Вернулись в другую вкладку — страница встаёт, как её оставили.
+            Message::TabOpen(section) | Message::Open(section) => is_tab(*section) && *section != self.tab && self.tabs.contains_key(section),
+            _ => false,
+        };
+        let chip_left = (self.chips_place(), self.chip.clone());
         let rank = self.section as u8;
         let tab = (self.search_tab, self.home_tab);
         let ready = self.page_ready();
@@ -3680,7 +3838,17 @@ impl App {
             self.scroll_wait = restore.filter(|_| !self.page_ready());
             self.list_offset = restore.unwrap_or(0.0);
             self.queue_scroll = None;
+            match chip_left {
+                (Some(key), Some(id)) => {
+                    self.chip_places.insert(key, id);
+                }
+                (Some(key), None) => {
+                    self.chip_places.remove(&key);
+                }
+                _ => {}
+            }
             self.filter_reset();
+            self.chip_restore = self.chips_place().filter(|_| travel).and_then(|key| Some((key.clone(), self.chip_places.get(&key)?.clone())));
             self.page_veil = 1.0;
             self.lyrics_shown = -1.0;
             self.lyrics_target = -1.0;
@@ -3689,9 +3857,13 @@ impl App {
             self.lyrics_fresh = true;
             let down = back || (self.section as u8) < rank;
             self.page_shift = (0.0, if down { -PAGE_SHIFT } else { PAGE_SHIFT });
-            match restore {
+            let scroll = match restore {
                 Some(y) => operation::scroll_to(Id::new(LIST), scrollable::AbsoluteOffset { x: 0.0, y }),
                 None => operation::snap_to(Id::new(LIST), scrollable::RelativeOffset::START),
+            };
+            match self.chip_restored() {
+                Some(chip) => Task::batch([scroll, chip]),
+                None => scroll,
             }
         };
         // Страница дождалась данных: прокрутка встаёт на прежнее место.
@@ -3747,6 +3919,7 @@ impl App {
     fn sync_overlays(&mut self) {
         self.menu_fade.sync(self.menu.as_ref().map(|(track, x, y)| (track.clone(), *x, *y, self.menu_artists, self.menu_lists)));
         self.eq_fade.sync(self.eq_menu);
+        self.devices_fade.sync(self.devices_menu);
         self.pin_fade.sync(self.pin_menu);
         self.dialog_fade.sync(self.dialog.clone());
         self.full_fade.sync(self.player_full.then_some(()));
@@ -4461,57 +4634,29 @@ impl App {
                     return self.go(place);
                 }
             }
-            Message::Open(section) => {
+            Message::TabOpen(section) => {
+                if section != self.tab {
+                    return self.tab_switch(section);
+                }
+                // Ещё раз по своей вкладке — к её началу; уже в начале — список наверх.
                 self.player_full = false;
-                if self.section != section {
+                if self.section == section {
+                    self.list_offset = 0.0;
+                    return operation::scroll_to(Id::new(LIST), scrollable::AbsoluteOffset { x: 0.0, y: 0.0 });
+                }
+                self.history.clear();
+                self.forward.clear();
+                return self.section_enter(section);
+            }
+            Message::Open(section) => {
+                if is_tab(section) && section != self.tab {
+                    return self.tab_switch(section);
+                }
+                self.player_full = false;
+                if self.section != section && !(is_overlay(self.section) && is_overlay(section)) {
                     self.remember();
                 }
-                self.section = section;
-                self.error = None;
-                self.retry = None;
-                if section == Section::Playlists {
-                    self.playlist = None;
-                }
-                return match section {
-                    Section::Home | Section::Books | Section::Kids if self.home_page != section || (self.home.blocks.is_empty() && !self.home_loading) => {
-                        let tab = self.landing_tabs[landing_index(section)];
-                        self.home_load(section, tab)
-                    }
-                    Section::Dislikes => {
-                        let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
-                        self.history_loading = true;
-                        Task::perform(background(move || api::disliked_tracks(&uid, HISTORY_LIMIT, &token)), Message::DislikesLoaded)
-                    }
-                    Section::History => {
-                        let Some(token) = self.token() else { return Task::none() };
-                        self.history_loading = true;
-                        Task::perform(background(move || api::history(HISTORY_LIMIT, &token)), Message::HistoryLoaded)
-                    }
-                    Section::Collection => {
-                        let likes = if self.liked.is_empty() { self.likes_more() } else { Task::none() };
-                        let lists = if self.playlists.is_empty() { self.playlists_load() } else { Task::none() };
-                        Task::batch([likes, lists, self.vibe_rooms_load()])
-                    }
-                    Section::Likes => {
-                        let likes = if self.liked.is_empty() { self.likes_more() } else { Task::none() };
-                        let ids = self.liked_ids.clone();
-                        Task::batch([likes, self.chips_load("likes".to_string(), ids)])
-                    }
-                    Section::Playlists if self.playlists.is_empty() => self.playlists_load(),
-                    Section::Search => operation::focus(Id::new(SEARCH_INPUT)),
-                    Section::Wave => Task::batch([self.wheel_load(), self.words_load(self.current.unwrap_or(0))]),
-                    Section::Discography => self.discography_load(0),
-                    Section::Clips => {
-                        let covers = Task::batch([self.clip_covers(&self.clips_liked), self.clip_covers(&self.clips_like)]);
-                        Task::batch([covers, self.clips_load(), self.clip_feed_load()])
-                    }
-                    Section::Concerts if !self.concerts_loading => self.concerts_load(),
-                    Section::Settings if self.ai_less.is_none() => {
-                        let Some(token) = self.token() else { return Task::none() };
-                        Task::perform(background(move || api::ai_reduction(&token)), Message::AiLessLoaded)
-                    }
-                    _ => Task::none(),
-                };
+                return self.section_enter(section);
             }
             Message::Query(query) => {
                 if query.trim() != self.query.trim() {
@@ -5626,7 +5771,7 @@ impl App {
             }
             Message::MenuClose => {
                 // Esc сначала закрывает меню и окна, потом плеер на всё окно, потом текст песни и очередь.
-                if self.menu.is_none() && self.pin_menu.is_none() && self.eq_menu.is_none() && self.page_menu.is_none() && self.dialog.is_none() {
+                if self.menu.is_none() && self.pin_menu.is_none() && self.eq_menu.is_none() && self.devices_menu.is_none() && self.page_menu.is_none() && self.dialog.is_none() {
                     if !self.player_full {
                         match self.section {
                             Section::Lyrics => return self.handle(Message::LyricsToggle),
@@ -5918,8 +6063,18 @@ impl App {
                     return Task::none();
                 }
                 // Как в оригинале: только заметные фильтры, не меньше двух и не больше семи.
-                let chips: Vec<_> = result.unwrap_or_default().into_iter().filter(|(id, _, tracks)| id != "all" && tracks.len() >= CHIP_TRACKS).take(CHIPS_MAX).collect();
-                self.chips = if chips.len() >= 2 { chips } else { Vec::new() };
+                // Не ответил сервер — остаются прежние фильтры, а не пропадают.
+                let Ok(found) = result else { return Task::none() };
+                let chips: Vec<_> = found.into_iter().filter(|(id, _, tracks)| id != "all" && tracks.len() >= CHIP_TRACKS).take(CHIPS_MAX).collect();
+                let chips = if chips.len() >= 2 { chips } else { Vec::new() };
+                if self.chips.is_empty() && !chips.is_empty() {
+                    self.chips_shown = 0.0;
+                }
+                self.chips_cache.insert(key, chips.clone());
+                self.chips = chips;
+                if let Some(task) = self.chip_restored() {
+                    return task;
+                }
                 if matches!(self.preview, Some(Preview::LikesChip)) {
                     self.preview = None;
                     let first = self.chips.first().map(|chip| chip.0.clone());
@@ -6338,6 +6493,14 @@ impl App {
                 std::mem::take(&mut self.downloads).iter().for_each(offline::remove);
                 self.downloads_changed();
                 return self.notify("Скачанное удалено".to_string());
+            }
+            Message::BooksToggle => {
+                self.books_tab = !self.books_tab;
+                self.save_settings();
+            }
+            Message::ConcertsToggle => {
+                self.concerts_tab = !self.concerts_tab;
+                self.save_settings();
             }
             Message::KidsToggle => {
                 self.kids = !self.kids;
@@ -6861,7 +7024,7 @@ impl App {
         if let Some((index, x, y)) = self.pin_fade.item {
             layers = layers.push(self.view_pin_menu(index, x, y));
         }
-        if let Some(devices) = self.devices_menu.and_then(|x| self.view_devices(x)) {
+        if let Some(devices) = self.devices_fade.item.and_then(|x| self.view_devices(x)) {
             layers = layers.push(devices);
         }
         if let Some((x, _)) = self.eq_fade.item {
@@ -7540,10 +7703,7 @@ impl App {
     }
 
     fn view_sidebar(&self) -> Element<'_, Message> {
-        let opened = match self.section {
-            Section::Likes | Section::Playlists | Section::Albums | Section::Artists | Section::History | Section::Dislikes | Section::Downloads => Section::Collection,
-            section => section,
-        };
+        let opened = if is_tab(self.section) { self.section } else { self.tab };
         let item = |icon: ui::Glyph, label, section| {
             let (icon, tint) = if opened == section { (icon.selected(), ui::c().text) } else { (icon, ui::c().muted) };
             glow(
@@ -7552,7 +7712,7 @@ impl App {
                     .width(Length::Fill)
                     .padding(Padding::new(12.0).right(12))
                     .style(ui::nav)
-                    .on_press(Message::Open(section)),
+                    .on_press(Message::TabOpen(section)),
                 24.0,
             )
         };
@@ -7573,10 +7733,10 @@ impl App {
                     item(ui::HOME, "Главная", Section::Home),
                     item(ui::SEARCH, "Поиск", Section::Search),
                     item(ui::WAVE, "Моя волна", Section::Wave),
-                    item(ui::HEADPHONES, "Книги и подкасты", Section::Books),
                 ]
+                .extend(self.books_tab.then(|| item(ui::HEADPHONES, "Книги и подкасты", Section::Books)))
                 .extend(self.kids.then(|| item(ui::KIDS, "Детям", Section::Kids)))
-                .push(item(ui::CONCERTS, "Концерты", Section::Concerts))
+                .extend(self.concerts_tab.then(|| item(ui::CONCERTS, "Концерты", Section::Concerts)))
                 .push(item(ui::COLLECTION, "Коллекция", Section::Collection))
                 .spacing(4),
                 Space::new().height(16),
@@ -7920,7 +8080,11 @@ impl App {
                 column![
                     column![title("Оформление"), looks, toggle("Включить lite-версию", "Визуальные эффекты и анимации будут загружаться в облегчённом формате", Some(self.lite), Some(Message::LiteToggle))].spacing(12),
                     group("Плеер", vec![toggle("Помнить последний трек", "После запуска в плеере трек и очередь, что играли при выходе, — даже если сервер Яндекса их не вернул", Some(self.keep_track), Some(Message::KeepTrackToggle))]),
-                    group("Боковая панель", vec![toggle("Детский раздел", "Пункт «Детям» в боковой панели: сказки, песни и аудиокниги для детей", Some(self.kids), Some(Message::KidsToggle))]),
+                    group("Боковая панель", vec![
+                        toggle("Книги и подкасты", "Пункт «Книги и подкасты» в боковой панели: аудиокниги, подкасты и выпуски", Some(self.books_tab), Some(Message::BooksToggle)),
+                        toggle("Детский раздел", "Пункт «Детям» в боковой панели: сказки, песни и аудиокниги для детей", Some(self.kids), Some(Message::KidsToggle)),
+                        toggle("Концерты", "Пункт «Концерты» в боковой панели: афиша концертов в вашем городе", Some(self.concerts_tab), Some(Message::ConcertsToggle)),
+                    ]),
                 ]
                 .spacing(28)
                 .into()
@@ -7938,7 +8102,7 @@ impl App {
                         toggle("Запускать свёрнутым", "Окно не появится при обычном запуске — откройте его из трея", Some(prefs.start_minimized), set(|p| p.start_minimized = !p.start_minimized)),
                         toggle("Сворачивать в трей при закрытии", "Музыка продолжит играть. Выйти совсем — из меню значка в трее", Some(prefs.close_to_tray), set(|p| p.close_to_tray = !p.close_to_tray)),
                     ]),
-                    group("Вид", vec![toggle("Трек в заголовке окна", "«Исполнитель — трек» на панели задач и в Alt+Tab", Some(prefs.track_title), set(|p| p.track_title = !p.track_title))]),
+                    group("Вид", vec![toggle("Трек в заголовке окна", "Вместо «Tune» — «Исполнитель — трек»: видно на панели задач и в Alt+Tab", Some(prefs.track_title), set(|p| p.track_title = !p.track_title))]),
                 ]
                 .spacing(28)
                 .into()
@@ -8247,7 +8411,8 @@ impl App {
         let chips = self.chips.iter().fold(row![chip("Всё".to_string(), self.chip.is_none(), Message::Chip(None))].spacing(8), |chips, (id, name, _)| {
             chips.push(chip(name.clone(), self.chip.as_deref() == Some(id.as_str()), Message::Chip(Some(id.clone()))))
         });
-        Some(chips.wrap().vertical_spacing(8).into())
+        let level = anim::ease_out(self.chips_shown);
+        Some(anim::grow(reveal(chips.wrap().vertical_spacing(8)).shift(0.0, -10.0 * (1.0 - level)), level))
     }
 
     fn view_filter_list<'a>(&'a self, section: Section) -> Element<'a, Message> {
@@ -10944,6 +11109,11 @@ fn main() -> iced::Result {
         }),
         _ => None,
     };
+    // Своё имя и значок в медиапанели и на панели задач — до первого окна.
+    shell::identify();
+    if preview.is_none() {
+        shell::register();
+    }
     let yandex_fonts = fonts::load();
     ui::set_icons(icons::load());
     ui::YANDEX_FONTS.store(!yandex_fonts.is_empty(), Ordering::Relaxed);
