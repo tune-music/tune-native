@@ -667,6 +667,8 @@ struct Place {
 enum Preview {
     /// Страница «Клипы».
     Clips,
+    /// Волна с открытым списком устройств.
+    Devices,
     /// Раздел «Концерты»; с `city` — окно выбора города.
     Concerts(bool),
     /// Страница концерта по номеру.
@@ -3879,6 +3881,10 @@ impl App {
                 self.ynison_start();
                 let page = match self.preview.clone() {
                     Some(Preview::Wave | Preview::WaveSeek | Preview::WaveWords | Preview::WaveWheel | Preview::WaveWheelHalf) => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
+                    Some(Preview::Devices) => {
+                        let wave = self.wave_load(vec![api::MY_WAVE.to_string()], None, false);
+                        Task::batch([wave, Task::perform(background(|| std::thread::sleep(Duration::from_secs(4))), |()| Message::DevicesOpen)])
+                    }
                     Some(Preview::Lyrics) => self.wave_load(vec!["artist:3121".to_string()], None, false),
                     Some(Preview::WaveTune) => {
                         self.preview = None;
@@ -10674,6 +10680,7 @@ fn main() -> iced::Result {
             "wave" => Preview::Wave,
             "wave-words" => Preview::WaveWords,
             "clips" => Preview::Clips,
+            "devices" => Preview::Devices,
             "concerts" => Preview::Concerts(false),
             "concerts-city" => Preview::Concerts(true),
             what if what.starts_with("concert:") => Preview::Concert(what["concert:".len()..].to_string()),

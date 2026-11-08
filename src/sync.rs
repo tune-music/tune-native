@@ -200,7 +200,11 @@ impl App {
                 return task;
             }
             Message::YnisonQueue(_, Err(e)) => return self.fail(e),
-            Message::DevicesOpen => self.devices_menu = Some(CURSOR.lock().unwrap().0),
+            Message::DevicesOpen => {
+                // В предпросмотре мыши нет: список встаёт там, где кнопка в широком окне.
+                let x = if matches!(self.preview, Some(Preview::Devices)) { WINDOW.lock().unwrap().0 - 250.0 } else { CURSOR.lock().unwrap().0 };
+                self.devices_menu = Some(x);
+            }
             Message::DeviceSelect(id) => {
                 self.devices_menu = None;
                 let Some(y) = &self.ynison else { return Task::none() };
@@ -236,11 +240,8 @@ impl App {
 
     /// Кнопка устройств в трекбаре: видна, когда кроме Tune есть куда передать музыку.
     pub(crate) fn devices_tool<'a>(&self, size: f32) -> Option<Element<'a, Message>> {
-        let y = self.ynison.as_ref().filter(|y| y.connected())?;
-        let others = self.ynison_state.devices.iter().any(|device| device.id != y.device_id() && device.can_play);
-        if !others {
-            return None;
-        }
+        // Кнопка есть всегда, как в оригинале: без связи или без других устройств список это и скажет.
+        self.ynison.as_ref()?;
         let elsewhere = self.ynison_elsewhere();
         let label = if elsewhere.is_some() { "Играет на другом устройстве" } else { "Устройства" };
         let color = if elsewhere.is_some() { ui::c().accent } else { ui::c().muted };
@@ -253,7 +254,13 @@ impl App {
         let me = y.device_id();
         let active = self.ynison_state.active.as_deref();
         let mut list = column![text("Устройства").size(16).font(ui::font_medium()).color(ui::c().text)].spacing(4);
-        let mut devices: Vec<ynison::Device> = self.ynison_state.devices.iter().filter(|device| device.id != me && device.can_play).cloned().collect();
+        let connected = y.connected();
+        let mut devices: Vec<ynison::Device> = if connected { self.ynison_state.devices.iter().filter(|device| device.id != me && device.can_play).cloned().collect() } else { Vec::new() };
+        let note = match (connected, devices.is_empty()) {
+            (false, _) => Some("Нет связи с Ynison: другие устройства не видны. Tune подключается заново сам"),
+            (true, true) => Some("Других устройств нет. Откройте Яндекс Музыку на телефоне или колонке — они появятся здесь"),
+            _ => None,
+        };
         devices.insert(0, ynison::Device { id: me.to_string(), title: "Это устройство".to_string(), kind: "WEB_DESKTOP".to_string(), can_play: true });
         for device in devices {
             let playing = active == Some(device.id.as_str());
@@ -265,6 +272,9 @@ impl App {
             }
             let line = row![ui::icon(ui::DEVICES, 22.0, tint), words].spacing(10).align_y(Alignment::Center);
             list = list.push(glow(button(line).width(Length::Fill).padding([8, 8]).style(ui::row).on_press(Message::DeviceSelect(device.id.clone())), 8.0));
+        }
+        if let Some(note) = note {
+            list = list.push(container(text(note).size(13).color(ui::c().muted)).padding([4, 8]));
         }
         let bottom = self.bar_top_y() - 12.0;
         Some(popup_above(list.into(), x - DEVICES_WIDTH / 2.0, bottom, DEVICES_WIDTH, 1.0, true))
