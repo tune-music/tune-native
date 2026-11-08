@@ -104,8 +104,9 @@ const MENU_ITEM: f32 = 40.0;
 const NOTICE_TIME: Duration = Duration::from_secs(4);
 /// Сколько видно уведомление о громкости или скорости.
 const QUICK_NOTICE_TIME: Duration = Duration::from_millis(1200);
-/// Сколько пикселей прокрутки тачпадом считаются одним щелчком колеса.
-const WHEEL_PIXELS: f32 = 50.0;
+/// Сколько пикселей прокрутки — один щелчок колеса. Колесо проходит через плавную прокрутку
+/// (`anim::smooth`): она дробит щелчок на порции ровно на столько пикселей.
+const WHEEL_PIXELS: f32 = anim::WHEEL_STEP;
 /// Сколько текст песни ждёт после прокрутки руками, прежде чем вернуться к звучащей строке.
 const LYRICS_HOLD: Duration = Duration::from_secs(5);
 /// Через сколько после наведения появляется подсказка у кнопки.
@@ -1064,7 +1065,7 @@ struct App {
     reverb: u8,
     lyrics_sources: lyrics::Sources,
     lyrics_size: u8,
-    /// Текст песни закрывается: насколько ушёл вниз и растаял, потом — «назад».
+    /// Текст песни или очередь закрываются: насколько ушли вниз и растаяли, потом — «назад».
     lyrics_closing: Option<f32>,
     /// Текст прокрутили руками: до этого времени он не возвращается к звучащей строке.
     lyrics_hold: Option<Instant>,
@@ -1076,6 +1077,7 @@ struct App {
     volume_step_text: String,
     speed_step_text: String,
     speed_text: String,
+    reverb_text: String,
     /// Уведомление о громкости или скорости: при смене числа оно не мигает.
     notice_quick: bool,
     /// Скрыт ли сейчас текст в заголовке окна.
@@ -1444,6 +1446,7 @@ enum Message {
     VolumeStepText(String),
     SpeedStepText(String),
     SpeedText(String),
+    ReverbText(String),
     /// Колесо мыши над плеером: на сколько щелчков.
     VolumeWheel(f32),
     SettingsTabSet(SettingsTab),
@@ -1806,6 +1809,7 @@ impl App {
             volume_step_text: saved.volume_step.to_string(),
             speed_step_text: speed_label(saved.speed_step),
             speed_text: speed_label(saved.speed),
+            reverb_text: saved.reverb.to_string(),
             notice_quick: false,
             caption_hidden: false,
             discord: None,
@@ -2120,12 +2124,13 @@ impl App {
             self.wheel_rest = 0.0;
         }
         self.wheel_rest += notches;
-        if self.wheel_rest.abs() < 1.0 {
+        // Порции плавной прокрутки в сумме дают щелчок с погрешностью: почти целый — уже щелчок.
+        if self.wheel_rest.abs() < 0.9 {
             return None;
         }
-        let steps = self.wheel_rest.trunc();
-        self.wheel_rest -= steps;
-        Some(steps.signum())
+        let sign = self.wheel_rest.signum();
+        self.wheel_rest = (self.wheel_rest - sign).clamp(-0.5, 0.5);
+        Some(sign)
     }
 
     /// С какой скоростью играет трек: книги и подкасты — всегда со своей, музыка — только с
@@ -3890,7 +3895,7 @@ impl App {
                 let level = level + elapsed / LYRICS_CLOSE;
                 if level >= 1.0 {
                     self.lyrics_closing = None;
-                    if self.section == Section::Lyrics {
+                    if is_overlay(self.section) {
                         return self.update(Message::Back);
                     }
                 } else {
@@ -3972,6 +3977,8 @@ impl App {
         let back = matches!(message, Message::Back);
         let travel = match &message {
             Message::Back | Message::Forward => true,
+            // Текст и очередь закрываются вложенным «назад»: это тоже возврат.
+            _ if is_overlay(self.section) => true,
             // Вернулись в другую вкладку — страница встаёт, как её оставили.
             Message::TabOpen(section) | Message::Open(section) => is_tab(*section) && *section != self.tab && self.tabs.contains_key(section),
             _ => false,
@@ -4018,8 +4025,8 @@ impl App {
             let down = back || (self.section as u8) < rank;
             self.page_shift = (0.0, if down { -PAGE_SHIFT } else { PAGE_SHIFT });
             self.lyrics_closing = None;
-            // Текст песни, как у Tune Client, всплывает снизу.
-            if self.section == Section::Lyrics {
+            // Текст песни и очередь, как текст у Tune Client, всплывают снизу.
+            if is_overlay(self.section) {
                 self.page_shift = (0.0, LYRICS_RISE);
             }
             let scroll = match restore {
@@ -6411,8 +6418,12 @@ impl App {
                 };
             }
             Message::QueueToggle => {
+                // Как текст: очередь сперва уходит вниз и тает, потом закрывается.
                 if self.section == Section::Queue {
-                    return self.handle(Message::Back);
+                    if self.lyrics_closing.is_none() {
+                        self.lyrics_closing = Some(0.0);
+                    }
+                    return Task::none();
                 }
                 return self.handle(Message::Open(Section::Queue));
             }
@@ -6766,7 +6777,16 @@ impl App {
                 self.lyrics_size = size;
                 self.save_settings();
             }
+            Message::ReverbText(value) => {
+                if let Some(reverb) = value.trim().trim_end_matches('%').trim().parse::<u8>().ok().filter(|reverb| *reverb <= 100) {
+                    self.reverb = reverb;
+                    self.apply_speed();
+                    self.save_settings();
+                }
+                self.reverb_text = value;
+            }
             Message::ReverbSet(reverb) => {
+                self.reverb_text = reverb.to_string();
                 self.reverb = reverb;
                 self.apply_speed();
                 self.save_settings();
@@ -7237,7 +7257,7 @@ impl App {
         // Вместо затухания самой страницы её на миг закрывает фон и плавно уходит.
         let rest = 1.0 - anim::ease_out(1.0 - self.page_veil);
         // Закрывающийся текст уходит вниз и тает, разгоняясь, как у Tune Client.
-        let (rest, shift) = match self.lyrics_closing.filter(|_| self.section == Section::Lyrics) {
+        let (rest, shift) = match self.lyrics_closing.filter(|_| is_overlay(self.section)) {
             Some(level) => (level * level, (0.0, LYRICS_RISE)),
             None => (rest, self.page_shift),
         };
@@ -8495,7 +8515,7 @@ impl App {
                     ]),
                     group("Вид", vec![
                         toggle("Трек в заголовке окна", "Вместо «Tune» в верхней полосе окна — «Исполнитель — трек». Windows берёт этот текст и для панели задач, поэтому там трек тоже будет", Some(prefs.track_title), set(|p| p.track_title = !p.track_title)),
-                        toggle("Трек на панели задач и в Alt+Tab", "«Исполнитель — трек» на кнопке окна и в переключении окон. Без первого пункта в верхней полосе окна остаётся только значок", Some(prefs.track_taskbar || prefs.track_title), (!prefs.track_title).then(|| Message::WindowPrefSet(settings::WindowPrefs { track_taskbar: !prefs.track_taskbar, ..prefs }))),
+                        toggle("Трек на панели задач и в Alt+Tab", "«Исполнитель — трек» на кнопке окна и в переключении окон. Windows берёт подпись для панели задач из заголовка окна, поэтому без первого пункта текст в заголовке скрывается — остаётся значок", Some(prefs.track_taskbar || prefs.track_title), (!prefs.track_title).then(|| Message::WindowPrefSet(settings::WindowPrefs { track_taskbar: !prefs.track_taskbar, ..prefs }))),
                     ]),
                 ]
                 .spacing(28)
@@ -8547,6 +8567,7 @@ impl App {
                             let label = if reverb == 0 { "Выключен".to_string() } else { format!("{reverb} %") };
                             line.push(shine(button(text(label).size(14)).padding([7, 16]).style(ui::chip(reverb == self.reverb)).on_press(Message::ReverbSet(reverb)), 18.0))
                         });
+                        let reverbs = reverbs.push(number_field("свой, %", &self.reverb_text, Message::ReverbText));
                         let mut effects = column![
                             title("Скорость и эффекты"),
                             toggle("Кнопка скорости для музыки", "У громкости, от 0,5× до 2×: клик — быстрее, колесо над кнопкой — по шагу, правый клик — обычная скорость. У книг и подкастов кнопка есть всегда", Some(self.speed_control), Some(Message::SpeedControlToggle)),
@@ -8558,7 +8579,7 @@ impl App {
                                 .push(container(column![column![text("Шаг скорости").color(ui::c().text), text("Свой — от 0,01 до 0,5").size(13).color(ui::c().muted)].spacing(2), steps.wrap().vertical_spacing(8)].spacing(10)).padding(8))
                                 .push(toggle("Тон вместе со скоростью", "Быстрее — выше, как в найткоре; медленнее — ниже, как в слоуде. Иначе голос звучит своим тоном на любой скорости", Some(self.pitch), Some(Message::PitchToggle)));
                         }
-                        effects.push(container(column![column![text("Реверб").color(ui::c().text), text("Эхо большого зала поверх трека — с замедлением получается slowed + reverb").size(13).color(ui::c().muted)].spacing(2), reverbs.wrap().vertical_spacing(8)].spacing(10)).padding(8))
+                        effects.push(container(column![column![text("Реверб").color(ui::c().text), text("Эхо большого зала поверх трека — с замедлением получается slowed + reverb. Свой — от 0 до 100 %").size(13).color(ui::c().muted)].spacing(2), reverbs.wrap().vertical_spacing(8)].spacing(10)).padding(8))
                     },
                     column![
                         title("Управление"),

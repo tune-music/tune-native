@@ -322,7 +322,7 @@ impl Widget<Message, Theme, Renderer> for Covered<'_> {
 }
 
 /// Сколько точек прокрутки даёт один щелчок колеса.
-const WHEEL_STEP: f32 = 90.0;
+pub const WHEEL_STEP: f32 = 90.0;
 /// Как быстро догоняется прокрутка: чем больше, тем короче хвост.
 const WHEEL_SPEED: f32 = 14.0;
 /// Меньше этого остаток не стоит кадра.
