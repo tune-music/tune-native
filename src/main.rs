@@ -3,7 +3,9 @@
 mod api;
 mod anim;
 mod clips;
+mod sync;
 mod video;
+mod ynison;
 mod dpi;
 mod client;
 mod fonts;
@@ -53,6 +55,8 @@ use settings::{Look, Quality, Repeat, Settings};
 /// Шаг перерисовки, пока идёт клип и больше ничего не движется.
 const CLIP_FRAME: Duration = Duration::from_micros(16_667);
 const TICK: Duration = Duration::from_millis(500);
+/// Как часто окно забирает пришедшее от Ynison и отправляет своё.
+const YNISON_TICK: Duration = Duration::from_millis(300);
 const COVER: f32 = 40.0;
 const BAR_COVER: f32 = 52.0;
 const BAR_HEIGHT: f32 = 68.0;
@@ -1065,6 +1069,12 @@ struct App {
     clip: Option<clips::Watch>,
     clip_ticket: u64,
     account_tries: u32,
+    /// Связь с Ynison, последнее общее состояние и что мы отправили последним.
+    ynison: Option<ynison::Ynison>,
+    ynison_state: ynison::Shared,
+    ynison_sent: Option<(ynison::Local, Instant)>,
+    /// Список устройств открыт: место кнопки по горизонтали.
+    devices_menu: Option<f32>,
     clips_liked: Vec<api::Clip>,
     clips_like: Vec<api::Clip>,
     clips_loading: bool,
@@ -1139,6 +1149,12 @@ enum Message {
     Back,
     Open(Section),
     ClipsLoaded(Result<(Vec<api::Clip>, Vec<api::Clip>), String>),
+    /// Ynison: забрать пришедшее и отправить своё.
+    YnisonTick,
+    /// Очередь с другого устройства: общее состояние и её треки.
+    YnisonQueue(ynison::Shared, Result<Vec<Track>, String>),
+    DevicesOpen,
+    DeviceSelect(String),
     ClipOpen(Vec<api::Clip>, usize),
     /// Клипы по ссылке `/video?ids=…`.
     ClipLink(Result<Vec<api::Clip>, String>, usize),
@@ -1688,6 +1704,10 @@ impl App {
             clip: None,
             clip_ticket: 0,
             account_tries: 0,
+            ynison: None,
+            ynison_state: ynison::Shared::default(),
+            ynison_sent: None,
+            devices_menu: None,
             clips_liked: Vec::new(),
             clips_like: Vec::new(),
             clips_loading: false,
@@ -2082,6 +2102,10 @@ impl App {
 
     /// Выход из аккаунта: чужих данных в окне оставаться не должно.
     fn reset(&mut self) {
+        self.ynison = None;
+        self.ynison_state = ynison::Shared::default();
+        self.ynison_sent = None;
+        self.devices_menu = None;
         if let Some(p) = &self.player {
             p.stop();
         }
@@ -3742,6 +3766,8 @@ impl App {
             }
         }
         match message {
+            Message::YnisonTick => return self.ynison_tick(),
+            message @ (Message::YnisonQueue(..) | Message::DevicesOpen | Message::DeviceSelect(_)) => return self.ynison_handle(message),
             message @ (Message::ClipsLoaded(_)
                 | Message::ClipOpen(..)
                 | Message::ClipLink(..)
@@ -3809,6 +3835,7 @@ impl App {
                 // Экран волны открыт с запуска, без перехода на него: колесо просим сразу.
                 let words = self.words_load(self.current.unwrap_or(0));
                 let pins = Task::batch([pins, avatar, self.liked_pages_load(), wizard, self.wheel_load(), words, self.vibe_rooms_load()]);
+                self.ynison_start();
                 let page = match self.preview.clone() {
                     Some(Preview::Wave | Preview::WaveSeek | Preview::WaveWords | Preview::WaveWheel | Preview::WaveWheelHalf) => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
                     Some(Preview::Lyrics) => self.wave_load(vec!["artist:3121".to_string()], None, false),
@@ -5498,6 +5525,7 @@ impl App {
                 self.pin_menu = None;
                 self.quality_menu = None;
                 self.eq_menu = None;
+                self.devices_menu = None;
                 self.page_menu = None;
                 self.dialog = None;
             }
@@ -6529,6 +6557,7 @@ impl App {
         };
         // Клипу хватает 60 кадров в секунду: окно не перерисовывается на каждый кадр монитора
         // (на 240 Гц это вчетверо больше работы видеокарте, а нового кадра видео нет).
+        let ynison = if self.ynison.is_some() { time::every(YNISON_TICK).map(|_| Message::YnisonTick) } else { Subscription::none() };
         let frames = if self.ui_animating() {
             window::frames().map(Message::Frame)
         } else if self.animating() {
@@ -6542,7 +6571,7 @@ impl App {
             _ => Subscription::none(),
         };
         let look = if self.look == Look::System { time::every(SYSTEM_LOOK_CHECK).map(|_| Message::SystemLookCheck) } else { Subscription::none() };
-        Subscription::batch([ticks, frames, online, look, sync]).pipe_media()
+        Subscription::batch([ticks, frames, online, look, sync, ynison]).pipe_media()
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -6642,7 +6671,7 @@ impl App {
         if let Some(clip) = self.view_clip() {
             layers = layers.push(clip);
         }
-        if self.menu.is_some() || self.quality_menu.is_some() || self.eq_menu.is_some() || self.page_menu.is_some() || self.pin_menu.is_some() {
+        if self.menu.is_some() || self.quality_menu.is_some() || self.eq_menu.is_some() || self.page_menu.is_some() || self.pin_menu.is_some() || self.devices_menu.is_some() {
             layers = layers.push(mouse_area(container(Space::new()).width(Length::Fill).height(Length::Fill)).on_press(Message::MenuClose).on_right_press(Message::MenuClose));
         }
         if let Some((track, x, y, artists, lists)) = &self.menu_fade.item {
@@ -6653,6 +6682,9 @@ impl App {
         }
         if let Some((x, y)) = self.quality_fade.item {
             layers = layers.push(self.view_quality(x, y));
+        }
+        if let Some(devices) = self.devices_menu.and_then(|x| self.view_devices(x)) {
+            layers = layers.push(devices);
         }
         if let Some((x, _)) = self.eq_fade.item {
             layers = layers.push(self.view_eq_popup(x));
@@ -7307,6 +7339,9 @@ impl App {
         let tool = |icon, on: bool, message, label| hint(glow(button(ui::icon(icon, size, if on { ui::c().accent } else { ui::c().muted })).padding(4).style(ui::ghost).on_press(message), 20.0), label);
         let mut tools = row![].spacing(6).align_y(Alignment::Center);
         if quality {
+            if let Some(devices) = self.devices_tool(size) {
+                tools = tools.push(devices);
+            }
             tools = tools.push(tool(ui::EQUALIZER, self.eq.enabled, Message::EqOpen, "Эквалайзер"));
             tools = tools.push(tool(ui::TUNE, self.quality == Quality::Lossless, Message::QualityOpen, "Настройки звука"));
         }
@@ -9790,6 +9825,30 @@ fn smoke_catalog(genre: &str) -> Result<(), String> {
 
 /// Строение ответа на запрос чтения: ключи, типы и начало строк, массивы — по первому элементу.
 /// Клип по номеру: поток у видеоплеера Яндекса, четыре секунды в libmpv без окна, кадры и место.
+/// Ynison без окна: подключиться, показать пришедшее за `seconds` секунд, отправить паузу.
+fn smoke_ynison(seconds: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Нет токена: войдите в Tune")?;
+    let seconds: u64 = seconds.parse().unwrap_or(10);
+    let local = ynison::Local { paused: true, speed: 1.0, ..ynison::Local::default() };
+    let link = ynison::Ynison::start(token, local.clone());
+    println!("Устройство {}", link.device_id());
+    let until = Instant::now() + Duration::from_secs(seconds);
+    let mut sent = false;
+    while Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(300));
+        for state in link.take() {
+            let devices: Vec<String> = state.devices.iter().map(|d| format!("{} ({})", d.title, d.kind)).collect();
+            println!("Состояние: устройства {devices:?}, играет {:?}, трек {:?} из {}, пауза {}, место {:?}", state.active, state.index, state.queue.len(), state.paused, state.progress);
+        }
+        if link.connected() && !sent {
+            link.send_status(&local);
+            sent = true;
+        }
+    }
+    println!("Связь: {}", if link.connected() { "есть" } else { "нет" });
+    Ok(())
+}
+
 fn smoke_clip(id: &str) -> Result<(), String> {
     let token = api::load_token().ok_or("Нет токена")?;
     let clip = api::clips_by_id(&[id.to_string()], &token)?.into_iter().next().ok_or("Клип не найден")?;
@@ -10500,7 +10559,7 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" || flag == "--smoke-clone" || flag == "--smoke-words" || flag == "--smoke-clip" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" || flag == "--smoke-clone" || flag == "--smoke-words" || flag == "--smoke-clip" || flag == "--smoke-ynison" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-library" => smoke_library(query),
@@ -10528,6 +10587,7 @@ fn main() -> iced::Result {
             "--smoke-clone" => smoke_clone(query),
             "--smoke-words" => smoke_words(query),
             "--smoke-clip" => smoke_clip(query),
+            "--smoke-ynison" => smoke_ynison(query),
                 _ => smoke_quality(query),
             };
             if let Err(e) = result {
