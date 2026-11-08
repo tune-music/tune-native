@@ -596,6 +596,12 @@ pub fn scroll<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Scrollable<'a, M
     Scrollable::new(content).direction(scrollable::Direction::Vertical(bar)).style(scroll_style)
 }
 
+/// Узкая колонка, которая листается вниз: тонкая полоса не наезжает на содержимое.
+pub fn scroll_y_thin<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Scrollable<'a, M> {
+    let bar = scrollable::Scrollbar::new().width(SCROLL_INNER).scroller_width(SCROLL_INNER).margin(0).spacing(2);
+    Scrollable::new(content).direction(scrollable::Direction::Vertical(bar)).style(scroll_still)
+}
+
 /// Лента, которая листается вбок: тонкая полоса снизу.
 pub fn scroll_x<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Scrollable<'a, M> {
     let bar = scrollable::Scrollbar::new().width(SCROLL_INNER).scroller_width(SCROLL_INNER).margin(0);

@@ -136,6 +136,26 @@ pub struct Settings {
     /// После запуска в плеере трек и очередь, что играли при выходе. Хранятся у Tune,
     /// а не на сервере: Ynison у части аккаунтов их не отдаёт.
     pub keep_track: bool,
+    pub window: WindowPrefs,
+}
+
+/// Окно и запуск — как во вкладке «Окно» у Tune Client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowPrefs {
+    /// Запускаться вместе с Windows, свёрнутым в трей.
+    pub autostart: bool,
+    /// Окно не появляется при обычном запуске — его открывают из трея.
+    pub start_minimized: bool,
+    /// Крестик прячет окно в трей, музыка играет дальше.
+    pub close_to_tray: bool,
+    /// «Исполнитель — трек» в заголовке окна: видно на панели задач и в Alt+Tab.
+    pub track_title: bool,
+}
+
+impl Default for WindowPrefs {
+    fn default() -> Self {
+        Self { autostart: false, start_minimized: false, close_to_tray: true, track_title: true }
+    }
 }
 
 /// Скорости, как в оригинале: кнопка перебирает их по кругу.
@@ -163,6 +183,16 @@ fn parse(v: &Value) -> Settings {
         speed: v["speed"].as_f64().map(|x| x as f32).filter(|x| SPEEDS.contains(x)).unwrap_or(1.0),
         look: Look::ALL.into_iter().find(|look| v["theme"].as_str() == Some(look.code())).unwrap_or(Look::Dark),
         keep_track: v["keepTrack"].as_bool().unwrap_or(true),
+        window: {
+            let base = WindowPrefs::default();
+            let w = &v["window"];
+            WindowPrefs {
+                autostart: w["autostart"].as_bool().unwrap_or(base.autostart),
+                start_minimized: w["startMinimized"].as_bool().unwrap_or(base.start_minimized),
+                close_to_tray: w["closeToTray"].as_bool().unwrap_or(base.close_to_tray),
+                track_title: w["trackTitle"].as_bool().unwrap_or(base.track_title),
+            }
+        },
     }
 }
 
@@ -191,7 +221,9 @@ pub fn save(settings: Settings) {
     };
     let eq = settings.eq;
     let equalizer = json!({ "enabled": eq.enabled, "preset": eq.preset, "preamp": eq.preamp, "gains": eq.gains });
-    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "words": settings.words, "wheel": settings.wheel, "speed": settings.speed, "theme": settings.look.code(), "keepTrack": settings.keep_track });
+    let w = settings.window;
+    let window = json!({ "autostart": w.autostart, "startMinimized": w.start_minimized, "closeToTray": w.close_to_tray, "trackTitle": w.track_title });
+    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "words": settings.words, "wheel": settings.wheel, "speed": settings.speed, "theme": settings.look.code(), "keepTrack": settings.keep_track, "window": window });
     let dir = api::data_dir();
     if fs::create_dir_all(&dir).is_ok() {
         let _ = fs::write(dir.join("settings.json"), value.to_string());
@@ -205,12 +237,14 @@ mod tests {
     #[test]
     fn reads_saved_and_broken_values() {
         let saved = parse(&json!({ "volume": 0.25, "muted": true, "repeat": "one", "shuffle": true, "quality": "lossless", "normalize": true }));
-        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default(), crossfade: true, normalize: true, lite: false, kids: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, keep_track: true });
+        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default(), crossfade: true, normalize: true, lite: false, kids: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, keep_track: true, window: WindowPrefs::default() });
         let empty = parse(&Value::Null);
-        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default(), crossfade: true, normalize: false, lite: false, kids: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, keep_track: true });
+        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default(), crossfade: true, normalize: false, lite: false, kids: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, keep_track: true, window: WindowPrefs::default() });
         assert!(!parse(&json!({ "crossfade": false })).crossfade);
         assert!(!parse(&json!({ "kids": false })).kids);
         assert!(!parse(&json!({ "keepTrack": false })).keep_track);
+        let window = parse(&json!({ "window": { "autostart": true, "closeToTray": false } })).window;
+        assert_eq!(window, WindowPrefs { autostart: true, start_minimized: false, close_to_tray: false, track_title: true });
         assert!(!parse(&json!({ "words": false })).words);
         assert_eq!((parse(&json!({ "theme": "system" })).look, parse(&json!({ "theme": "pink" })).look), (Look::System, Look::Dark));
         assert_eq!((parse(&json!({ "speed": 1.5 })).speed, parse(&json!({ "speed": 7 })).speed), (1.5, 1.0));

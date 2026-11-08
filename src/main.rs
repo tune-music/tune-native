@@ -114,6 +114,8 @@ const ACCOUNT_AVATAR: f32 = 72.0;
 const ACCOUNT_LINK: &str = "https://id.yandex.ru/";
 const PLUS_LINK: &str = "https://plus.yandex.ru/my";
 const SIDEBAR: f32 = 224.0;
+/// Самое низкое окно: ниже не помещаются боковая панель и плеер.
+const MIN_HEIGHT: f32 = 600.0;
 const LIKE: f32 = 32.0;
 /// Постоянное место под полосу прокрутки: колонка времени не прыгает на коротких списках.
 const SCROLLBAR: f32 = 14.0;
@@ -1003,6 +1005,8 @@ struct App {
     /// Показывать ли колесо волны.
     wheel_on: bool,
     keep_track: bool,
+    /// Запуск, трей и заголовок окна.
+    window_prefs: settings::WindowPrefs,
     /// Открытая вкладка настроек.
     settings_tab: SettingsTab,
     /// Раскрыто ли колесо и насколько оно уже выехало, от 0 до 1.
@@ -1344,6 +1348,7 @@ enum Message {
     WheelSpin(f32),
     WheelToggle,
     KeepTrackToggle,
+    WindowPrefSet(settings::WindowPrefs),
     SettingsTabSet(SettingsTab),
     /// Раскрыть колесо или вернуться к волне.
     WheelShow(bool),
@@ -1679,6 +1684,7 @@ impl App {
             wheel_target: 0.0,
             wheel_on: saved.wheel,
             keep_track: saved.keep_track,
+            window_prefs: saved.window,
             settings_tab: SettingsTab::Main,
             wheel_open: false,
             wheel_reveal: 0.0,
@@ -1969,7 +1975,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, keep_track: self.keep_track });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, keep_track: self.keep_track, window: self.window_prefs });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -3570,7 +3576,7 @@ impl App {
                 };
             }
             self.session_store(true);
-            tray::sync(false, false, false);
+            tray::sync(false, ui::is_light());
             tray::remove();
             return iced::exit();
         }
@@ -3733,7 +3739,7 @@ impl App {
         if let Some(media) = &mut self.media {
             media.sync(track.as_ref(), playing, position);
         }
-        tray::sync(self.is_playing(), track.is_some(), self.hwnd.is_some_and(window_away));
+        tray::sync(self.is_playing(), ui::is_light());
         Task::batch([task, snap, more, covers, lyrics])
     }
 
@@ -5320,6 +5326,15 @@ impl App {
                 self.keep_track = !self.keep_track;
                 self.save_settings();
             }
+            Message::WindowPrefSet(prefs) => {
+                if prefs.autostart != self.window_prefs.autostart {
+                    if let Err(e) = set_autostart(prefs.autostart) {
+                        return self.notify(e);
+                    }
+                }
+                self.window_prefs = prefs;
+                self.save_settings();
+            }
             Message::SettingsTabSet(tab) => {
                 self.settings_tab = tab;
                 self.list_offset = 0.0;
@@ -6412,22 +6427,31 @@ impl App {
                     tray::start();
                 }
             }
-            Message::CloseWindow => {
-                match self.hwnd.filter(|_| self.is_playing()) {
-                    Some(hwnd) => hide_window(hwnd),
-                    None => return self.update(Message::Quit),
-                }
-            }
+            // Как у Tune Client: крестик прячет окно в трей, если это не выключено в настройках.
+            Message::CloseWindow => match self.hwnd.filter(|_| self.window_prefs.close_to_tray) {
+                Some(hwnd) => hide_window(hwnd),
+                None => return self.update(Message::Quit),
+            },
             Message::Tray(event) => match event {
-                tray::Event::Window => {
+                tray::Event::Show => {
                     if let Some(hwnd) = self.hwnd {
-                        if window_away(hwnd) { show_window(hwnd) } else { minimize_window(hwnd) }
+                        show_window(hwnd);
                     }
+                }
+                tray::Event::Settings => {
+                    if let Some(hwnd) = self.hwnd {
+                        show_window(hwnd);
+                    }
+                    self.settings_tab = SettingsTab::Window;
+                    return self.update(Message::Open(Section::Settings));
+                }
+                tray::Event::Restart => {
+                    restart();
+                    return self.update(Message::Quit);
                 }
                 tray::Event::Toggle => return self.update(Message::Toggle),
                 tray::Event::Next => return self.update(Message::Next),
                 tray::Event::Previous => return self.update(Message::Previous),
-                tray::Event::Open(url) => return self.update(Message::OpenUrl(url.to_string())),
                 tray::Event::Quit => return self.update(Message::Quit),
             },
             Message::Media(event) => {
@@ -7506,6 +7530,15 @@ impl App {
         hint(glow(button(container(ui::icon(ui::MORE, size, ui::c().muted)).center(LIKE)).padding(0).style(ui::ghost).on_press(Message::MenuOpen(track.clone())), 20.0), "Ещё")
     }
 
+    /// Заголовок окна: «Исполнитель — трек», как у Tune Client, или просто «Tune».
+    fn title(&self) -> String {
+        match self.current_track().filter(|_| self.window_prefs.track_title) {
+            Some(track) if !track.title.is_empty() && track.artists.is_empty() => track.title.clone(),
+            Some(track) if !track.title.is_empty() => format!("{} — {}", track.artists, track.title),
+            _ => "Tune".to_string(),
+        }
+    }
+
     fn view_sidebar(&self) -> Element<'_, Message> {
         let opened = match self.section {
             Section::Likes | Section::Playlists | Section::Albums | Section::Artists | Section::History | Section::Dislikes | Section::Downloads => Section::Collection,
@@ -7547,8 +7580,9 @@ impl App {
                 .push(item(ui::COLLECTION, "Коллекция", Section::Collection))
                 .spacing(4),
                 Space::new().height(16),
-                self.view_pins(),
-                Space::new().height(Length::Fill),
+                // Закреплённого бывает больше, чем помещается в низкое окно: оно листается,
+                // а профиль остаётся внизу.
+                ui::scroll_y_thin(self.view_pins()).height(Length::Fill),
                 profile,
             ]
             .spacing(4),
@@ -7887,6 +7921,24 @@ impl App {
                     column![title("Оформление"), looks, toggle("Включить lite-версию", "Визуальные эффекты и анимации будут загружаться в облегчённом формате", Some(self.lite), Some(Message::LiteToggle))].spacing(12),
                     group("Плеер", vec![toggle("Помнить последний трек", "После запуска в плеере трек и очередь, что играли при выходе, — даже если сервер Яндекса их не вернул", Some(self.keep_track), Some(Message::KeepTrackToggle))]),
                     group("Боковая панель", vec![toggle("Детский раздел", "Пункт «Детям» в боковой панели: сказки, песни и аудиокниги для детей", Some(self.kids), Some(Message::KidsToggle))]),
+                ]
+                .spacing(28)
+                .into()
+            }
+            SettingsTab::Window => {
+                let prefs = self.window_prefs;
+                let set = |change: fn(&mut settings::WindowPrefs)| {
+                    let mut next = prefs;
+                    change(&mut next);
+                    Some(Message::WindowPrefSet(next))
+                };
+                column![
+                    group("Запуск", vec![
+                        toggle("Запускать вместе с Windows", "Tune стартует свёрнутым в трей", Some(prefs.autostart), set(|p| p.autostart = !p.autostart)),
+                        toggle("Запускать свёрнутым", "Окно не появится при обычном запуске — откройте его из трея", Some(prefs.start_minimized), set(|p| p.start_minimized = !p.start_minimized)),
+                        toggle("Сворачивать в трей при закрытии", "Музыка продолжит играть. Выйти совсем — из меню значка в трее", Some(prefs.close_to_tray), set(|p| p.close_to_tray = !p.close_to_tray)),
+                    ]),
+                    group("Вид", vec![toggle("Трек в заголовке окна", "«Исполнитель — трек» на панели задач и в Alt+Tab", Some(prefs.track_title), set(|p| p.track_title = !p.track_title))]),
                 ]
                 .spacing(28)
                 .into()
@@ -9303,27 +9355,61 @@ fn page_section(page: &str) -> Section {
     }
 }
 
-/// Окно выходит вперёд, даже если было свёрнуто.
-/// Окно свёрнуто или спрятано в трей.
-fn window_away(hwnd: isize) -> bool {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
-    let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
-    // SAFETY: только чтение состояния своего окна.
-    unsafe { IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 }
-}
-
 fn hide_window(hwnd: isize) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
     // SAFETY: своё окно; вернёт его клик по значку в трее.
     unsafe { ShowWindow(hwnd as windows_sys::Win32::Foundation::HWND, SW_HIDE) };
 }
 
-fn minimize_window(hwnd: isize) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_MINIMIZE};
-    // SAFETY: своё окно.
-    unsafe { ShowWindow(hwnd as windows_sys::Win32::Foundation::HWND, SW_MINIMIZE) };
+/// Флаг автозапуска: Tune стартует спрятанным в трей.
+const MINIMIZED_FLAG: &str = "--minimized";
+/// Перезапуск: новая копия ждёт, пока старая с этим номером процесса закроется.
+const RESTART_FLAG: &str = "--tune-restart=";
+const AUTOSTART_NAME: &str = "Tune Native";
+
+/// Автозапуск с Windows, как у Tune Client: значение в HKCU\…\Run.
+fn set_autostart(on: bool) -> Result<(), String> {
+    use windows_sys::Win32::System::Registry::{RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ};
+    let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let key = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+    let name = wide(AUTOSTART_NAME);
+    if !on {
+        // SAFETY: строки оканчиваются нулём. Значения могло и не быть — это не ошибка.
+        unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr()) };
+        return Ok(());
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let value = wide(&format!("\"{}\" {MINIMIZED_FLAG}", exe.display()));
+    // SAFETY: строки оканчиваются нулём, длина значения — в байтах вместе с нулём.
+    let status = unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr(), REG_SZ, value.as_ptr().cast(), (value.len() * 2) as u32) };
+    if status == 0 { Ok(()) } else { Err("Не удалось включить автозапуск".to_string()) }
 }
 
+/// Новая копия Tune с теми же ключами; эта после вызова закрывается.
+fn restart() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut args: Vec<String> = std::env::args().skip(1).filter(|arg| !arg.starts_with(RESTART_FLAG) && arg != MINIMIZED_FLAG).collect();
+    args.push(format!("{RESTART_FLAG}{}", std::process::id()));
+    if let Err(e) = std::process::Command::new(exe).args(args).spawn() {
+        api::log(&format!("перезапуск: {e}"));
+    }
+}
+
+/// Ждёт, пока закроется прежняя копия, — иначе новая отдала бы запуск ей.
+fn wait_for_exit(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    // SAFETY: только ожидание чужого процесса, дескриптор закрывается здесь же.
+    unsafe {
+        let process = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if !process.is_null() {
+            WaitForSingleObject(process, 10_000);
+            CloseHandle(process);
+        }
+    }
+}
+
+/// Окно выходит вперёд, даже если было свёрнуто или спрятано в трей.
 fn show_window(hwnd: isize) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW};
     let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
@@ -9833,6 +9919,7 @@ fn eq_place((x, y): (f32, f32)) -> (f32, f32) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsTab {
     Main,
+    Window,
     Sound,
     Recommendations,
     Downloads,
@@ -9841,11 +9928,12 @@ enum SettingsTab {
 }
 
 impl SettingsTab {
-    const ALL: [SettingsTab; 6] = [SettingsTab::Main, SettingsTab::Sound, SettingsTab::Recommendations, SettingsTab::Downloads, SettingsTab::Hotkeys, SettingsTab::Account];
+    const ALL: [SettingsTab; 7] = [SettingsTab::Main, SettingsTab::Window, SettingsTab::Sound, SettingsTab::Recommendations, SettingsTab::Downloads, SettingsTab::Hotkeys, SettingsTab::Account];
 
     fn label(self) -> &'static str {
         match self {
             SettingsTab::Main => "Основные",
+            SettingsTab::Window => "Окно",
             SettingsTab::Sound => "Звук",
             SettingsTab::Recommendations => "Рекомендации",
             SettingsTab::Downloads => "Скачанное",
@@ -10701,7 +10789,13 @@ fn smoke_library(query: &str) -> Result<(), String> {
 }
 
 fn main() -> iced::Result {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    // Перезапуск из трея: прежняя копия ещё закрывается.
+    if let Some(pid) = args.iter().find_map(|arg| arg.strip_prefix(RESTART_FLAG)?.parse().ok()) {
+        wait_for_exit(pid);
+    }
+    let minimized = args.iter().any(|arg| arg == MINIMIZED_FLAG);
+    args.retain(|arg| !arg.starts_with(RESTART_FLAG) && arg != MINIMIZED_FLAG);
     if args.get(1).is_some_and(|flag| flag == "--login") {
         login::run();
     }
@@ -10855,15 +10949,33 @@ fn main() -> iced::Result {
     ui::YANDEX_FONTS.store(!yandex_fonts.is_empty(), Ordering::Relaxed);
     // Для проверки вёрстки: снимки предпросмотра в узком окне.
     let width = preview.as_ref().and(std::env::var("TUNE_PREVIEW_WIDTH").ok()).and_then(|w| w.parse().ok()).unwrap_or(1280.0_f32);
+    let height = preview.as_ref().and(std::env::var("TUNE_PREVIEW_HEIGHT").ok()).and_then(|h| h.parse().ok()).unwrap_or(820.0_f32);
+    let prefs = settings::load().window;
+    // Установщик или перенос папки меняют путь к программе: запись автозапуска обновляется.
+    if prefs.autostart && preview.is_none() {
+        std::thread::spawn(|| {
+            if let Err(e) = set_autostart(true) {
+                api::log(&format!("автозапуск: {e}"));
+            }
+        });
+    }
+    let visible = preview.is_some() || !(minimized || prefs.start_minimized);
     let mut app = iced::application(move || App::new(preview.clone()), App::update, App::view);
     for font in yandex_fonts {
         app = app.font(font);
     }
-    app.title("Tune")
+    app.title(App::title)
         .theme(|_: &App| ui::theme())
         .default_font(ui::font())
         .subscription(App::subscription)
-        .window(window::Settings { size: Size::new(width, 820.0), min_size: Some(Size::new(900.0, 600.0)), exit_on_close_request: false, ..window::Settings::default() })
+        .window(window::Settings {
+            size: Size::new(width, height),
+            min_size: Some(Size::new(900.0, MIN_HEIGHT)),
+            visible,
+            icon: window::icon::from_file_data(&tray::ICON[..], None).ok(),
+            exit_on_close_request: false,
+            ..window::Settings::default()
+        })
         .run()
 }
 
