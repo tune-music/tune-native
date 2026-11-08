@@ -7,6 +7,7 @@ mod concerts;
 mod sync;
 mod video;
 mod ynison;
+mod tray;
 mod dpi;
 mod client;
 mod fonts;
@@ -767,7 +768,8 @@ enum Preview {
     Account,
     LogoutAsk,
     /// Вкладка настроек.
-    Settings,
+    /// Настройки на вкладке по номеру.
+    Settings(usize),
     /// Очередь, сохранённая при прошлом выходе.
     Restored,
     PinMenu,
@@ -1000,6 +1002,9 @@ struct App {
     wheel_target: f32,
     /// Показывать ли колесо волны.
     wheel_on: bool,
+    keep_track: bool,
+    /// Открытая вкладка настроек.
+    settings_tab: SettingsTab,
     /// Раскрыто ли колесо и насколько оно уже выехало, от 0 до 1.
     wheel_open: bool,
     wheel_reveal: f32,
@@ -1338,6 +1343,8 @@ enum Message {
     /// Повернуть колесо на столько шагов.
     WheelSpin(f32),
     WheelToggle,
+    KeepTrackToggle,
+    SettingsTabSet(SettingsTab),
     /// Раскрыть колесо или вернуться к волне.
     WheelShow(bool),
     /// Прокрутка над колесом в щелчках колёсика: дробные копятся до целого шага.
@@ -1496,6 +1503,9 @@ enum Message {
     NoticeClear(u64),
     WindowReady(Option<isize>),
     WindowSize(Size),
+    /// Крестик окна: во время музыки окно уходит в трей, как у оригинала.
+    CloseWindow,
+    Tray(tray::Event),
     Media(media::Event),
     Play(Section, usize),
     Started(u64, Result<api::Sound, String>),
@@ -1668,6 +1678,8 @@ impl App {
             wheel_turn: 0.0,
             wheel_target: 0.0,
             wheel_on: saved.wheel,
+            keep_track: saved.keep_track,
+            settings_tab: SettingsTab::Main,
             wheel_open: false,
             wheel_reveal: 0.0,
             wheel_scroll: 0.0,
@@ -1957,7 +1969,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, keep_track: self.keep_track });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -3558,6 +3570,8 @@ impl App {
                 };
             }
             self.session_store(true);
+            tray::sync(false, false, false);
+            tray::remove();
             return iced::exit();
         }
         if let Message::Frame(now) = message {
@@ -3719,6 +3733,7 @@ impl App {
         if let Some(media) = &mut self.media {
             media.sync(track.as_ref(), playing, position);
         }
+        tray::sync(self.is_playing(), track.is_some(), self.hwnd.is_some_and(window_away));
         Task::batch([task, snap, more, covers, lyrics])
     }
 
@@ -4031,8 +4046,9 @@ impl App {
                         // Отдельным сообщением: смена страницы очищает поиск уже после этого обработчика.
                         Task::batch([page, Task::done(Message::Filter(query))])
                     }
-                    Some(Preview::Settings) => {
+                    Some(Preview::Settings(tab)) => {
                         self.preview = None;
+                        self.settings_tab = SettingsTab::ALL[tab.min(SettingsTab::ALL.len() - 1)];
                         self.update(Message::Open(Section::Settings))
                     }
                     Some(Preview::WaveRestored) => {
@@ -4086,7 +4102,7 @@ impl App {
                         self.update(Message::Search)
                     }
                     // Главная сразу показывает трек и управление, как в оригинале.
-                    None if self.queue.is_empty() => match session::load() {
+                    None if self.queue.is_empty() => match session::load().filter(|_| self.keep_track) {
                         Some(saved) => self.restore(saved),
                         None => self.token().map_or(Task::none(), |token| Task::perform(background(move || api::wave_last(&token)), Message::WaveLast)),
                     },
@@ -5300,6 +5316,15 @@ impl App {
                     self.wheel_target = (self.wheel_turn + ahead).round();
                 }
             }
+            Message::KeepTrackToggle => {
+                self.keep_track = !self.keep_track;
+                self.save_settings();
+            }
+            Message::SettingsTabSet(tab) => {
+                self.settings_tab = tab;
+                self.list_offset = 0.0;
+                return operation::snap_to(Id::new(LIST), scrollable::RelativeOffset::START);
+            }
             Message::WheelToggle => {
                 self.wheel_on = !self.wheel_on;
                 self.wheel_open = false;
@@ -6382,7 +6407,29 @@ impl App {
                     dpi::guard(hwnd);
                 }
                 self.media = hwnd.map(Media::new);
+                // У предпросмотров значка нет: их закрывают снаружи, и он оставался бы висеть.
+                if self.preview.is_none() {
+                    tray::start();
+                }
             }
+            Message::CloseWindow => {
+                match self.hwnd.filter(|_| self.is_playing()) {
+                    Some(hwnd) => hide_window(hwnd),
+                    None => return self.update(Message::Quit),
+                }
+            }
+            Message::Tray(event) => match event {
+                tray::Event::Window => {
+                    if let Some(hwnd) = self.hwnd {
+                        if window_away(hwnd) { show_window(hwnd) } else { minimize_window(hwnd) }
+                    }
+                }
+                tray::Event::Toggle => return self.update(Message::Toggle),
+                tray::Event::Next => return self.update(Message::Next),
+                tray::Event::Previous => return self.update(Message::Previous),
+                tray::Event::Open(url) => return self.update(Message::OpenUrl(url.to_string())),
+                tray::Event::Quit => return self.update(Message::Quit),
+            },
             Message::Media(event) => {
                 let playing = self.active && !self.player.as_ref().is_none_or(Player::is_paused);
                 match event {
@@ -7826,95 +7873,70 @@ impl App {
         let title = |label| text(label).size(20).font(ui::font_medium()).color(ui::c().text);
         let choice = |label, chosen, press| shine(button(text(label)).padding([9, 18]).style(if chosen { ui::accent } else { ui::secondary }).on_press(press), 20.0);
         let link = |label, press| shine(button(text(label)).padding([9, 18]).style(ui::secondary).on_press(press), 20.0);
+        // Строка с переключателем: название, пояснение и сам переключатель справа.
+        let toggle = |label: &'static str, about: &'static str, on: Option<bool>, press: Option<Message>| -> Element<'_, Message> {
+            let line = row![column![text(label).color(ui::c().text), text(about).size(13).color(ui::c().muted)].spacing(2).width(Length::Fill), view_switch(on)].spacing(16).align_y(Alignment::Center);
+            glow(button(line).width(Length::Fill).padding(8).style(ui::row).on_press_maybe(press), 8.0)
+        };
+        let group = |name, items: Vec<Element<'static, Message>>| -> Element<'static, Message> { column![title(name)].extend(items).spacing(8).into() };
 
-        let quality = Quality::ALL.into_iter().fold(row![].spacing(8), |line, quality| line.push(choice(quality.label(), quality == self.quality, Message::QualitySet(quality))));
-        let mut sound = column![title("Качество звука"), quality].spacing(12);
-        if let Some(playing) = &self.sound {
-            sound = sound.push(text(format!("Сейчас играет: {}", playing.label)).size(13).color(ui::c().muted));
-            if playing.below(self.quality.code()) {
-                sound = sound.push(text("Яндекс не дал этот трек в выбранном качестве: играет лучшее, что есть для вашего аккаунта").size(13).color(ui::c().muted));
+        let content: Element<'_, Message> = match self.settings_tab {
+            SettingsTab::Main => {
+                let looks = Look::ALL.into_iter().fold(row![].spacing(8), |line, look| line.push(choice(look.label(), look == self.look, Message::LookSet(look))));
+                column![
+                    column![title("Оформление"), looks, toggle("Включить lite-версию", "Визуальные эффекты и анимации будут загружаться в облегчённом формате", Some(self.lite), Some(Message::LiteToggle))].spacing(12),
+                    group("Плеер", vec![toggle("Помнить последний трек", "После запуска в плеере трек и очередь, что играли при выходе, — даже если сервер Яндекса их не вернул", Some(self.keep_track), Some(Message::KeepTrackToggle))]),
+                    group("Боковая панель", vec![toggle("Детский раздел", "Пункт «Детям» в боковой панели: сказки, песни и аудиокниги для детей", Some(self.kids), Some(Message::KidsToggle))]),
+                ]
+                .spacing(28)
+                .into()
             }
-        }
-
-        let ai = row![
-            column![text("Меньше ИИ").color(ui::c().text), text("В рекомендациях будет реже встречаться музыка, созданная с помощью ИИ").size(13).color(ui::c().muted)].spacing(2).width(Length::Fill),
-            view_switch(self.ai_less),
-        ]
-        .spacing(16)
-        .align_y(Alignment::Center);
-        let ai = glow(button(ai).width(Length::Fill).padding(8).style(ui::row).on_press_maybe(self.ai_less.map(|enabled| Message::AiLessSet(!enabled))), 8.0);
-
-        let cross = row![
-            column![text("Плавные переходы между треками").color(ui::c().text), text("Конец трека перетекает в начало следующего").size(13).color(ui::c().muted)].spacing(2).width(Length::Fill),
-            view_switch(Some(self.crossfade)),
-        ]
-        .spacing(16)
-        .align_y(Alignment::Center);
-        let cross = glow(button(cross).width(Length::Fill).padding(8).style(ui::row).on_press(Message::CrossfadeToggle), 8.0);
-
-        let normalize = row![
-            column![text("Одинаковая громкость треков").color(ui::c().text), text("Тихие и громкие записи звучат на одном уровне, по данным Яндекса о громкости трека").size(13).color(ui::c().muted)].spacing(2).width(Length::Fill),
-            view_switch(Some(self.normalize)),
-        ]
-        .spacing(16)
-        .align_y(Alignment::Center);
-        let normalize = glow(button(normalize).width(Length::Fill).padding(8).style(ui::row).on_press(Message::NormalizeToggle), 8.0);
-
-        let lite = row![
-            column![text("Включить lite-версию").color(ui::c().text), text("Визуальные эффекты и анимации будут загружаться в облегчённом формате").size(13).color(ui::c().muted)].spacing(2).width(Length::Fill),
-            view_switch(Some(self.lite)),
-        ]
-        .spacing(16)
-        .align_y(Alignment::Center);
-        let lite = glow(button(lite).width(Length::Fill).padding(8).style(ui::row).on_press(Message::LiteToggle), 8.0);
-
-        let kids = row![
-            column![text("Детский раздел").color(ui::c().text), text("Пункт «Детям» в боковой панели: сказки, песни и аудиокниги для детей").size(13).color(ui::c().muted)].spacing(2).width(Length::Fill),
-            view_switch(Some(self.kids)),
-        ]
-        .spacing(16)
-        .align_y(Alignment::Center);
-        let kids = glow(button(kids).width(Length::Fill).padding(8).style(ui::row).on_press(Message::KidsToggle), 8.0);
-
-        let words = row![
-            column![text("Слова в волне").color(ui::c().text), text("Короткие факты о треках от ИИ на экране Моей волны").size(13).color(ui::c().muted)].spacing(2).width(Length::Fill),
-            view_switch(Some(self.words_on)),
-        ]
-        .spacing(16)
-        .align_y(Alignment::Center);
-        let words = glow(button(words).width(Length::Fill).padding(8).style(ui::row).on_press(Message::WordsToggle), 8.0);
-
-        let wheel = row![
-            column![text("Колесо волны").color(ui::c().text), text("Подсказки волн по настроению, жанру и артистам над Моей волной").size(13).color(ui::c().muted)].spacing(2).width(Length::Fill),
-            view_switch(Some(self.wheel_on)),
-        ]
-        .spacing(16)
-        .align_y(Alignment::Center);
-        let wheel = glow(button(wheel).width(Length::Fill).padding(8).style(ui::row).on_press(Message::WheelToggle), 8.0);
-
-        let looks = Look::ALL.into_iter().fold(row![].spacing(8), |line, look| line.push(choice(look.label(), look == self.look, Message::LookSet(look))));
-        let page = column![
-            text("Настройки").size(36).font(ui::font_headline()).color(ui::c().text),
-            column![title("Оформление"), looks, lite].spacing(12),
-            sound,
-            self.view_equalizer(),
-            cross,
-            normalize,
-            column![title("Рекомендации"), ai, wheel, words, kids].spacing(8),
-            self.view_stored(),
-            view_hotkeys(),
-            column![title("Аккаунт"), row![link("Управление аккаунтом", Message::DialogOpen(Dialog::Account)), link("Выйти", Message::DialogOpen(Dialog::Logout))].spacing(8)].spacing(12),
-            column![
-                title("О приложении"),
-                text(format!("Tune Native, версия {}", env!("CARGO_PKG_VERSION"))).color(ui::c().muted),
-                row![link("Помощь", Message::OpenLink("https://yandex.ru/support/music/")), link("Условия использования", Message::OpenLink("https://yandex.ru/legal/music_termsofuse/"))].spacing(8),
+            SettingsTab::Sound => {
+                let quality = Quality::ALL.into_iter().fold(row![].spacing(8), |line, quality| line.push(choice(quality.label(), quality == self.quality, Message::QualitySet(quality))));
+                let mut sound = column![title("Качество звука"), quality].spacing(12);
+                if let Some(playing) = &self.sound {
+                    sound = sound.push(text(format!("Сейчас играет: {}", playing.label)).size(13).color(ui::c().muted));
+                    if playing.below(self.quality.code()) {
+                        sound = sound.push(text("Яндекс не дал этот трек в выбранном качестве: играет лучшее, что есть для вашего аккаунта").size(13).color(ui::c().muted));
+                    }
+                }
+                column![
+                    sound,
+                    self.view_equalizer(),
+                    group("Воспроизведение", vec![
+                        toggle("Плавные переходы между треками", "Конец трека перетекает в начало следующего", Some(self.crossfade), Some(Message::CrossfadeToggle)),
+                        toggle("Одинаковая громкость треков", "Тихие и громкие записи звучат на одном уровне, по данным Яндекса о громкости трека", Some(self.normalize), Some(Message::NormalizeToggle)),
+                    ]),
+                ]
+                .spacing(28)
+                .into()
+            }
+            SettingsTab::Recommendations => group("Рекомендации", vec![
+                toggle("Меньше ИИ", "В рекомендациях будет реже встречаться музыка, созданная с помощью ИИ", self.ai_less, self.ai_less.map(|enabled| Message::AiLessSet(!enabled))),
+                toggle("Колесо волны", "Подсказки волн по настроению, жанру и артистам над Моей волной", Some(self.wheel_on), Some(Message::WheelToggle)),
+                toggle("Слова в волне", "Короткие факты о треках от ИИ на экране Моей волны", Some(self.words_on), Some(Message::WordsToggle)),
+            ]),
+            SettingsTab::Downloads => self.view_stored(),
+            SettingsTab::Hotkeys => view_hotkeys(),
+            SettingsTab::Account => column![
+                column![title("Аккаунт"), row![link("Управление аккаунтом", Message::DialogOpen(Dialog::Account)), link("Выйти", Message::DialogOpen(Dialog::Logout))].spacing(8).wrap().vertical_spacing(8)].spacing(12),
+                column![
+                    title("О приложении"),
+                    text(format!("Tune Native, версия {}", env!("CARGO_PKG_VERSION"))).color(ui::c().muted),
+                    row![link("Помощь", Message::OpenLink("https://yandex.ru/support/music/")), link("Условия использования", Message::OpenLink("https://yandex.ru/legal/music_termsofuse/"))].spacing(8).wrap().vertical_spacing(8),
+                ]
+                .spacing(12),
             ]
-            .spacing(12),
-        ]
-        .spacing(28)
-        .max_width(700)
-        .padding(Padding::ZERO.right(20));
-        ui::scroll(page).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill).into()
+            .spacing(28)
+            .into(),
+        };
+        let tabs = SettingsTab::ALL.into_iter().fold(row![].spacing(8), |tabs, tab| {
+            tabs.push(shine(button(text(tab.label()).wrapping(Wrapping::None)).padding([7, 16]).style(ui::chip(tab == self.settings_tab)).on_press(Message::SettingsTabSet(tab)), 18.0))
+        });
+        let head = column![text("Настройки").size(36).font(ui::font_headline()).color(ui::c().text), tabs.wrap().vertical_spacing(8)].spacing(16);
+        let body = container(content).max_width(700).padding(Padding::ZERO.right(20));
+        let scroll = ui::scroll(body).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill);
+        column![head, scroll].spacing(24).height(Length::Fill).into()
     }
 
     /// Сколько скачано и сколько места занимает, с переходом к списку и очисткой.
@@ -9282,10 +9304,33 @@ fn page_section(page: &str) -> Section {
 }
 
 /// Окно выходит вперёд, даже если было свёрнуто.
+/// Окно свёрнуто или спрятано в трей.
+fn window_away(hwnd: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
+    let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+    // SAFETY: только чтение состояния своего окна.
+    unsafe { IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 }
+}
+
+fn hide_window(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    // SAFETY: своё окно; вернёт его клик по значку в трее.
+    unsafe { ShowWindow(hwnd as windows_sys::Win32::Foundation::HWND, SW_HIDE) };
+}
+
+fn minimize_window(hwnd: isize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_MINIMIZE};
+    // SAFETY: своё окно.
+    unsafe { ShowWindow(hwnd as windows_sys::Win32::Foundation::HWND, SW_MINIMIZE) };
+}
+
 fn show_window(hwnd: isize) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW};
     let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
     unsafe {
+        if IsWindowVisible(hwnd) == 0 {
+            ShowWindow(hwnd, SW_SHOW);
+        }
         if IsIconic(hwnd) != 0 {
             ShowWindow(hwnd, SW_RESTORE);
         }
@@ -9643,7 +9688,7 @@ impl PipeMedia for Subscription<Message> {
                 None
             }
             Event::Window(window::Event::Resized(size)) => Some(Message::WindowSize(size)),
-            Event::Window(window::Event::CloseRequested) => Some(Message::Quit),
+            Event::Window(window::Event::CloseRequested) => Some(Message::CloseWindow),
             Event::Keyboard(keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Escape), .. }) => Some(Message::MenuClose),
             // Tab переходит между полями ввода: поиском, фильтром и полем окна.
             Event::Keyboard(keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::Tab), modifiers, .. }) => Some(Message::FocusMove(!modifiers.shift())),
@@ -9652,7 +9697,7 @@ impl PipeMedia for Subscription<Message> {
             Event::Keyboard(keyboard::Event::KeyPressed { key, physical_key, modifiers, .. }) if status == event::Status::Ignored => hotkey(&key, physical_key, modifiers),
             _ => None,
         });
-        Subscription::batch([self, back, Subscription::run(media::events).map(Message::Media), Subscription::run(pipe::links).map(Message::LinkFromOutside)])
+        Subscription::batch([self, back, Subscription::run(media::events).map(Message::Media), Subscription::run(pipe::links).map(Message::LinkFromOutside), Subscription::run(tray::events).map(Message::Tray)])
     }
 }
 
@@ -9782,6 +9827,32 @@ fn view_hotkeys<'a>() -> Element<'a, Message> {
 /// Эквалайзер открывается от кнопки в трекбаре: по высоте он встаёт над трекбаром.
 fn eq_place((x, y): (f32, f32)) -> (f32, f32) {
     (x, y)
+}
+
+/// Вкладка настроек: по смыслу, чтобы не листать всё одним списком.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsTab {
+    Main,
+    Sound,
+    Recommendations,
+    Downloads,
+    Hotkeys,
+    Account,
+}
+
+impl SettingsTab {
+    const ALL: [SettingsTab; 6] = [SettingsTab::Main, SettingsTab::Sound, SettingsTab::Recommendations, SettingsTab::Downloads, SettingsTab::Hotkeys, SettingsTab::Account];
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingsTab::Main => "Основные",
+            SettingsTab::Sound => "Звук",
+            SettingsTab::Recommendations => "Рекомендации",
+            SettingsTab::Downloads => "Скачанное",
+            SettingsTab::Hotkeys => "Горячие клавиши",
+            SettingsTab::Account => "Аккаунт",
+        }
+    }
 }
 
 /// Пресет эквалайзера в выпадающем списке.
@@ -10728,7 +10799,8 @@ fn main() -> iced::Result {
             "menu" => Preview::Menu,
             "track-info" => Preview::TrackInfo,
             "account" => Preview::Account,
-            "settings" => Preview::Settings,
+            "settings" => Preview::Settings(0),
+            what if what.starts_with("settings:") => Preview::Settings(what["settings:".len()..].parse().unwrap_or(0)),
             "restored" => Preview::Restored,
             "logout-ask" => Preview::LogoutAsk,
             "pin-menu" => Preview::PinMenu,
