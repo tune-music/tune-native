@@ -166,6 +166,13 @@ pub fn with_files() -> Vec<String> {
     current().map(|list| list.files.keys().filter(|id| auto_on(Kind::Track, id)).cloned().collect()).unwrap_or_default()
 }
 
+/// Треки со своим аудиофайлом из «Подменить…»: удалённые Яндексом тоже ищутся по ним.
+pub fn own_audio_ids() -> Vec<String> {
+    let guard = OWN.read().unwrap();
+    let Some(tracks) = guard.as_ref().and_then(|own| own["track"].as_object()) else { return Vec::new() };
+    tracks.iter().filter(|(_, fields)| fields.get("audio").is_some()).map(|(id, _)| id.clone()).collect()
+}
+
 /// Включено ли «Без цензуры».
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)

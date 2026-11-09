@@ -2662,6 +2662,30 @@ impl App {
     }
 
     fn search_run(&mut self) -> Task<Message> {
+        let restored = self.restored_load();
+        Task::batch([restored, self.search_fetch()])
+    }
+
+    /// Удалённые Яндексом треки, которые вернул «Без цензуры» или своя подмена файлом, —
+    /// поиск Яндекса их не находит. Подходят, если все слова запроса есть в «исполнитель
+    /// название», как «гидропон cupsize».
+    fn restored_matches(&self, query: &str, have: &[Track]) -> Vec<Track> {
+        let words: Vec<String> = search_words(query);
+        if words.iter().map(String::len).sum::<usize>() < 3 {
+            return Vec::new();
+        }
+        self.restored_wave
+            .iter()
+            .filter(|track| !have.iter().any(|known| known.id == track.id) && uncensor::file(&track.id).is_some())
+            .filter(|track| {
+                let hay = search_words(&format!("{} {}", track.artists, track.title)).join(" ");
+                words.iter().all(|word| hay.contains(word.as_str()))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn search_fetch(&mut self) -> Task<Message> {
         let Some(token) = self.token() else { return Task::none() };
         let text = self.query.trim().to_string();
         self.search_id += 1;
@@ -2692,6 +2716,11 @@ impl App {
     }
 
     fn search_show(&mut self, found: Found) -> Task<Message> {
+        let mut found = found;
+        if matches!(self.search_tab, SearchTab::All | SearchTab::Tracks) {
+            let restored = self.restored_matches(self.query.trim(), &found.tracks);
+            found.tracks.splice(0..0, restored);
+        }
         self.results = found.tracks.clone();
         self.found = found;
         self.searched = true;
@@ -3707,16 +3736,21 @@ impl App {
     /// Удалённые треки с версией без цензуры: какие из треков списка FckCensor Яндекс закрыл.
     /// Раз в сутки, в фоне; похожие исполнители для оценки подгружаются заодно.
     fn restored_load(&mut self) -> Task<Message> {
-        if !self.restored_in_wave || !uncensor::enabled() {
-            return Task::none();
-        }
         let Some(token) = self.token() else { return Task::none() };
-        let seeds: Vec<String> = taste::liked_artists().into_iter().chain(self.recent_wave_artists()).collect();
-        taste::load_similar(seeds, token.clone());
+        if self.restored_in_wave && uncensor::enabled() {
+            let seeds: Vec<String> = taste::liked_artists().into_iter().chain(self.recent_wave_artists()).collect();
+            taste::load_similar(seeds, token.clone());
+        }
         if self.restored_at.is_some_and(|at| at.elapsed() < RESTORED_TTL) {
             return Task::none();
         }
-        let ids = uncensor::with_files();
+        // Удалённые с версией без цензуры и свои подмены файлом — их Яндекс тоже может не знать.
+        let mut ids = uncensor::with_files();
+        for id in uncensor::own_audio_ids() {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
         if ids.is_empty() {
             return Task::none();
         }
@@ -6059,7 +6093,14 @@ impl App {
                 self.save_settings();
             }
             Message::RestoredWave(result) => match result {
-                Ok(tracks) => self.restored_wave = tracks,
+                Ok(tracks) => {
+                    self.restored_wave = tracks;
+                    // Список пришёл, когда поиск уже показан: удалённые встают в его начало.
+                    if self.section == Section::Search && self.searched {
+                        let found = self.found.clone();
+                        return self.search_show(found);
+                    }
+                }
                 Err(e) => {
                     api::log(&format!("Удалённые треки для волны: {e}"));
                     // Повтор через час, а не через сутки.
@@ -11063,6 +11104,12 @@ fn grouped(n: u64) -> String {
     out
 }
 
+/// Слова для поиска без регистра, «ё» и знаков: «Гидропон!» и «гидропон» — одно.
+fn search_words(text: &str) -> Vec<String> {
+    let clean: String = text.to_lowercase().replace('ё', "е").chars().map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect();
+    clean.split_whitespace().map(str::to_string).collect()
+}
+
 /// Через сколько треков волны может встать следующий удалённый: от 10 до 15.
 fn restored_gap() -> usize {
     10 + (random_seed() % 6) as usize
@@ -12617,6 +12664,12 @@ mod lyrics_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn search_words_ignore_case_and_marks() {
+        assert_eq!(super::search_words("Гидропон, CUPSIZE!"), ["гидропон", "cupsize"]);
+        assert_eq!(super::search_words("Ёлки"), ["елки"]);
+    }
+
     #[test]
     fn any_long_track_gets_a_plain_fade() {
         let song = Track { duration: Duration::from_secs(180), ..Track::default() };
