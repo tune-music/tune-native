@@ -585,6 +585,20 @@ pub fn tracks_by_ids(ids: &[String], token: &str) -> Result<Vec<Track>, String> 
     Ok(ids.iter().filter_map(|id| found.iter().find(|t| t.id == *id).cloned()).collect())
 }
 
+/// Какие из треков Яндекс закрыл или удалил: `available: false` в ответе как есть, до
+/// подмены «Без цензуры».
+pub fn unavailable_ids(ids: &[String], token: &str) -> Result<Vec<String>, String> {
+    let body = format!("track-ids={}", ids.join("%2C"));
+    let v = post("tracks", "application/x-www-form-urlencoded", body, token)?;
+    Ok(v["result"].as_array().into_iter().flatten().filter(|t| t["available"].as_bool() == Some(false)).filter_map(|t| id_text(&t["id"])).collect())
+}
+
+/// Номера похожих исполнителей.
+pub fn similar_artist_ids(id: &str, token: &str) -> Result<Vec<String>, String> {
+    let v = get(&format!("artists/{id}/similar"), &[], token)?;
+    Ok(result(&v)["similarArtists"].as_array().into_iter().flatten().filter_map(|a| id_text(&a["id"])).collect())
+}
+
 /// Сколько найденных треков показываем при поиске внутри списка.
 const FILTER_LIMIT: usize = 300;
 const FILTER_PAGE: usize = 100;

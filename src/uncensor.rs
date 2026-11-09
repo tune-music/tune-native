@@ -161,6 +161,16 @@ fn auto_file(id: &str) -> Option<String> {
     })
 }
 
+/// Треки, у которых в списке есть файл: среди них ищутся удалённые Яндексом для волны.
+pub fn with_files() -> Vec<String> {
+    current().map(|list| list.files.keys().filter(|id| auto_on(Kind::Track, id)).cloned().collect()).unwrap_or_default()
+}
+
+/// Включено ли «Без цензуры».
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
 /// У трека есть версия без цензуры: рядом с названием ставится значок.
 pub fn has(id: &str) -> bool {
     auto(Kind::Track, id).is_some_and(|list| list.files.contains_key(id))

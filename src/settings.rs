@@ -142,6 +142,8 @@ pub struct Settings {
     pub keep_track: bool,
     /// Свои загруженные треки иногда попадаются в «Моей волне», как в Tune Client.
     pub own_in_wave: bool,
+    /// Удалённые Яндексом треки, которые вернул «Без цензуры», подмешиваются в волну по вкусу.
+    pub restored_in_wave: bool,
     /// Без цензуры по списку FckCensor, как в Tune Client.
     pub uncensor: bool,
     pub window: WindowPrefs,
@@ -230,6 +232,7 @@ fn parse(v: &Value) -> Settings {
         keep_track: v["keepTrack"].as_bool().unwrap_or(true),
         uncensor: v["uncensor"].as_bool().unwrap_or(true),
         own_in_wave: v["ownInWave"].as_bool().unwrap_or(true),
+        restored_in_wave: v["restoredInWave"].as_bool().unwrap_or(true),
         volume_wheel: v["volumeWheel"].as_bool().unwrap_or(true),
         speed_control: v["speedControl"].as_bool().unwrap_or(false),
         speed_step: v["speedStep"].as_f64().map(|x| ((x * 100.0).round() / 100.0) as f32).filter(|x| (SPEED_STEP_MIN..=SPEED_STEP_MAX).contains(x)).unwrap_or(0.25),
@@ -294,7 +297,7 @@ pub fn save(settings: Settings) {
     let lyrics = json!({ "enabled": l.enabled, "always": l.always, "lrclib": l.lrclib, "netease": l.netease, "neteaseFirst": l.netease_first });
     let w = settings.window;
     let window = json!({ "autostart": w.autostart, "startMinimized": w.start_minimized, "closeToTray": w.close_to_tray, "trackInTitle": w.track_title, "trackInTaskbar": w.track_taskbar, "yandexLinks": w.yandex_links });
-    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "books": settings.books, "concerts": settings.concerts, "words": settings.words, "wheel": settings.wheel, "speed": settings.speed, "theme": settings.look.code(), "keepTrack": settings.keep_track, "uncensor": settings.uncensor, "ownInWave": settings.own_in_wave, "window": window, "volumeWheel": settings.volume_wheel, "volumeStep": settings.volume_step, "speedControl": settings.speed_control, "speedStep": settings.speed_step, "pitchWithSpeed": settings.pitch, "reverb": settings.reverb, "lyrics": lyrics, "lyricsSize": settings.lyrics_size });
+    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "books": settings.books, "concerts": settings.concerts, "words": settings.words, "wheel": settings.wheel, "speed": settings.speed, "theme": settings.look.code(), "keepTrack": settings.keep_track, "uncensor": settings.uncensor, "ownInWave": settings.own_in_wave, "restoredInWave": settings.restored_in_wave, "window": window, "volumeWheel": settings.volume_wheel, "volumeStep": settings.volume_step, "speedControl": settings.speed_control, "speedStep": settings.speed_step, "pitchWithSpeed": settings.pitch, "reverb": settings.reverb, "lyrics": lyrics, "lyricsSize": settings.lyrics_size });
     let dir = api::data_dir();
     if fs::create_dir_all(&dir).is_ok() {
         let _ = fs::write(dir.join("settings.json"), value.to_string());
@@ -308,9 +311,9 @@ mod tests {
     #[test]
     fn reads_saved_and_broken_values() {
         let saved = parse(&json!({ "volume": 0.25, "muted": true, "repeat": "one", "shuffle": true, "quality": "lossless", "normalize": true }));
-        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default(), crossfade: true, normalize: true, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, keep_track: true, uncensor: true, own_in_wave: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0, lyrics: crate::lyrics::Sources::default(), lyrics_size: 26 });
+        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default(), crossfade: true, normalize: true, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, keep_track: true, uncensor: true, own_in_wave: true, restored_in_wave: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0, lyrics: crate::lyrics::Sources::default(), lyrics_size: 26 });
         let empty = parse(&Value::Null);
-        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default(), crossfade: true, normalize: false, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, keep_track: true, uncensor: true, own_in_wave: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0, lyrics: crate::lyrics::Sources::default(), lyrics_size: 26 });
+        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default(), crossfade: true, normalize: false, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, keep_track: true, uncensor: true, own_in_wave: true, restored_in_wave: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0, lyrics: crate::lyrics::Sources::default(), lyrics_size: 26 });
         assert!(!parse(&json!({ "crossfade": false })).crossfade);
         assert!(!parse(&json!({ "kids": false })).kids);
         assert!(!parse(&json!({ "books": false })).books && !parse(&json!({ "concerts": false })).concerts);

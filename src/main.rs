@@ -13,6 +13,7 @@ mod tray;
 mod uncensor;
 mod export;
 mod placement;
+mod taste;
 mod protocol;
 mod dpi;
 mod caption;
@@ -355,6 +356,12 @@ const CROSS_MAX: f32 = 6.0;
 const OWN_WAVE_CHANCE: u64 = 25;
 /// Список своих треков для волны перечитывается раз в полчаса.
 const OWN_WAVE_TTL: Duration = Duration::from_secs(30 * 60);
+/// Список удалённых треков для волны перечитывается раз в сутки.
+const RESTORED_TTL: Duration = Duration::from_secs(24 * 3600);
+/// Сколько номеров спрашивать у Яндекса за раз.
+const RESTORED_CHUNK: usize = 200;
+/// Сколько последних треков очереди считаются «текущей волной» для оценки.
+const RECENT_WAVE: usize = 30;
 /// Короче этого переход не делается: от трека почти ничего не осталось бы.
 const PLAIN_FADE_MIN: f32 = 30.0;
 /// Выпуски и книги: шаг кнопок перемотки, как часто место уходит Яндексу, и границы,
@@ -1204,6 +1211,12 @@ struct App {
     /// Свои треки, что уже были в этой волне, и стоял ли свой трек в прошлой пачке.
     own_wave_used: HashSet<String>,
     own_wave_last: bool,
+    restored_in_wave: bool,
+    /// Удалённые Яндексом треки с версией без цензуры — кандидаты для волны.
+    restored_wave: Vec<Track>,
+    restored_at: Option<Instant>,
+    /// Сколько ещё треков волны до следующего удалённого: не чаще одного на 10–15.
+    restored_gap: usize,
     uncensor: bool,
     /// Запуск, трей и заголовок окна.
     window_prefs: settings::WindowPrefs,
@@ -1587,6 +1600,8 @@ enum Message {
     KeepTrackToggle,
     UncensorToggle,
     OwnInWaveToggle,
+    RestoredInWaveToggle,
+    RestoredWave(Result<Vec<Track>, String>),
     /// «Скачать в файл»: трек с тегами и обложкой в «Загрузки».
     SaveToFile(Track),
     FileSaved(String, Result<std::path::PathBuf, String>),
@@ -1984,6 +1999,10 @@ impl App {
             own_wave_at: None,
             own_wave_used: HashSet::new(),
             own_wave_last: true,
+            restored_in_wave: saved.restored_in_wave,
+            restored_wave: Vec::new(),
+            restored_at: None,
+            restored_gap: restored_gap(),
             uncensor: { uncensor::set_enabled(saved.uncensor); saved.uncensor },
             window_prefs: saved.window,
             discord_prefs: discord::load(),
@@ -2353,7 +2372,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, keep_track: self.keep_track, own_in_wave: self.own_in_wave, uncensor: self.uncensor, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb, lyrics: self.lyrics_sources, lyrics_size: self.lyrics_size });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, keep_track: self.keep_track, own_in_wave: self.own_in_wave, restored_in_wave: self.restored_in_wave, uncensor: self.uncensor, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb, lyrics: self.lyrics_sources, lyrics_size: self.lyrics_size });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -3028,6 +3047,11 @@ impl App {
     /// Без сети отзыв откладывается на диск и уходит пачкой, когда связь вернётся.
     fn feedback(&self, kind: &'static str, track: Option<&Track>, played: Option<f32>) {
         let (Some(session), Some(token)) = (self.wave.clone(), self.token()) else { return };
+        // Реакции в волне — вкус по исполнителям для удалённых треков.
+        if let Some(track) = track {
+            let artists: Vec<String> = track.artist_list.iter().map(|(_, id)| id.clone()).filter(|id| !id.is_empty()).collect();
+            taste::react(kind, &artists, played, track.duration.as_secs_f32());
+        }
         let body = api::feedback_body(kind, track, played);
         let seeds = self.wave_base.clone();
         if self.offline {
@@ -3484,6 +3508,7 @@ impl App {
             // Новая волна: свои треки снова могут попасться, первая пачка — без них.
             self.own_wave_used.clear();
             self.own_wave_last = false;
+            self.restored_gap = restored_gap();
         }
         // Карточка трека видна на экране волны: Яндексу скажем, что её уже показали.
         self.word_open = None;
@@ -3669,7 +3694,77 @@ impl App {
     /// Перед концом очереди просит у волны следующую пачку.
     fn wave_refill(&mut self) -> Task<Message> {
         let own = self.own_wave_load();
-        Task::batch([own, self.wave_refill_batch()])
+        let restored = self.restored_load();
+        Task::batch([own, restored, self.wave_refill_batch()])
+    }
+
+    /// Исполнители последних треков волны.
+    fn recent_wave_artists(&self) -> HashSet<String> {
+        let end = self.queue.len();
+        self.queue[end.saturating_sub(RECENT_WAVE)..].iter().flat_map(|track| track.artist_list.iter().map(|(_, id)| id.clone())).filter(|id| !id.is_empty()).collect()
+    }
+
+    /// Удалённые треки с версией без цензуры: какие из треков списка FckCensor Яндекс закрыл.
+    /// Раз в сутки, в фоне; похожие исполнители для оценки подгружаются заодно.
+    fn restored_load(&mut self) -> Task<Message> {
+        if !self.restored_in_wave || !uncensor::enabled() {
+            return Task::none();
+        }
+        let Some(token) = self.token() else { return Task::none() };
+        let seeds: Vec<String> = taste::liked_artists().into_iter().chain(self.recent_wave_artists()).collect();
+        taste::load_similar(seeds, token.clone());
+        if self.restored_at.is_some_and(|at| at.elapsed() < RESTORED_TTL) {
+            return Task::none();
+        }
+        let ids = uncensor::with_files();
+        if ids.is_empty() {
+            return Task::none();
+        }
+        self.restored_at = Some(Instant::now());
+        Task::perform(
+            background(move || {
+                let mut gone = Vec::new();
+                for chunk in ids.chunks(RESTORED_CHUNK) {
+                    gone.extend(api::unavailable_ids(chunk, &token)?);
+                }
+                let mut tracks = Vec::new();
+                for chunk in gone.chunks(RESTORED_CHUNK) {
+                    tracks.extend(api::tracks_by_ids(chunk, &token)?);
+                }
+                Ok(tracks)
+            }),
+            Message::RestoredWave,
+        )
+    }
+
+    /// Удалённый трек для новой пачки волны, как в Tune Client: не чаще одного на 10–15 треков,
+    /// только с оценкой по вкусу от `taste::WAVE_PASS` и без повторов неделю.
+    fn restored_pick(&mut self, known: &HashSet<String>, count: usize) -> Option<Track> {
+        if !self.restored_in_wave || !uncensor::enabled() || self.restored_wave.is_empty() {
+            return None;
+        }
+        self.restored_gap = self.restored_gap.saturating_sub(count);
+        if self.restored_gap > 0 {
+            return None;
+        }
+        let recent = self.recent_wave_artists();
+        let liked = taste::liked_artists();
+        let candidates: Vec<(&Track, f64)> = self
+            .restored_wave
+            .iter()
+            .filter(|track| !known.contains(&track.id) && !self.disliked.contains(&track.id) && uncensor::file(&track.id).is_some() && !taste::played(&track.id))
+            .filter_map(|track| {
+                let artists: Vec<String> = track.artist_list.iter().map(|(_, id)| id.clone()).filter(|id| !id.is_empty()).collect();
+                let score = taste::score(&artists, self.liked_set.contains(&track.id), &recent, &liked)?;
+                (score >= taste::WAVE_PASS).then_some((track, score))
+            })
+            .collect();
+        let scores: Vec<f64> = candidates.iter().map(|(_, score)| *score).collect();
+        let at = taste::pick_weighted(&scores, (random_seed() % 1_000_000) as f64 / 1_000_000.0)?;
+        let track = candidates[at].0.clone();
+        self.restored_gap = restored_gap();
+        taste::mark_played(&track.id);
+        Some(Track { batch: None, ..track })
     }
 
     fn wave_refill_batch(&mut self) -> Task<Message> {
@@ -4825,6 +4920,7 @@ impl App {
                 // Новая волна: свои треки снова могут попасться, первая пачка — без них.
                 self.own_wave_used.clear();
                 self.own_wave_last = false;
+                self.restored_gap = restored_gap();
                 return Task::batch([self.words_load(self.current.unwrap_or(0)), self.wave_refill()]);
             }
             Message::AiLessLoaded(result) => match result {
@@ -5958,6 +6054,18 @@ impl App {
                 use std::os::windows::process::CommandExt;
                 let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).spawn();
             }
+            Message::RestoredInWaveToggle => {
+                self.restored_in_wave = !self.restored_in_wave;
+                self.save_settings();
+            }
+            Message::RestoredWave(result) => match result {
+                Ok(tracks) => self.restored_wave = tracks,
+                Err(e) => {
+                    api::log(&format!("Удалённые треки для волны: {e}"));
+                    // Повтор через час, а не через сутки.
+                    self.restored_at = Instant::now().checked_sub(RESTORED_TTL - Duration::from_secs(3600));
+                }
+            },
             Message::OwnInWaveToggle => {
                 self.own_in_wave = !self.own_in_wave;
                 self.save_settings();
@@ -6189,7 +6297,11 @@ impl App {
                     Ok(tracks) if self.wave.is_some() => {
                         let known: HashSet<String> = self.queue.iter().map(|t| t.id.clone()).collect();
                         let mut fresh: Vec<Track> = tracks.into_iter().filter(|t| !known.contains(&t.id)).collect();
-                        if let Some(own) = self.own_wave_pick(&known) {
+                        // Удалённый трек по вкусу, иначе иногда — свой.
+                        let count = fresh.len();
+                        if let Some(restored) = self.restored_pick(&known, count) {
+                            fresh.insert(0, restored);
+                        } else if let Some(own) = self.own_wave_pick(&known) {
                             fresh.insert(0, own);
                         }
                         let task = self.fetch_wave_covers(&fresh);
@@ -9161,7 +9273,10 @@ impl App {
                     ]
                     .spacing(8),
                     group("Без цензуры", vec![toggle("Играть без цензуры", "Треки с запиканными словами играют в оригинале по открытому списку FckCensor, названия и обложки — без цензуры, удалённые треки возвращаются в альбомы. У таких треков значок открытого замка. Уже открытые страницы обновятся при следующем открытии", Some(self.uncensor), Some(Message::UncensorToggle))]),
-                    group("Моя волна", vec![toggle("Свои треки в «Моей волне»", "Загруженные вами треки из «Мне нравится» иногда попадаются в волне, но не два раза подряд и без повторов", Some(self.own_in_wave), Some(Message::OwnInWaveToggle))]),
+                    group("Моя волна", vec![
+                        toggle("Свои треки в «Моей волне»", "Загруженные вами треки из «Мне нравится» иногда попадаются в волне, но не два раза подряд и без повторов", Some(self.own_in_wave), Some(Message::OwnInWaveToggle)),
+                        toggle("Удалённые треки в «Моей волне»", "Треки, которые Яндекс удалил, а «Без цензуры» вернул, попадаются в волне по вашему вкусу: Tune сам оценивает исполнителей по лайкам, пропускам и похожим. Не чаще одного на 10–15 треков, без повторов неделю", Some(self.restored_in_wave), Some(Message::RestoredInWaveToggle)),
+                    ]),
                     group("Треки", vec![toggle("Помнить последний трек", "После запуска в плеере трек и очередь, что играли при выходе, — даже если сервер синхронизации Яндекса (Ynison) их не вернул", Some(self.keep_track), Some(Message::KeepTrackToggle))]),
                 ]
                 .spacing(28)
@@ -10948,6 +11063,11 @@ fn grouped(n: u64) -> String {
     out
 }
 
+/// Через сколько треков волны может встать следующий удалённый: от 10 до 15.
+fn restored_gap() -> usize {
+    10 + (random_seed() % 6) as usize
+}
+
 /// Ровный переход для трека без точек Яндекса. У выпусков, глав и отрывков его нет.
 fn plain_fade(track: &Track) -> Option<api::Fade> {
     let length = track.duration.as_secs_f32();
@@ -11452,6 +11572,24 @@ fn smoke_export(id: &str) -> Result<(), String> {
         std::thread::sleep(Duration::from_secs(2));
         println!("{}: {} байт, позиция через 2 с: {:?}", path.display(), size, player.position());
     }
+    Ok(())
+}
+
+/// Удалённые треки для волны: сколько их в списке FckCensor и похожие на исполнителя `artist`.
+fn smoke_restored(artist: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let ids = uncensor::with_files();
+    let mut gone = Vec::new();
+    for chunk in ids.chunks(RESTORED_CHUNK) {
+        gone.extend(api::unavailable_ids(chunk, &token)?);
+    }
+    println!("В списке с файлами: {}, удалены Яндексом: {}", ids.len(), gone.len());
+    let tracks = api::tracks_by_ids(&gone[..gone.len().min(5)], &token)?;
+    for track in &tracks {
+        println!("  {} — {} (доступен после подмены: {}, исполнители: {:?})", track.artists, track.title, !track.unavailable, track.artist_list);
+    }
+    let similar = api::similar_artist_ids(artist, &token)?;
+    println!("Похожих на {artist}: {}", similar.len());
     Ok(())
 }
 
@@ -12263,9 +12401,10 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-uncensor" || flag == "--smoke-export" || flag == "--smoke-spoof" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" || flag == "--smoke-clone" || flag == "--smoke-words" || flag == "--smoke-clip" || flag == "--smoke-ynison" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-restored" || flag == "--smoke-uncensor" || flag == "--smoke-export" || flag == "--smoke-spoof" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" || flag == "--smoke-clone" || flag == "--smoke-words" || flag == "--smoke-clip" || flag == "--smoke-ynison" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
+                "--smoke-restored" => smoke_restored(query),
                 "--smoke-uncensor" => smoke_uncensor(query),
                 "--smoke-export" => smoke_export(query),
                 "--smoke-spoof" => smoke_spoof(query),
