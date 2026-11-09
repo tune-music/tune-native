@@ -7723,7 +7723,9 @@ impl App {
         if let Some(clip) = self.view_clip() {
             layers = layers.push(clip);
         }
-        layers = layers.push(self.view_caption());
+        if !caption::hidden() {
+            layers = layers.push(self.view_caption());
+        }
         if self.menu.is_some() || self.eq_menu.is_some() || self.page_menu.is_some() || self.pin_menu.is_some() || self.devices_menu.is_some() {
             layers = layers.push(mouse_area(container(Space::new()).width(Length::Fill).height(Length::Fill)).on_press(Message::MenuClose).on_right_press(Message::MenuClose));
         }
@@ -8891,7 +8893,8 @@ impl App {
         let label = text(clipped(&source, WAVE_LABEL)).size(16).font(ui::font_medium()).color(ui::c().muted).wrapping(Wrapping::None);
         let head = row![collapse, container(label).center_x(Length::Fill), Space::new().width(44)].align_y(Alignment::Center);
         let tools = row![Space::new().width(Length::Fill), self.view_tools(22.0, true, false), self.view_volume(22.0, Some(120.0))].spacing(10).align_y(Alignment::Center);
-        let page = column![head, container(self.player_body(track, art, line, top)).center(Length::Fill), tools].padding(24).width(Length::Fill).height(Length::Fill);
+        // Сверху своя полоса заголовка окна: «Свернуть» — под ней.
+        let page = column![head, container(self.player_body(track, art, line, top)).center(Length::Fill), tools].padding(Padding::new(24.0).top(caption::HEIGHT + 8.0)).width(Length::Fill).height(Length::Fill);
         let back = move |_: &iced::Theme| container::Style {
             background: Some(iced::Background::Gradient(iced::Gradient::Linear(iced::gradient::Linear::new(iced::Radians(std::f32::consts::PI)).add_stop(0.0, top).add_stop(0.35, shade(FULL_TINT * 0.72)).add_stop(0.7, shade(FULL_TINT * 0.42)).add_stop(1.0, shade(FULL_TINT * 0.22))))),
             ..container::Style::default()

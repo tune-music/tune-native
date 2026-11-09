@@ -34,6 +34,8 @@ static NEXT: AtomicIsize = AtomicIsize::new(0);
 static MAX_HOVER: AtomicBool = AtomicBool::new(false);
 static MAX_PRESSED: AtomicBool = AtomicBool::new(false);
 static ACTIVE: AtomicBool = AtomicBool::new(true);
+/// Полосы нет: клип во весь экран.
+static HIDDEN: AtomicBool = AtomicBool::new(false);
 
 type Channel = (UnboundedSender<()>, Mutex<Option<UnboundedReceiver<()>>>);
 static EVENTS: OnceLock<Channel> = OnceLock::new();
@@ -62,6 +64,15 @@ fn set(flag: &AtomicBool, value: bool) {
 /// Мышь над кнопкой «развернуть» и нажата ли она.
 pub fn max_state() -> (bool, bool) {
     (MAX_HOVER.load(Ordering::Relaxed), MAX_PRESSED.load(Ordering::Relaxed))
+}
+
+/// Прячет полосу: верх окна снова обычная клиентская часть.
+pub fn set_hidden(hidden: bool) {
+    HIDDEN.store(hidden, Ordering::Relaxed);
+}
+
+pub fn hidden() -> bool {
+    HIDDEN.load(Ordering::Relaxed)
 }
 
 /// Окно в фокусе: в неактивном подпись и значки тусклее, как у системного заголовка.
@@ -158,7 +169,7 @@ unsafe extern "system" fn proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
         }
         WM_NCHITTEST => {
             let result = unsafe { next(hwnd, message, wparam, lparam) };
-            if result != HTCLIENT as LRESULT {
+            if result != HTCLIENT as LRESULT || hidden() {
                 return result;
             }
             unsafe { hit(hwnd, lparam) }.map_or(result, |hit| hit as LRESULT)

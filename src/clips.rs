@@ -203,6 +203,7 @@ impl App {
     pub(crate) fn clip_close(&mut self) -> Task<Message> {
         let Some(watch) = self.clip.take() else { return Task::none() };
         let unfull = if watch.full { window::latest().and_then(|id| window::set_mode(id, window::Mode::Windowed)) } else { Task::none() };
+        caption::set_hidden(false);
         drop(watch.video);
         if watch.resume {
             if let Some(p) = self.player.clone().filter(|p| p.is_paused()) {
@@ -357,6 +358,8 @@ impl App {
                 watch.full = !watch.full;
                 watch.menu = None;
                 let mode = if watch.full { window::Mode::Fullscreen } else { window::Mode::Windowed };
+                // Во весь экран полосы заголовка нет: верх окна — это видео, не перетаскивание.
+                caption::set_hidden(watch.full);
                 return window::latest().and_then(move |id| window::set_mode(id, mode));
             }
             Message::ClipMenu(menu) => {
@@ -613,7 +616,7 @@ impl App {
         let side = watch.list.len() > 1 && width - 48.0 - NEXT_WIDTH - 24.0 >= NEXT_ROOM;
         let room = if side { width - 48.0 - NEXT_WIDTH - 24.0 } else { width - 48.0 } - SCROLLBAR;
         // Видео 16:9 во всю ширину, но так, чтобы под ним оставалось место для названия.
-        let video_width = room.min((height - 64.0 - 150.0) * 16.0 / 9.0).max(320.0);
+        let video_width = room.min((height - caption::HEIGHT - 64.0 - 150.0) * 16.0 / 9.0).max(320.0);
         let video_height = (video_width * 9.0 / 16.0).round();
         let close = hint(glow(button(ui::icon(ui::CLOSE, 26.0, iced::Color::WHITE)).padding(6).style(ui::ghost).on_press(Message::ClipClose), 20.0), "Закрыть");
         let top = row![text("Клип").size(16).font(ui::font_medium()).color(iced::Color::from_rgb8(0xb3, 0xb3, 0xb3)), Space::new().width(Length::Fill), close].align_y(Alignment::Center);
@@ -628,7 +631,8 @@ impl App {
         if side {
             content = content.push(self.clip_next(watch));
         }
-        let page = column![top, container(content).center_x(Length::Fill).height(Length::Fill)].spacing(12).padding(Padding::from([16, 24])).width(Length::Fill).height(Length::Fill);
+        // Сверху своя полоса заголовка окна: «Клип» и крестик — под ней.
+        let page = column![top, container(content).center_x(Length::Fill).height(Length::Fill)].spacing(12).padding(Padding::from([16, 24]).top(caption::HEIGHT + 4.0)).width(Length::Fill).height(Length::Fill);
         let page = mouse_area(container(page).width(Length::Fill).height(Length::Fill).style(back)).on_move(|_| Message::ClipMove);
         Some(anim::block(page))
     }
