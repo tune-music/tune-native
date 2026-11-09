@@ -124,7 +124,14 @@ fn agent() -> ureq::Agent {
 }
 
 /// Тело файла с байта `from` и полная длина файла. Продолжение просится заголовком `Range`.
-fn request(agent: &ureq::Agent, url: &str, from: u64) -> Result<(impl Read + use<>, u64), String> {
+fn request(agent: &ureq::Agent, url: &str, from: u64) -> Result<(Box<dyn Read + Send>, u64), String> {
+    // Свой файл из окна подмены: читается с диска так же, как из сети.
+    if let Some(path) = url.strip_prefix(crate::uncensor::LOCAL) {
+        let mut file = File::open(path).map_err(|e| format!("Не удалось открыть свой файл трека: {e}"))?;
+        let len = file.metadata().map_err(|e| e.to_string())?.len();
+        file.seek(SeekFrom::Start(from)).map_err(|e| e.to_string())?;
+        return Ok((Box::new(file), len));
+    }
     let mut req = agent.get(url);
     if from > 0 {
         req = req.header("Range", format!("bytes={from}-"));
@@ -141,7 +148,7 @@ fn request(agent: &ureq::Agent, url: &str, from: u64) -> Result<(impl Read + use
         header("content-length").and_then(|v| v.parse().ok())
     }
     .ok_or("Сервер не сообщил размер файла")?;
-    Ok((resp.into_body().into_with_config().limit(1024 * 1024 * 1024).reader(), len))
+    Ok((Box::new(resp.into_body().into_with_config().limit(1024 * 1024 * 1024).reader()), len))
 }
 
 /// Перекачивает тело в файл, расшифровывая на ходу. Связь может оборваться посреди файла:

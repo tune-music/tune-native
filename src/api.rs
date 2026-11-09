@@ -412,7 +412,7 @@ fn result(v: &Value) -> &Value {
 }
 
 fn parse_artist_list(v: &Value) -> Vec<(String, String)> {
-    v.as_array().into_iter().flatten().filter_map(|a| Some((a["name"].as_str()?.to_string(), id_text(&a["id"])?))).collect()
+    v.as_array().into_iter().flatten().filter_map(|a| Some((a["name"].as_str()?.to_string(), id_text(&a["id"]).unwrap_or_default()))).collect()
 }
 
 /// У загруженных пользователем треков исполнители — одна строка «А, Б, В», а номер
@@ -1064,11 +1064,14 @@ fn album_subtitle(v: &Value) -> String {
 }
 
 fn artist_card(v: &Value) -> Option<Card> {
+    let patched = crate::uncensor::patch_artist(v);
+    let v = patched.as_ref().unwrap_or(v);
     Some(Card { id: id_text(&v["id"])?, title: v["name"].as_str()?.to_string(), subtitle: "Исполнитель".to_string(), cover: cover_uri(v) })
 }
 
 fn parse_artist(v: &Value) -> Option<Artist> {
-    let artist = &v["artist"];
+    let patched = crate::uncensor::patch_artist(&v["artist"]);
+    let artist = patched.as_ref().unwrap_or(&v["artist"]);
     Some(Artist {
         id: id_text(&artist["id"])?,
         name: artist["name"].as_str().unwrap_or_default().to_string(),
@@ -3272,8 +3275,8 @@ fn sign(data: &str) -> String {
 pub fn file_info(track_id: &str, quality: &str, token: &str) -> Result<FileInfo, String> {
     // Без цензуры: файл из списка FckCensor вместо файла Яндекса. Формат узнаётся по самому
     // файлу: в списке бывают и m4a под видом mp3.
-    if let Some(url) = crate::uncensor::file(track_id).filter(|_| quality != "smart_preview") {
-        return Ok(FileInfo { url, key: None, codec: "mp3".to_string(), bitrate: 0, quality: quality.to_string() });
+    if let Some((url, codec)) = crate::uncensor::file(track_id).filter(|_| quality != "smart_preview") {
+        return Ok(FileInfo { url, key: None, codec, bitrate: 0, quality: quality.to_string() });
     }
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs().to_string();
     // HE-AAC просим только в MP4: его кадры декодирует декодер Windows (см. `heaac`).
@@ -3533,6 +3536,10 @@ const PLUS_PAGE: &str = "https://plus.yandex.ru/";
 
 /// Обложка нужного размера, например 100x100. Нет сети — останется заглушка.
 pub fn cover(uri: &str, size: &str) -> Option<Vec<u8>> {
+    // Своя обложка из окна подмены лежит на диске.
+    if let Some(path) = uri.strip_prefix(crate::uncensor::LOCAL) {
+        return std::fs::read(path).ok();
+    }
     let url = format!("https://{}", uri.trim_start_matches("https://").replace("%%", size));
     let resp = agent().get(url).call().ok()?;
     if resp.status().as_u16() != 200 {

@@ -5,6 +5,11 @@
 //!
 //! Список лежит на GitHub; если он недоступен — на зеркале jsDelivr. Он сохраняется на диск
 //! и при запуске читается оттуда сразу, а свежий скачивается в фоне и раз в час.
+//!
+//! Как в FckCensor, любой трек, альбом или исполнителя можно подменить вручную (окно
+//! «Подменить…»): название, исполнители, обложка, свой аудиофайл; автоподмену из списка можно
+//! выключить для отдельного id. Свои подмены важнее списка и работают, даже когда «Без
+//! цензуры» выключено: это явный выбор пользователя.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +24,27 @@ const REFRESH: Duration = Duration::from_secs(3600);
 /// Не скачался — повтор через десять минут.
 const RETRY: Duration = Duration::from_secs(600);
 /// Поля, которые не подменяются напрямую: служебные и список треков альбома.
-const SKIP: [&str; 3] = ["__fckCensor", "volumes", "id"];
+const SKIP: [&str; 5] = ["__fckCensor", "volumes", "id", "audio", "noAuto"];
+/// Свой файл трека или обложки лежит на диске: `local:` и путь.
+pub const LOCAL: &str = "local:";
+
+/// Что подменяется: ключи в файле своих подмен — как у Tune Client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Track,
+    Album,
+    Artist,
+}
+
+impl Kind {
+    fn key(self) -> &'static str {
+        match self {
+            Kind::Track => "track",
+            Kind::Album => "album",
+            Kind::Artist => "artist",
+        }
+    }
+}
 
 #[derive(Default)]
 struct List {
@@ -27,12 +52,15 @@ struct List {
     files: HashMap<String, String>,
     tracks: HashMap<String, Map<String, Value>>,
     albums: HashMap<String, Map<String, Value>>,
+    artists: HashMap<String, Map<String, Value>>,
     /// Зеркало, с которого пришёл список: с него же качаются файлы.
     mirror: usize,
 }
 
 static LIST: RwLock<Option<Arc<List>>> = RwLock::new(None);
 static ENABLED: AtomicBool = AtomicBool::new(true);
+/// Свои подмены: { track | album | artist: { id: поля } }.
+static OWN: RwLock<Option<Value>> = RwLock::new(None);
 
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
@@ -45,9 +73,86 @@ fn current() -> Option<Arc<List>> {
     LIST.read().unwrap().clone()
 }
 
-/// Ссылка на версию трека без цензуры.
-pub fn file(id: &str) -> Option<String> {
-    let list = current()?;
+fn own_path() -> std::path::PathBuf {
+    crate::api::data_dir().join("spoofs.json")
+}
+
+/// Папка своих файлов: аудио и обложки копируются сюда, чтобы не зависеть от исходных.
+pub fn own_dir() -> std::path::PathBuf {
+    crate::api::data_dir().join("spoof")
+}
+
+fn read_own() {
+    let own = std::fs::read(own_path()).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()).filter(Value::is_object);
+    *OWN.write().unwrap() = Some(own.unwrap_or_else(|| json!({})));
+}
+
+/// Своя подмена: поля как у FckCensor (title / name, artists, coverUri) и свои (audio, noAuto).
+pub fn own(kind: Kind, id: &str) -> Map<String, Value> {
+    OWN.read().unwrap().as_ref().and_then(|own| own[kind.key()][id].as_object().cloned()).unwrap_or_default()
+}
+
+/// Сохраняет свою подмену; пустая — убирает её.
+pub fn set_own(kind: Kind, id: &str, fields: Map<String, Value>) -> Result<(), String> {
+    let mut guard = OWN.write().unwrap();
+    let own = guard.get_or_insert_with(|| json!({}));
+    let Some(root) = own.as_object_mut() else { return Err("Файл подмен повреждён".into()) };
+    let list = root.entry(kind.key()).or_insert_with(|| json!({}));
+    let Some(list) = list.as_object_mut() else { return Err("Файл подмен повреждён".into()) };
+    if fields.is_empty() {
+        list.remove(id);
+    } else {
+        list.insert(id.to_string(), Value::Object(fields));
+    }
+    std::fs::create_dir_all(crate::api::data_dir()).map_err(|e| e.to_string())?;
+    std::fs::write(own_path(), serde_json::to_string_pretty(own).unwrap_or_default()).map_err(|e| format!("Не удалось сохранить подмену: {e}"))
+}
+
+/// Автоподмена из списка для этого id не выключена вручную.
+fn auto_on(kind: Kind, id: &str) -> bool {
+    own(kind, id).get("noAuto").and_then(Value::as_bool) != Some(true)
+}
+
+/// Список, если для этого id автоподмена не выключена.
+fn auto(kind: Kind, id: &str) -> Option<Arc<List>> {
+    current().filter(|_| auto_on(kind, id))
+}
+
+/// Есть ли у id запись в списке FckCensor — тогда в окне подмены есть выключатель автоподмены.
+pub fn listed(kind: Kind, id: &str) -> bool {
+    current().is_some_and(|list| match kind {
+        Kind::Track => list.tracks.contains_key(id) || list.files.contains_key(id),
+        Kind::Album => list.albums.contains_key(id),
+        Kind::Artist => list.artists.contains_key(id),
+    })
+}
+
+/// Поля подмены: из списка, поверх — свои.
+fn spoof(kind: Kind, id: &str) -> Option<Map<String, Value>> {
+    let mut fields = auto(kind, id)
+        .and_then(|list| match kind {
+            Kind::Track => list.tracks.get(id).cloned(),
+            Kind::Album => list.albums.get(id).cloned(),
+            Kind::Artist => list.artists.get(id).cloned(),
+        })
+        .unwrap_or_default();
+    fields.extend(own(kind, id));
+    (!fields.is_empty()).then_some(fields)
+}
+
+/// Файл трека и его формат: свой из окна подмены, иначе версия без цензуры из списка.
+pub fn file(id: &str) -> Option<(String, String)> {
+    let mine = own(Kind::Track, id);
+    if let Some(path) = mine.get("audio").and_then(|audio| audio["file"].as_str()) {
+        let codec = mine["audio"]["codec"].as_str().unwrap_or("mp3");
+        return Some((format!("{LOCAL}{path}"), codec.to_string()));
+    }
+    auto_file(id).map(|url| (url, "mp3".to_string()))
+}
+
+/// Ссылка на версию трека без цензуры из списка.
+fn auto_file(id: &str) -> Option<String> {
+    let list = auto(Kind::Track, id)?;
     let url = list.files.get(id)?;
     let full = if url.starts_with("http://") || url.starts_with("https://") { url.clone() } else { format!("https://{url}") };
     Some(match full.strip_prefix(MIRRORS[0]) {
@@ -58,7 +163,7 @@ pub fn file(id: &str) -> Option<String> {
 
 /// У трека есть версия без цензуры: рядом с названием ставится значок.
 pub fn has(id: &str) -> bool {
-    current().is_some_and(|list| list.files.contains_key(id))
+    auto(Kind::Track, id).is_some_and(|list| list.files.contains_key(id))
 }
 
 fn id_of(v: &Value) -> Option<String> {
@@ -89,15 +194,14 @@ fn apply(target: &mut Map<String, Value>, spoof: &Map<String, Value>) {
 
 /// Трек из ответа Яндекса с подменой; `None` — подменять нечего.
 pub fn patch_track(v: &Value) -> Option<Value> {
-    let list = current()?;
     let id = id_of(v)?;
-    let spoof = list.tracks.get(&id);
-    let file = list.files.contains_key(&id);
+    let spoof = spoof(Kind::Track, &id);
+    let file = file(&id).is_some();
     if spoof.is_none() && !file {
         return None;
     }
     let mut out = v.as_object()?.clone();
-    if let Some(spoof) = spoof {
+    if let Some(spoof) = &spoof {
         apply(&mut out, spoof);
     }
     // Удалённый или закрытый в Яндексе трек с файлом снова играет.
@@ -110,16 +214,24 @@ pub fn patch_track(v: &Value) -> Option<Value> {
 
 /// Альбом из ответа Яндекса с подменой названия, исполнителей и обложки.
 pub fn patch_album(v: &Value) -> Option<Value> {
-    let list = current()?;
-    let spoof = list.albums.get(&id_of(v)?)?;
+    patch(Kind::Album, v)
+}
+
+/// Исполнитель из ответа Яндекса с подменой имени и обложки.
+pub fn patch_artist(v: &Value) -> Option<Value> {
+    patch(Kind::Artist, v)
+}
+
+fn patch(kind: Kind, v: &Value) -> Option<Value> {
+    let spoof = spoof(kind, &id_of(v)?)?;
     let mut out = v.as_object()?.clone();
-    apply(&mut out, spoof);
+    apply(&mut out, &spoof);
     Some(Value::Object(out))
 }
 
 /// Треки альбома по дискам, как в списке: туда возвращаются удалённые Яндексом треки.
 pub fn album_volumes(id: &str) -> Option<Vec<Vec<String>>> {
-    let list = current()?;
+    let list = auto(Kind::Album, id)?;
     let volumes = list.albums.get(id)?.get("volumes")?.as_array()?;
     let volumes: Vec<Vec<String>> = volumes.iter().map(|disk| disk.as_array().into_iter().flatten().filter_map(|track| if track.is_object() { id_of(track) } else { id_of(&json!({ "id": track })) }).filter(|id| is_id(id)).collect()).collect();
     volumes.iter().any(|disk| !disk.is_empty()).then_some(volumes)
@@ -135,7 +247,7 @@ fn is_id(id: &str) -> bool {
 fn parse(list: &Value, mirror: usize) -> List {
     let mut out = List { mirror, ..List::default() };
     for source in list["sources"].as_array().into_iter().flatten() {
-        for (kind, target) in [("tracks", &mut out.tracks), ("albums", &mut out.albums)] {
+        for (kind, target) in [("tracks", &mut out.tracks), ("albums", &mut out.albums), ("artists", &mut out.artists)] {
             for (id, fields) in source[kind].as_object().into_iter().flatten() {
                 if let (true, Some(fields)) = (is_id(id), fields.as_object()) {
                     target.entry(id.clone()).or_insert_with(|| fields.clone());
@@ -228,6 +340,7 @@ fn fetch(first: usize) -> Result<usize, String> {
 
 /// Читает список с диска и запускает обновление в фоне. Вызывается один раз при запуске.
 pub fn start() {
+    read_own();
     let (at, mut mirror) = read_cache().unwrap_or((0, 0));
     std::thread::spawn(move || {
         let mut wait = Duration::from_secs(REFRESH.as_secs().saturating_sub(now().saturating_sub(at)));

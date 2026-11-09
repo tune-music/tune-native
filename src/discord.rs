@@ -197,7 +197,7 @@ impl Track {
             title: track.title.clone(),
             artist: track.artists.clone(),
             album: track.album_title.clone(),
-            cover: track.cover.as_deref().map(|uri| format!("https://{}", uri.trim_start_matches("https://").replace("%%", "400x400"))).unwrap_or_default(),
+            cover: track.cover.as_deref().filter(|uri| !uri.starts_with(crate::uncensor::LOCAL)).map(|uri| format!("https://{}", uri.trim_start_matches("https://").replace("%%", "400x400"))).unwrap_or_default(),
             url: album.map(|album| format!("https://music.yandex.ru/album/{album}/track/{}", track.id)).unwrap_or_else(|| format!("https://music.yandex.ru/track/{}", track.id)),
             album_url: album.map(|album| format!("https://music.yandex.ru/album/{album}")).unwrap_or_default(),
             artist_url: artist.map(|artist| format!("https://music.yandex.ru/artist/{artist}")).unwrap_or_default(),

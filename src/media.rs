@@ -96,7 +96,7 @@ impl Media {
         let Some(controls) = self.controls.as_mut() else { return };
         let changed = self.track.as_deref() != Some(track.id.as_str());
         if changed {
-            let cover = track.cover.as_ref().map(|uri| format!("https://{}", uri.replace("%%", "400x400")));
+            let cover = track.cover.as_ref().filter(|uri| !uri.starts_with(crate::uncensor::LOCAL)).map(|uri| format!("https://{}", uri.trim_start_matches("https://").replace("%%", "400x400")));
             let _ = controls.set_metadata(MediaMetadata {
                 title: Some(&track.title),
                 artist: Some(&track.artists),

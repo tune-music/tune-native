@@ -497,8 +497,126 @@ enum QueueFrom {
     Downloads,
 }
 
+/// Окно «Подменить…», как у FckCensor: название, исполнители, обложка, свой аудиофайл и
+/// выключатель автоподмены из списка. Пустое поле — как у Яндекса.
+#[derive(Clone, Debug, PartialEq)]
+struct SpoofForm {
+    kind: uncensor::Kind,
+    id: String,
+    title: String,
+    /// Исполнители через запятую; у исполнителя поля нет.
+    artists: String,
+    /// Ссылка на обложку; своя картинка с диска — `local:` и путь.
+    cover: String,
+    /// Свой аудиофайл, скопированный в папку подмен.
+    audio: Option<String>,
+    /// Автоподмена из списка FckCensor для этого id.
+    auto: bool,
+    /// Название и исполнители при открытии: что не меняли, то не сохраняется.
+    start: (String, String),
+    /// Имена и номера прежних исполнителей: совпавшее имя ведёт на ту же страницу.
+    artist_ids: Vec<(String, String)>,
+}
+
+impl SpoofForm {
+    fn new(kind: uncensor::Kind, id: &str, title: &str, artists: &[(String, String)], line: &str) -> Self {
+        let own = uncensor::own(kind, id);
+        Self {
+            kind,
+            id: id.to_string(),
+            title: title.to_string(),
+            artists: line.to_string(),
+            cover: own.get("coverUri").and_then(serde_json::Value::as_str).unwrap_or_default().to_string(),
+            audio: own.get("audio").and_then(|audio| audio["file"].as_str()).map(str::to_string),
+            auto: own.get("noAuto").and_then(serde_json::Value::as_bool) != Some(true),
+            start: (title.to_string(), line.to_string()),
+            artist_ids: artists.to_vec(),
+        }
+    }
+
+    fn track(track: &Track) -> Self {
+        Self::new(uncensor::Kind::Track, &track.id, &track.title, &track.artist_list, &track.artists)
+    }
+
+    fn album(album: &api::Album) -> Self {
+        let line = album.artists.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(", ");
+        Self::new(uncensor::Kind::Album, &album.id, &album.title, &album.artists, &line)
+    }
+
+    fn artist(artist: &api::Artist) -> Self {
+        Self::new(uncensor::Kind::Artist, &artist.id, &artist.name, &[], "")
+    }
+
+    /// Своя подмена после правки: прежние свои поля, поверх — изменённые.
+    fn fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        use serde_json::{json, Value};
+        let mut fields = uncensor::own(self.kind, &self.id);
+        let name = if self.kind == uncensor::Kind::Artist { "name" } else { "title" };
+        let title = self.title.trim();
+        if title.is_empty() {
+            fields.remove(name);
+        } else if title != self.start.0.trim() {
+            fields.insert(name.into(), title.into());
+        }
+        let artists = self.artists.trim();
+        if self.kind != uncensor::Kind::Artist && artists != self.start.1.trim() {
+            let list: Vec<Value> = artists
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| match self.artist_ids.iter().find(|(known, id)| known == name && !id.is_empty()) {
+                    Some((_, id)) => json!({ "id": id, "name": name }),
+                    None => json!({ "name": name }),
+                })
+                .collect();
+            if list.is_empty() {
+                fields.remove("artists");
+            } else {
+                fields.insert("artists".into(), Value::Array(list));
+            }
+        }
+        match self.cover.trim() {
+            "" => fields.remove("coverUri"),
+            cover => fields.insert("coverUri".into(), cover.into()),
+        };
+        match &self.audio {
+            Some(path) => fields.insert("audio".into(), json!({ "file": path, "codec": audio_codec(path).unwrap_or("mp3") })),
+            None => fields.remove("audio"),
+        };
+        if self.auto {
+            fields.remove("noAuto");
+        } else {
+            fields.insert("noAuto".into(), Value::Bool(true));
+        }
+        fields
+    }
+}
+
+/// Формат своего аудиофайла по расширению; `None` — такой Tune не играет.
+fn audio_codec(path: &str) -> Option<&'static str> {
+    match std::path::Path::new(path).extension()?.to_str()?.to_lowercase().as_str() {
+        "mp3" => Some("mp3"),
+        "flac" => Some("flac"),
+        "aac" => Some("aac"),
+        "m4a" | "mp4" => Some("aac-mp4"),
+        _ => None,
+    }
+}
+
+/// Копирует свой файл в папку подмен: исходный можно переносить и удалять.
+fn spoof_copy(prefix: &str, id: &str, path: &std::path::Path) -> Result<String, String> {
+    let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("bin").to_lowercase();
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let dir = uncensor::own_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let target = dir.join(format!("{prefix}-{id}-{stamp}.{ext}"));
+    std::fs::copy(path, &target).map_err(|e| format!("Не удалось скопировать файл: {e}"))?;
+    Ok(target.to_string_lossy().into_owned())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Dialog {
+    Spoof,
     Create,
     Rename(Playlist),
     Describe(Playlist),
@@ -801,6 +919,7 @@ enum Preview {
     Filter(String),
     /// Сведения о первом треке лайков.
     TrackInfo,
+    Spoof,
     Account,
     LogoutAsk,
     /// Вкладка настроек.
@@ -1086,6 +1205,8 @@ struct App {
     /// Скрыт ли сейчас текст в заголовке окна.
     /// Мышь над крестиком своей полосы заголовка: он краснеет, значок белеет.
     caption_close_hover: bool,
+    /// Окно «Подменить…».
+    spoof: Option<SpoofForm>,
     discord: Option<discord::Handle>,
     discord_sent: Option<(String, bool, Instant, f64)>,
     /// Открытая вкладка настроек.
@@ -1621,6 +1742,19 @@ enum Message {
     CaptionCloseHover(bool),
     /// Полосу заголовка надо перерисовать: наведение на «развернуть», фокус окна.
     CaptionRefresh,
+    SpoofOpen(Box<SpoofForm>),
+    SpoofTitle(String),
+    SpoofArtists(String),
+    SpoofCover(String),
+    SpoofCoverPick,
+    SpoofCoverChosen(Option<std::path::PathBuf>),
+    SpoofAudioPick,
+    SpoofAudioChosen(Option<std::path::PathBuf>),
+    SpoofAudioClear,
+    SpoofAutoToggle,
+    SpoofSave,
+    SpoofReset,
+    SpoofTrack(Result<Vec<Track>, String>),
     Tray(tray::Event),
     Media(media::Event),
     Play(Section, usize),
@@ -1822,6 +1956,7 @@ impl App {
             reverb_text: saved.reverb.to_string(),
             notice_quick: false,
             caption_close_hover: false,
+            spoof: None,
             discord: None,
             discord_sent: None,
             settings_tab: SettingsTab::Main,
@@ -2924,6 +3059,7 @@ impl App {
                 let mut items = link_and_pin(PinRef::Artist(artist.id.clone()), format!("https://music.yandex.ru/artist/{}", artist.id));
                 let disliked = self.disliked_artists.iter().any(|c| c.id == artist.id);
                 items.push((ui::DISLIKE, if disliked { "Убрать дизлайк" } else { "Не нравится" }.to_string(), Message::ArtistDislike, false));
+                items.push((ui::EDIT, "Подменить…".to_string(), Message::SpoofOpen(Box::new(SpoofForm::artist(artist))), false));
                 items
             }
             Section::Playlists => {
@@ -2938,6 +3074,9 @@ impl App {
                         items.push((ui::CHECK, label.to_string(), Message::AlbumFinished(!album.finished), false));
                     }
                     items.extend(self.download_item());
+                    if let Some(album) = &self.album {
+                        items.push((ui::EDIT, "Подменить…".to_string(), Message::SpoofOpen(Box::new(SpoofForm::album(album))), false));
+                    }
                     return items;
                 }
                 let mut items = link_and_pin(PinRef::Playlist(list.owner.clone(), list.kind.clone()), format!("https://music.yandex.ru/users/{}/playlists/{}", list.owner, list.kind));
@@ -4291,7 +4430,7 @@ impl App {
                         Task::batch([wave, self.update(Message::DialogOpen(Dialog::WaveTune))])
                     }
                     Some(Preview::WaveSeeded) => self.wave_load(vec!["artist:3121".to_string()], Some(wave_label("artist:3121", "Metallica")), false),
-                    Some(Preview::Likes | Preview::LikesEnd | Preview::LikesAt(_) | Preview::Menu | Preview::Panels | Preview::TrackInfo | Preview::QueueJump) => self.update(Message::Open(Section::Likes)),
+                    Some(Preview::Likes | Preview::LikesEnd | Preview::LikesAt(_) | Preview::Menu | Preview::Panels | Preview::TrackInfo | Preview::Spoof | Preview::QueueJump) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
                     // Превращается в обычный запуск ещё в `new`.
                     Some(Preview::CollectionEarly) => Task::none(),
@@ -5406,6 +5545,14 @@ impl App {
                             self.queue = self.liked.clone();
                             self.current = Some(0).filter(|_| !self.queue.is_empty());
                         }
+                        if matches!(self.preview, Some(Preview::Spoof)) {
+                            self.preview = None;
+                            if let Some(track) = self.liked.first() {
+                                let mut form = SpoofForm::track(track);
+                                form.title = "Своё название".to_string();
+                                return self.handle(Message::SpoofOpen(Box::new(form)));
+                            }
+                        }
                         if matches!(self.preview, Some(Preview::TrackInfo)) {
                             self.preview = None;
                             if let Some(track) = self.liked.first().cloned() {
@@ -6069,6 +6216,7 @@ impl App {
                 }
                 self.dialog = None;
                 return match dialog {
+                    Dialog::Spoof => self.handle(Message::SpoofSave),
                     Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account | Dialog::Wizard | Dialog::Unsafe(..) | Dialog::Vibe(_) => Task::none(),
                     Dialog::Logout => self.handle(Message::Logout),
                     Dialog::ConcertCity => {
@@ -6874,6 +7022,82 @@ impl App {
                 Some(hwnd) => hide_window(hwnd),
                 None => return self.update(Message::Quit),
             },
+            Message::SpoofOpen(form) => {
+                self.page_menu = None;
+                self.spoof = Some(*form);
+                return self.update(Message::DialogOpen(Dialog::Spoof));
+            }
+            Message::SpoofTitle(value) => {
+                if let Some(form) = &mut self.spoof {
+                    form.title = value;
+                }
+            }
+            Message::SpoofArtists(value) => {
+                if let Some(form) = &mut self.spoof {
+                    form.artists = value;
+                }
+            }
+            Message::SpoofCover(value) => {
+                if let Some(form) = &mut self.spoof {
+                    form.cover = value;
+                }
+            }
+            Message::SpoofAutoToggle => {
+                if let Some(form) = &mut self.spoof {
+                    form.auto = !form.auto;
+                }
+            }
+            Message::SpoofAudioClear => {
+                if let Some(form) = &mut self.spoof {
+                    form.audio = None;
+                }
+            }
+            Message::SpoofCoverPick => {
+                let owner = self.hwnd;
+                return Task::perform(background(move || pick::image(owner, "Своя обложка")), Message::SpoofCoverChosen);
+            }
+            Message::SpoofAudioPick => {
+                let owner = self.hwnd;
+                return Task::perform(background(move || pick::audio(owner, "Свой аудиофайл").into_iter().next()), Message::SpoofAudioChosen);
+            }
+            Message::SpoofCoverChosen(path) => {
+                let (Some(path), Some(form)) = (path, &mut self.spoof) else { return Task::none() };
+                match spoof_copy("cover", &form.id, &path) {
+                    Ok(copy) => form.cover = format!("{}{copy}", uncensor::LOCAL),
+                    Err(e) => return self.notify_quick(e),
+                }
+            }
+            Message::SpoofAudioChosen(path) => {
+                let (Some(path), Some(form)) = (path, &mut self.spoof) else { return Task::none() };
+                if audio_codec(&path.to_string_lossy()).is_none() {
+                    return self.notify_quick("Этот формат Tune не играет: нужен MP3, M4A, AAC или FLAC".to_string());
+                }
+                match spoof_copy("track", &form.id, &path) {
+                    Ok(copy) => form.audio = Some(copy),
+                    Err(e) => return self.notify_quick(e),
+                }
+            }
+            Message::SpoofSave | Message::SpoofReset => {
+                let Some(form) = self.spoof.clone() else { return Task::none() };
+                self.dialog = None;
+                let fields = if matches!(message, Message::SpoofReset) { serde_json::Map::new() } else { form.fields() };
+                if let Err(e) = uncensor::set_own(form.kind, &form.id, fields) {
+                    return self.notify_quick(e);
+                }
+                return self.spoof_applied(&form);
+            }
+            Message::SpoofTrack(Ok(tracks)) => {
+                for fresh in tracks {
+                    for list in [&mut self.queue, &mut self.playlist_tracks, &mut self.episodes] {
+                        for track in list.iter_mut().filter(|track| track.id == fresh.id) {
+                            let batch = track.batch.take();
+                            *track = Track { batch, ..fresh.clone() };
+                        }
+                    }
+                }
+                self.save_session();
+            }
+            Message::SpoofTrack(Err(e)) => api::log(&format!("Подмена: трек не обновился: {e}")),
             Message::CaptionMinimize => {
                 if let Some(hwnd) = self.hwnd {
                     caption::minimize(hwnd);
@@ -7398,6 +7622,7 @@ impl App {
             Dialog::WaveTune => return self.view_wave_tune(),
             Dialog::Wizard => return self.view_wizard(),
             Dialog::TrackInfo(track) => return self.view_track_info(track),
+            Dialog::Spoof => return self.view_spoof(),
             Dialog::Account => return self.view_account(),
             Dialog::Unsafe(_, go, modal) => return self.view_unsafe(go, modal),
             Dialog::Vibe(kind) => return self.view_vibe(kind),
@@ -7889,6 +8114,11 @@ impl App {
         }
         items = items.push(item(ui::INFO, "Сведения о треке", Message::DialogOpen(Dialog::TrackInfo(track.clone()))));
         count += 2.0;
+        // Как в FckCensor: своё название, исполнители, обложка и аудиофайл.
+        if !track.ugc {
+            items = items.push(item(ui::EDIT, "Подменить…", Message::SpoofOpen(Box::new(SpoofForm::track(track)))));
+            count += 1.0;
+        }
         // Жалоба — форма Яндекса, как в окне оригинала, только в браузере.
         if !track.ugc {
             let theme = if ui::is_light() { "white" } else { "black" };
@@ -8137,6 +8367,87 @@ impl App {
             Some(track) if !track.title.is_empty() => format!("{} — {}", track.artists, track.title),
             _ => "Tune".to_string(),
         }
+    }
+
+    /// Окно «Подменить…»: те же поля, что у FckCensor.
+    fn view_spoof(&self) -> Element<'_, Message> {
+        let alpha = self.dialog_fade.shown();
+        let Some(form) = &self.spoof else { return Space::new().into() };
+        let kind = form.kind;
+        let what = match kind {
+            uncensor::Kind::Track => "трек",
+            uncensor::Kind::Album => "альбом",
+            uncensor::Kind::Artist => "исполнителя",
+        };
+        let label = |name: &str| text(name.to_string()).size(13).color(ui::c().muted.scale_alpha(alpha));
+        let small = |name: &str, message: Message| shine(button(text(name.to_string()).color(ui::c().text.scale_alpha(alpha)).wrapping(Wrapping::None)).padding([9, 14]).style(ui::button_faded(ui::secondary, alpha)).on_press(message), 24.0);
+        let mut body = column![text(format!("Подменить {what}")).size(20).font(ui::font_medium()).color(ui::c().text.scale_alpha(alpha))].spacing(16);
+        let title = text_input("Как у Яндекса", &form.title).id(DIALOG_INPUT).on_input(Message::SpoofTitle).on_submit(Message::SpoofSave).padding([10, 16]).style(ui::input_faded(alpha));
+        body = body.push(column![label(if kind == uncensor::Kind::Artist { "Имя" } else { "Название" }), title].spacing(6));
+        if kind != uncensor::Kind::Artist {
+            let artists = text_input("Как у Яндекса", &form.artists).on_input(Message::SpoofArtists).on_submit(Message::SpoofSave).padding([10, 16]).style(ui::input_faded(alpha));
+            body = body.push(column![label("Исполнители через запятую"), artists].spacing(6));
+        }
+        let cover: Element<'_, Message> = match form.cover.strip_prefix(uncensor::LOCAL) {
+            Some(_) => row![text("Своя картинка с диска").color(ui::c().text.scale_alpha(alpha)).width(Length::Fill), small("Другая…", Message::SpoofCoverPick), small("Убрать", Message::SpoofCover(String::new()))].spacing(8).align_y(Alignment::Center).into(),
+            None => row![
+                text_input("Ссылка на картинку", &form.cover).on_input(Message::SpoofCover).on_submit(Message::SpoofSave).padding([10, 16]).style(ui::input_faded(alpha)).width(Length::Fill),
+                small("Файл…", Message::SpoofCoverPick),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into(),
+        };
+        body = body.push(column![label("Обложка"), cover].spacing(6));
+        if kind == uncensor::Kind::Track {
+            let state = match &form.audio {
+                Some(path) => format!("Свой файл: {}", std::path::Path::new(path).extension().and_then(|ext| ext.to_str()).unwrap_or_default().to_uppercase()),
+                None if uncensor::has(&form.id) && form.auto => "Играет версия без цензуры из списка FckCensor".to_string(),
+                None => "Играет файл Яндекса".to_string(),
+            };
+            let mut line = row![text(state).color(ui::c().text.scale_alpha(alpha)).width(Length::Fill), small(if form.audio.is_some() { "Другой…" } else { "Выбрать файл…" }, Message::SpoofAudioPick)].spacing(8).align_y(Alignment::Center);
+            if form.audio.is_some() {
+                line = line.push(small("Убрать", Message::SpoofAudioClear));
+            }
+            body = body.push(column![label("Аудио: MP3, M4A, AAC или FLAC"), line].spacing(6));
+        }
+        if uncensor::listed(kind, &form.id) {
+            let switch = shine(button(text(if form.auto { "Автоподмена из списка FckCensor включена" } else { "Автоподмена из списка FckCensor выключена" }).size(14)).padding([7, 16]).style(ui::chip_faded(form.auto, alpha)).on_press(Message::SpoofAutoToggle), 18.0);
+            body = body.push(switch);
+        }
+        let mut buttons = row![].spacing(12).align_y(Alignment::Center);
+        if !uncensor::own(kind, &form.id).is_empty() {
+            buttons = buttons.push(shine(button(text("Сбросить").color(ui::c().danger.scale_alpha(alpha))).padding([8, 18]).style(ui::button_faded(ui::secondary, alpha)).on_press(Message::SpoofReset), 24.0));
+        }
+        buttons = buttons.push(Space::new().width(Length::Fill)).push(shine(button(text("Отмена").color(ui::c().text.scale_alpha(alpha))).padding([8, 18]).style(ui::button_faded(ui::secondary, alpha)).on_press(Message::MenuClose), 24.0)).push(shine(
+            button(text("Сохранить").font(ui::font_medium()).color(ui::c().on_accent.scale_alpha(alpha))).padding([8, 18]).style(ui::button_faded(ui::accent, alpha)).on_press(Message::SpoofSave),
+            24.0,
+        ));
+        body = body.push(buttons);
+        let tall = WINDOW.lock().unwrap().1 - INFO_MARGIN;
+        let window = reveal(container(ui::scroll(body).style(ui::scroll_still)).width(DIALOG_WIDTH).max_height(tall).padding(24).style(ui::popover_faded(alpha))).scale(0.94 + 0.06 * alpha, 0.5, 0.5).shift(0.0, 10.0 * (1.0 - alpha));
+        let dim = iced::Color::BLACK.scale_alpha(0.6 * alpha);
+        reveal(mouse_area(container(mouse_area(window).on_press(Message::DialogInput(self.dialog_text.clone()))).center(Length::Fill).style(move |_| container::Style::default().background(dim))).on_press(Message::MenuClose)).inert(!self.dialog_fade.live).into()
+    }
+
+    /// Подмену сохранили: обложка перечитывается, трек — с сервера, открытая страница — заново.
+    fn spoof_applied(&mut self, form: &SpoofForm) -> Task<Message> {
+        let id = form.id.clone();
+        self.covers.retain(|key, _| !key.contains(id.as_str()));
+        self.requested.borrow_mut().retain(|key| !key.contains(id.as_str()));
+        let notice = self.notify_quick("Подмена сохранена".to_string());
+        let refresh = match form.kind {
+            uncensor::Kind::Track => match self.token() {
+                Some(token) => Task::perform(background(move || api::tracks_by_ids(&[id], &token)), Message::SpoofTrack),
+                None => Task::none(),
+            },
+            uncensor::Kind::Album if self.playlist.as_ref().is_some_and(|list| list.kind == id) => self.handle(Message::ListReload),
+            uncensor::Kind::Artist if self.artist.as_ref().is_some_and(|artist| artist.id == id) => self.handle(Message::ArtistLoad(id)),
+            _ => Task::none(),
+        };
+        // Трек на открытой странице списка тоже обновится вместе с ней.
+        let page = if form.kind == uncensor::Kind::Track && self.section == Section::Playlists { self.handle(Message::ListReload) } else { Task::none() };
+        Task::batch([notice, refresh, page])
     }
 
     /// Своя полоса заголовка: значок, «Tune» или трек и кнопки окна. Перетаскивание,
@@ -10888,6 +11199,35 @@ fn tracks_word(n: usize) -> &'static str {
 }
 
 /// Проверка без окна: поиск, ссылка на файл и несколько секунд звука.
+/// Своя подмена трека: название и свой файл с диска. Подмена потом убирается.
+fn smoke_spoof(id: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let file = std::env::temp_dir().join("tune-spoof-smoke.mp3");
+    let (url, _) = uncensor::file(id).ok_or("У трека нет версии в списке FckCensor")?;
+    player::save_file(&api::FileInfo { url, key: None, codec: "mp3".into(), bitrate: 0, quality: String::new() }, &file)?;
+    let mut form = SpoofForm::new(uncensor::Kind::Track, id, "", &[], "");
+    form.title = "Своё название".to_string();
+    form.artists = "Свой исполнитель".to_string();
+    form.audio = Some(file.to_string_lossy().into_owned());
+    uncensor::set_own(form.kind, id, form.fields())?;
+    let result = (|| {
+        let track = api::tracks_by_ids(&[id.to_string()], &token)?.into_iter().next().ok_or("Яндекс не прислал трек")?;
+        println!("Трек: {} — {}", track.artists, track.title);
+        let info = api::file_info(id, Quality::Normal.code(), &token)?;
+        println!("Файл: {} {}", info.label(), info.url);
+        let player = Player::new()?;
+        player.set_volume(0.05);
+        let generation = player.stop();
+        player.play(generation, &info)?;
+        std::thread::sleep(Duration::from_secs(3));
+        println!("Позиция через 3 с: {:?}", player.position());
+        Ok::<(), String>(())
+    })();
+    uncensor::set_own(uncensor::Kind::Track, id, serde_json::Map::new())?;
+    let _ = std::fs::remove_file(&file);
+    result
+}
+
 /// Трек по номеру через «Без цензуры»: название из списка FckCensor, файл без цензуры играет.
 fn smoke_uncensor(id: &str) -> Result<(), String> {
     let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
@@ -11692,10 +12032,11 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-uncensor" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" || flag == "--smoke-clone" || flag == "--smoke-words" || flag == "--smoke-clip" || flag == "--smoke-ynison" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-uncensor" || flag == "--smoke-spoof" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" || flag == "--smoke-clone" || flag == "--smoke-words" || flag == "--smoke-clip" || flag == "--smoke-ynison" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-uncensor" => smoke_uncensor(query),
+                "--smoke-spoof" => smoke_spoof(query),
                 "--smoke-library" => smoke_library(query),
                 "--smoke-wave" => smoke_wave(query),
                 "--smoke-lyrics" => smoke_lyrics(query),
@@ -11764,6 +12105,7 @@ fn main() -> iced::Result {
             "queue-jump" => Preview::QueueJump,
             "menu" => Preview::Menu,
             "track-info" => Preview::TrackInfo,
+            "spoof" => Preview::Spoof,
             "account" => Preview::Account,
             "settings" => Preview::Settings(0),
             what if what.starts_with("settings:") => Preview::Settings(what["settings:".len()..].parse().unwrap_or(0)),
@@ -11880,6 +12222,26 @@ mod lyrics_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spoof_form_keeps_only_changes() {
+        use serde_json::json;
+        let artists = vec![("А".to_string(), "1".to_string()), ("Б".to_string(), "2".to_string())];
+        let mut form = super::SpoofForm::new(crate::uncensor::Kind::Track, "999000999", "Трек", &artists, "А, Б");
+        assert!(form.fields().is_empty());
+        form.title = "Без цензуры".to_string();
+        form.artists = "Б, В".to_string();
+        form.cover = "https://example.org/c.jpg".to_string();
+        form.auto = false;
+        form.audio = Some("C:\\spoof\\track.m4a".to_string());
+        let fields = form.fields();
+        assert_eq!(fields["title"], "Без цензуры");
+        assert_eq!(fields["artists"], json!([{ "id": "2", "name": "Б" }, { "name": "В" }]));
+        assert_eq!(fields["coverUri"], "https://example.org/c.jpg");
+        assert_eq!(fields["noAuto"], true);
+        assert_eq!(fields["audio"]["codec"], "aac-mp4");
+        assert_eq!(super::audio_codec("x.ogg"), None);
+    }
+
     use super::*;
 
     #[test]
