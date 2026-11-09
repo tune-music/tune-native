@@ -3745,8 +3745,10 @@ impl App {
             return Task::none();
         }
         // Удалённые с версией без цензуры и свои подмены файлом — их Яндекс тоже может не знать.
-        let mut ids = uncensor::with_files();
-        for id in uncensor::own_audio_ids() {
+        let listed = uncensor::with_files();
+        let own = uncensor::own_audio_ids();
+        let mut ids = listed.clone();
+        for id in own.clone() {
             if !ids.contains(&id) {
                 ids.push(id);
             }
@@ -3757,10 +3759,25 @@ impl App {
         self.restored_at = Some(Instant::now());
         Task::perform(
             background(move || {
-                let mut gone = Vec::new();
-                for chunk in ids.chunks(RESTORED_CHUNK) {
-                    gone.extend(api::unavailable_ids(chunk, &token)?);
-                }
+                // Какие из 1500 треков списка удалены, помнится на диске сутки: после перезапуска
+                // хватает одного запроса за ними самими, и поиск находит их сразу.
+                let gone = match restored_cached(&listed) {
+                    Some(mut gone) => {
+                        let own: Vec<String> = own.into_iter().filter(|id| !gone.contains(id)).collect();
+                        for chunk in own.chunks(RESTORED_CHUNK) {
+                            gone.extend(api::unavailable_ids(chunk, &token)?);
+                        }
+                        gone
+                    }
+                    None => {
+                        let mut gone = Vec::new();
+                        for chunk in ids.chunks(RESTORED_CHUNK) {
+                            gone.extend(api::unavailable_ids(chunk, &token)?);
+                        }
+                        restored_store(&listed, &gone);
+                        gone
+                    }
+                };
                 let mut tracks = Vec::new();
                 for chunk in gone.chunks(RESTORED_CHUNK) {
                     tracks.extend(api::tracks_by_ids(chunk, &token)?);
@@ -4663,7 +4680,8 @@ impl App {
                     Some(token) if !self.offline => Task::perform(background(move || api::red_alert(&token)), Message::RedAlert),
                     _ => Task::none(),
                 };
-                let pins = Task::batch([pins, alert]);
+                let restored = if self.offline { Task::none() } else { self.restored_load() };
+                let pins = Task::batch([pins, alert, restored]);
                 let page = match self.preview.clone() {
                     Some(Preview::Wave | Preview::WaveSeek | Preview::WaveWords | Preview::WaveWheel | Preview::WaveWheelHalf) => self.wave_load(vec![api::MY_WAVE.to_string()], None, false),
                     Some(Preview::Devices) => {
@@ -11108,6 +11126,25 @@ fn grouped(n: u64) -> String {
 fn search_words(text: &str) -> Vec<String> {
     let clean: String = text.to_lowercase().replace('ё', "е").chars().map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect();
     clean.split_whitespace().map(str::to_string).collect()
+}
+
+/// Удалённые из списка FckCensor, если запомнены меньше суток назад для того же списка.
+fn restored_cached(listed: &[String]) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(api::data_dir().join("restored.json")).ok()?).ok()?;
+    let at = v["at"].as_u64()?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    if now.saturating_sub(at) >= RESTORED_TTL.as_secs() || v["listed"].as_u64()? != listed.len() as u64 {
+        return None;
+    }
+    let gone: Vec<String> = v["ids"].as_array()?.iter().filter_map(|id| id.as_str().map(str::to_string)).collect();
+    Some(gone.into_iter().filter(|id| listed.contains(id)).collect())
+}
+
+fn restored_store(listed: &[String], gone: &[String]) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let gone: Vec<&String> = gone.iter().filter(|id| listed.contains(id)).collect();
+    let value = serde_json::json!({ "at": now, "listed": listed.len(), "ids": gone });
+    let _ = std::fs::write(api::data_dir().join("restored.json"), value.to_string());
 }
 
 /// Через сколько треков волны может встать следующий удалённый: от 10 до 15.
