@@ -3696,6 +3696,14 @@ impl App {
 
     /// Включает новый список вместо очереди.
     fn play_list(&mut self, tracks: Vec<Track>, title: String, index: usize) -> Task<Message> {
+        // В закрытом альбоме не играет ни один трек: очередь и играющий трек остаются как были.
+        // Иначе очередь уже сменилась бы, номер играющего трека смотрел бы мимо неё — и
+        // трекбар пропадал, хотя прежний трек играл дальше.
+        let playable = |track: &Track| !track.unavailable;
+        let any = if self.shuffle { tracks.iter().any(playable) } else { tracks.iter().skip(index).any(playable) };
+        if !any {
+            return self.notify(UNAVAILABLE.to_string());
+        }
         self.queue = tracks;
         self.failures = 0;
         self.wave = None;
