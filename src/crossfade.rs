@@ -34,10 +34,12 @@ fn part(position: f32, (start, stop): (f32, f32)) -> f32 {
     ((position - start) / (stop - start)).clamp(0.0, 1.0)
 }
 
-/// Громкость по равной мощности: сумма двух треков на переходе не проваливается.
+/// Громкость по плавной S-кривой: в начале и в конце окна она меняется медленно, без рывка,
+/// а громкости двух треков в сумме дают единицу. С равной мощностью два громких места
+/// складывались в перегруз посередине перехода — так он звучал резко.
 pub fn gain(position: f32, fade_in: Option<(f32, f32)>, fade_out: Option<(f32, f32)>) -> f32 {
-    let rise = fade_in.map_or(1.0, |range| (part(position, range) * FRAC_PI_2).sin());
-    let fall = fade_out.map_or(1.0, |range| (part(position, range) * FRAC_PI_2).cos());
+    let rise = fade_in.map_or(1.0, |range| (part(position, range) * FRAC_PI_2).sin().powi(2));
+    let fall = fade_out.map_or(1.0, |range| (part(position, range) * FRAC_PI_2).cos().powi(2));
     rise * fall
 }
 
@@ -122,9 +124,10 @@ mod tests {
         assert!((gain(1.5, Some((0.0, 1.5)), None) - 1.0).abs() < 1e-6);
         assert!((gain(118.2, None, Some((118.2, 123.2))) - 1.0).abs() < 1e-6);
         assert!(gain(123.2, None, Some((118.2, 123.2))).abs() < 1e-6);
-        // Посередине оба трека звучат на равной мощности.
+        // Посередине оба трека звучат вполовину: вместе — как один.
         let middle = gain(0.75, Some((0.0, 1.5)), None);
-        assert!((middle * middle - 0.5).abs() < 1e-4, "{middle}");
+        assert!((middle - 0.5).abs() < 1e-4, "{middle}");
+        assert!((gain(0.3, Some((0.0, 1.5)), None) + gain(0.3, None, Some((0.0, 1.5))) - 1.0).abs() < 1e-4);
     }
 
     #[test]

@@ -337,9 +337,15 @@ const VIDEO_COVER: &str = "video:";
 const PHOTO_COVER: &str = "photo:";
 /// За сколько до конца трека начать качать следующий.
 /// Переход для трека без точек Яндекса (свои, загруженные, без цензуры, подменённые):
-/// затухание за столько секунд до конца и нарастание нового в первые секунды.
+/// затухание за столько секунд до конца.
 const PLAIN_FADE_OUT: f32 = 6.0;
-const PLAIN_FADE_IN: f32 = 4.0;
+/// Самый длинный обычный переход: точки Яндекса бывают и на 10–15 секунд, и трек тогда
+/// уходил задолго до конца. В волне-сете переходы — часть сведения, их длина не режется.
+const CROSS_MAX: f32 = 6.0;
+/// Свои треки в волне: с такой вероятностью в новую пачку встаёт один свой трек.
+const OWN_WAVE_CHANCE: u64 = 25;
+/// Список своих треков для волны перечитывается раз в полчаса.
+const OWN_WAVE_TTL: Duration = Duration::from_secs(30 * 60);
 /// Короче этого переход не делается: от трека почти ничего не осталось бы.
 const PLAIN_FADE_MIN: f32 = 30.0;
 /// Выпуски и книги: шаг кнопок перемотки, как часто место уходит Яндексу, и границы,
@@ -1178,6 +1184,13 @@ struct App {
     /// Показывать ли колесо волны.
     wheel_on: bool,
     keep_track: bool,
+    own_in_wave: bool,
+    /// Свои загруженные треки для волны и когда их список прочитан.
+    own_wave: Vec<Track>,
+    own_wave_at: Option<Instant>,
+    /// Свои треки, что уже были в этой волне, и стоял ли свой трек в прошлой пачке.
+    own_wave_used: HashSet<String>,
+    own_wave_last: bool,
     uncensor: bool,
     /// Запуск, трей и заголовок окна.
     window_prefs: settings::WindowPrefs,
@@ -1558,6 +1571,8 @@ enum Message {
     WheelToggle,
     KeepTrackToggle,
     UncensorToggle,
+    OwnInWaveToggle,
+    OwnWave(Result<Vec<Track>, String>),
     /// Клик по вкладке боковой панели.
     TabOpen(Section),
     WindowPrefSet(settings::WindowPrefs),
@@ -1940,6 +1955,11 @@ impl App {
             wheel_target: 0.0,
             wheel_on: saved.wheel,
             keep_track: saved.keep_track,
+            own_in_wave: saved.own_in_wave,
+            own_wave: Vec::new(),
+            own_wave_at: None,
+            own_wave_used: HashSet::new(),
+            own_wave_last: true,
             uncensor: { uncensor::set_enabled(saved.uncensor); saved.uncensor },
             window_prefs: saved.window,
             discord_prefs: discord::load(),
@@ -2308,7 +2328,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, keep_track: self.keep_track, uncensor: self.uncensor, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb, lyrics: self.lyrics_sources, lyrics_size: self.lyrics_size });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, keep_track: self.keep_track, own_in_wave: self.own_in_wave, uncensor: self.uncensor, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb, lyrics: self.lyrics_sources, lyrics_size: self.lyrics_size });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -3429,6 +3449,9 @@ impl App {
         if let Some(session) = self.wave_pending.take() {
             self.wave = Some(session);
             self.feedback("radioStarted", None, None);
+            // Новая волна: свои треки снова могут попасться, первая пачка — без них.
+            self.own_wave_used.clear();
+            self.own_wave_last = false;
         }
         // Карточка трека видна на экране волны: Яндексу скажем, что её уже показали.
         self.word_open = None;
@@ -3472,7 +3495,11 @@ impl App {
         self.sound = None;
         // Переход: играющий трек затихает сам, новый нарастает поверх него.
         let generation = match (self.cross_out.take(), self.fade_of(&track)) {
-            (Some(out), Some(fade)) if restart.is_none() && resume.is_none() => player.crossfade(out, (fade.in_start, fade.in_stop)),
+            // Новый трек нарастает ровно столько, сколько затихает прежний; в волне-сете — по точкам.
+            (Some(out), Some(fade)) if restart.is_none() && resume.is_none() => {
+                let fade_in = if self.wave_queue && is_mix(&self.wave_base) { (fade.in_start, fade.in_stop) } else { (fade.in_start, fade.in_start + (out.1 - out.0)) };
+                player.crossfade(out, fade_in)
+            }
             _ => player.stop(),
         };
         player.set_speed(self.speed_for(&track));
@@ -3519,6 +3546,14 @@ impl App {
         Task::batch([start, self.wave_refill(), self.words_load(index)])
     }
 
+    /// Когда затухает играющий трек: в конце его окна, не дольше `CROSS_MAX`.
+    fn cross_window(&self, fade: api::Fade) -> (f32, f32) {
+        if self.wave_queue && is_mix(&self.wave_base) {
+            return (fade.out_start, fade.out_stop);
+        }
+        (fade.out_start.max(fade.out_stop - CROSS_MAX), fade.out_stop)
+    }
+
     /// Точки перехода трека: в волне-сете свои, плотнее обычных. Без точек Яндекса —
     /// ровный переход по длительности, чтобы перетекали любые треки.
     fn fade_of(&self, track: &Track) -> Option<api::Fade> {
@@ -3535,9 +3570,9 @@ impl App {
         if self.player.as_ref().is_none_or(Player::is_paused) {
             return None;
         }
-        let fade = self.fade_of(self.current_track()?)?;
+        let (start, stop) = self.cross_window(self.fade_of(self.current_track()?)?);
         let position = self.position.as_secs_f32();
-        if position < fade.out_start || position >= fade.out_stop {
+        if position < start || position >= stop {
             return None;
         }
         let next = self.next_index().filter(|&next| Some(next) != self.current)?;
@@ -3569,8 +3604,41 @@ impl App {
         });
     }
 
+    /// Свой трек для новой пачки волны, как в Tune Client: иногда, не две пачки подряд и без
+    /// повторов в одной волне. Первая пачка задаёт начало волны — её не трогаем.
+    fn own_wave_pick(&mut self, known: &HashSet<String>) -> Option<Track> {
+        if !self.own_in_wave || std::mem::take(&mut self.own_wave_last) || random_seed() % 100 >= OWN_WAVE_CHANCE {
+            return None;
+        }
+        let pool: Vec<&Track> = self.own_wave.iter().filter(|track| !self.own_wave_used.contains(&track.id) && !known.contains(&track.id)).collect();
+        let track = (*pool.get(random_seed() as usize % pool.len().max(1))?).clone();
+        self.own_wave_used.insert(track.id.clone());
+        self.own_wave_last = true;
+        Some(Track { batch: None, ..track })
+    }
+
+    /// Свои загруженные треки из «Мне нравится» для волны: у них номер не из одних цифр.
+    fn own_wave_load(&mut self) -> Task<Message> {
+        if !self.own_in_wave || self.own_wave_at.is_some_and(|at| at.elapsed() < OWN_WAVE_TTL) {
+            return Task::none();
+        }
+        let Some(token) = self.token() else { return Task::none() };
+        let ids: Vec<String> = self.liked_ids.iter().filter(|id| !id.bytes().all(|b| b.is_ascii_digit())).cloned().collect();
+        self.own_wave_at = Some(Instant::now());
+        if ids.is_empty() {
+            self.own_wave.clear();
+            return Task::none();
+        }
+        Task::perform(background(move || api::tracks_by_ids(&ids, &token)), Message::OwnWave)
+    }
+
     /// Перед концом очереди просит у волны следующую пачку.
     fn wave_refill(&mut self) -> Task<Message> {
+        let own = self.own_wave_load();
+        Task::batch([own, self.wave_refill_batch()])
+    }
+
+    fn wave_refill_batch(&mut self) -> Task<Message> {
         let (Some(session), Some(token), Some(index)) = (self.wave.clone(), self.token(), self.current) else { return Task::none() };
         if self.wave_fetching || self.queue.len() - index > WAVE_MARGIN + 1 {
             return Task::none();
@@ -4710,6 +4778,9 @@ impl App {
                 }
                 self.wave = Some(wave.session);
                 self.feedback("radioStarted", None, None);
+                // Новая волна: свои треки снова могут попасться, первая пачка — без них.
+                self.own_wave_used.clear();
+                self.own_wave_last = false;
                 return Task::batch([self.words_load(self.current.unwrap_or(0)), self.wave_refill()]);
             }
             Message::AiLessLoaded(result) => match result {
@@ -5820,6 +5891,14 @@ impl App {
                     self.wheel_target = (self.wheel_turn + ahead).round();
                 }
             }
+            Message::OwnInWaveToggle => {
+                self.own_in_wave = !self.own_in_wave;
+                self.save_settings();
+            }
+            Message::OwnWave(result) => match result {
+                Ok(tracks) => self.own_wave = tracks.into_iter().filter(|track| !track.unavailable).collect(),
+                Err(e) => api::log(&format!("Свои треки для волны: {e}")),
+            },
             Message::UncensorToggle => {
                 self.uncensor = !self.uncensor;
                 uncensor::set_enabled(self.uncensor);
@@ -6037,7 +6116,10 @@ impl App {
                 match result {
                     Ok(tracks) if self.wave.is_some() => {
                         let known: HashSet<String> = self.queue.iter().map(|t| t.id.clone()).collect();
-                        let fresh: Vec<Track> = tracks.into_iter().filter(|t| !known.contains(&t.id)).collect();
+                        let mut fresh: Vec<Track> = tracks.into_iter().filter(|t| !known.contains(&t.id)).collect();
+                        if let Some(own) = self.own_wave_pick(&known) {
+                            fresh.insert(0, own);
+                        }
                         let task = self.fetch_wave_covers(&fresh);
                         self.queue.extend(fresh);
                         return Task::batch([task, self.words_load(self.current.unwrap_or(0))]);
@@ -7298,7 +7380,7 @@ impl App {
                             self.feedback("trackFinished", Some(&track), Some(self.position.as_secs_f32()));
                         }
                         self.change_reason = Some("finish");
-                        self.cross_out = self.current_track().and_then(|track| self.fade_of(track)).map(|fade| (fade.out_start, fade.out_stop));
+                        self.cross_out = self.current_track().and_then(|track| self.fade_of(track)).map(|fade| self.cross_window(fade));
                         return self.play(next);
                     }
                     let Some(p) = &self.player else { return Task::none() };
@@ -8976,6 +9058,7 @@ impl App {
                     ]
                     .spacing(8),
                     group("Без цензуры", vec![toggle("Играть без цензуры", "Треки с запиканными словами играют в оригинале по открытому списку FckCensor, названия и обложки — без цензуры, удалённые треки возвращаются в альбомы. У таких треков значок открытого замка. Уже открытые страницы обновятся при следующем открытии", Some(self.uncensor), Some(Message::UncensorToggle))]),
+                    group("Моя волна", vec![toggle("Свои треки в «Моей волне»", "Загруженные вами треки из «Мне нравится» иногда попадаются в волне, но не два раза подряд и без повторов", Some(self.own_in_wave), Some(Message::OwnInWaveToggle))]),
                     group("Треки", vec![toggle("Помнить последний трек", "После запуска в плеере трек и очередь, что играли при выходе, — даже если сервер синхронизации Яндекса (Ynison) их не вернул", Some(self.keep_track), Some(Message::KeepTrackToggle))]),
                 ]
                 .spacing(28)
@@ -10767,7 +10850,7 @@ fn plain_fade(track: &Track) -> Option<api::Fade> {
     if track.remember || track.smart_preview || length < PLAIN_FADE_MIN {
         return None;
     }
-    Some(api::Fade { in_start: 0.0, in_stop: PLAIN_FADE_IN, out_start: length - PLAIN_FADE_OUT, out_stop: length })
+    Some(api::Fade { in_start: 0.0, in_stop: PLAIN_FADE_OUT, out_start: length - PLAIN_FADE_OUT, out_stop: length })
 }
 
 /// Без номера страницу исполнителя придётся искать по имени.
@@ -12242,7 +12325,7 @@ mod tests {
     fn any_long_track_gets_a_plain_fade() {
         let song = Track { duration: Duration::from_secs(180), ..Track::default() };
         let fade = super::plain_fade(&song).unwrap();
-        assert_eq!((fade.in_start, fade.in_stop, fade.out_start, fade.out_stop), (0.0, 4.0, 174.0, 180.0));
+        assert_eq!((fade.in_start, fade.in_stop, fade.out_start, fade.out_stop), (0.0, 6.0, 174.0, 180.0));
         assert!(super::plain_fade(&Track { remember: true, ..song.clone() }).is_none());
         assert!(super::plain_fade(&Track { duration: Duration::from_secs(20), ..song }).is_none());
     }
