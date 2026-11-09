@@ -68,6 +68,8 @@ const TICK: Duration = Duration::from_millis(500);
 const YNISON_TICK: Duration = Duration::from_millis(300);
 const COVER: f32 = 40.0;
 const BAR_COVER: f32 = 52.0;
+/// Не скачавшуюся обложку просим снова через столько.
+const COVER_RETRY: Duration = Duration::from_secs(20);
 const BAR_HEIGHT: f32 = 68.0;
 /// Полоска перемотки: высота и ширина подписей времени.
 const SEEK_HEIGHT: f32 = 20.0;
@@ -1116,6 +1118,8 @@ struct App {
     covers: HashMap<String, image::Handle>,
     /// Только что загруженные обложки и насколько они проявились.
     cover_fades: HashMap<iced::advanced::image::Id, f32>,
+    /// Обложки, что не скачались, и когда: до `COVER_RETRY` их не просим снова.
+    cover_failed: RefCell<HashMap<String, Instant>>,
     /// Какие обложки уже просили, чтобы при прокрутке не просить снова.
     requested: RefCell<HashSet<String>>,
     /// Сколько лайков уже запрошено и прокрутка открытого списка.
@@ -1365,6 +1369,8 @@ struct App {
     lyrics_back: f32,
     /// Место в треке после перезапуска: действует, пока трек не запустили.
     resume: Option<Duration>,
+    /// Чей это `resume`: после смены очереди на том же месте стоит другой трек.
+    resume_for: Option<String>,
     /// Куда перемотать, как только трек запустится.
     resume_seek: Option<Duration>,
     /// Новый трек волны-сета вступил переходом: сразу после старта он перематывается сюда.
@@ -1615,6 +1621,8 @@ enum Message {
     WordRate(String, &'static str),
     WordRated(String, String, Result<(), String>),
     Cover(String, image::Handle),
+    /// Обложка не скачалась: её можно будет запросить снова чуть позже.
+    CoverFailed(String),
     PlaylistsLoaded(Result<Vec<Playlist>, String>),
     PlaylistOpen(usize),
     PinOpen(usize),
@@ -1936,6 +1944,7 @@ impl App {
             preloaded: None,
             covers: HashMap::new(),
             cover_fades: HashMap::new(),
+            cover_failed: RefCell::new(HashMap::new()),
             requested: RefCell::new(HashSet::new()),
             likes_from: 0,
             list_offset: 0.0,
@@ -2094,6 +2103,7 @@ impl App {
             lyrics_gap: 0.0,
             lyrics_back: 1.0,
             resume: None,
+            resume_for: None,
             resume_seek: None,
             mix_seek: None,
             session_key: None,
@@ -2929,7 +2939,9 @@ impl App {
 
     fn fetch_cover_jobs(&self, jobs: Vec<(String, String)>, size: &'static str) -> Task<Message> {
         let mut requested = self.requested.borrow_mut();
-        let jobs: Vec<(String, String)> = jobs.into_iter().filter(|(id, _)| !self.covers.contains_key(id) && requested.insert(id.clone())).collect();
+        let failed = self.cover_failed.borrow();
+        let fresh = |id: &String| failed.get(id).is_none_or(|at| at.elapsed() >= COVER_RETRY);
+        let jobs: Vec<(String, String)> = jobs.into_iter().filter(|(id, _)| !self.covers.contains_key(id) && fresh(id) && requested.insert(id.clone())).collect();
         if jobs.is_empty() {
             return Task::none();
         }
@@ -2957,14 +2969,18 @@ impl App {
                     }
                 };
                 let blur = id.starts_with(WHEEL_BLUR);
-                if let Some(handle) = bytes.and_then(|bytes| if blur { decoded_blurred(&bytes) } else { decoded(&bytes) }) {
-                    if tx.unbounded_send((id, handle)).is_err() {
-                        break;
-                    }
+                // Не скачалась — об этом тоже сообщаем: иначе обложка считалась бы запрошенной
+                // и больше не запрашивалась, и трек так и стоял бы без картинки.
+                let handle = bytes.and_then(|bytes| if blur { decoded_blurred(&bytes) } else { decoded(&bytes) });
+                if tx.unbounded_send((id, handle)).is_err() {
+                    break;
                 }
             });
         }
-        Task::stream(rx).map(|(id, handle)| Message::Cover(id, handle))
+        Task::stream(rx).map(|(id, handle)| match handle {
+            Some(handle) => Message::Cover(id, handle),
+            None => Message::CoverFailed(id),
+        })
     }
 
     /// Обложки остаются только у того, что на экране, рядом с ним и рядом в очереди.
@@ -3385,6 +3401,7 @@ impl App {
         self.current = Some(saved.current);
         self.position = saved.position;
         self.resume = Some(saved.position);
+        self.resume_for = self.queue.get(saved.current).map(|track| track.id.clone());
         let Some(seeds) = saved.wave else {
             self.queue_title = Some(saved.title);
             self.wave_queue = false;
@@ -3473,7 +3490,9 @@ impl App {
         }
         let restart = self.restart.take();
         // Место прошлого запуска относится только к тому же треку.
-        let mut resume = self.resume.take().filter(|_| self.current == Some(index));
+        // Сменили волну или плейлист — на том же номере уже другой трек: он играет с начала.
+        let resume_for = self.resume_for.take();
+        let mut resume = self.resume.take().filter(|_| self.current == Some(index) && resume_for.as_deref() == Some(track.id.as_str()));
         // Выпуск подкаста и глава книги продолжаются там, где остановились, если не дослушаны.
         if resume.is_none() && restart.is_none() && track.remember {
             let place = self.progress.get(&track.id).copied().or(track.progress).unwrap_or(0.0);
@@ -5920,7 +5939,10 @@ impl App {
                 Err(e) => return self.notify(format!("Не удалось скачать «{title}»: {e}")),
             },
             Message::RevealFile(path) => {
-                let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
+                // Explorer не понимает «/select,путь» целиком в кавычках, как их ставит Rust для
+                // пути с пробелами, и открывает «Документы»: кавычки только вокруг пути.
+                use std::os::windows::process::CommandExt;
+                let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).spawn();
             }
             Message::OwnInWaveToggle => {
                 self.own_in_wave = !self.own_in_wave;
@@ -6627,6 +6649,7 @@ impl App {
                 if let (true, true, Some(index)) = (changed, self.active, self.current) {
                     self.restart = Some(self.player.as_ref().is_some_and(Player::is_paused));
                     self.resume = Some(self.position);
+                    self.resume_for = self.current_track().map(|track| track.id.clone());
                     self.preloaded = None;
                     return self.play(index);
                 }
@@ -7262,7 +7285,12 @@ impl App {
                     }
                 }
             }
+            Message::CoverFailed(id) => {
+                self.requested.borrow_mut().remove(&id);
+                self.cover_failed.borrow_mut().insert(id, Instant::now());
+            }
             Message::Cover(id, handle) => {
+                self.cover_failed.borrow_mut().remove(&id);
                 // Крупная обложка заменяет уже видную мелкую, ей проявляться не нужно.
                 if let Some(track) = id.strip_prefix(WAVE_BIG) {
                     if let Some(tint) = average_color(&handle) {
@@ -7438,6 +7466,7 @@ impl App {
                     let place = Duration::from_secs_f32(value.max(0.0));
                     self.position = place;
                     self.resume = Some(place);
+                    self.resume_for = self.current_track().map(|track| track.id.clone());
                 }
             }
             Message::SeekDone => {
@@ -10323,7 +10352,7 @@ impl App {
 
     fn cover<'a>(&'a self, track: &Track, size: f32) -> Element<'a, Message> {
         let dim = if track.unavailable { UNAVAILABLE_COVER } else { 1.0 };
-        match self.covers.get(&track.id) {
+        match self.covers.get(&track.id).or_else(|| self.covers.get(&format!("{WAVE_BIG}{}", track.id))) {
             Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle) * dim).width(size).height(size).border_radius(6).into(),
             None => container(Space::new()).width(size).height(size).style(ui::tile).into(),
         }
