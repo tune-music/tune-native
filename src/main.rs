@@ -11,6 +11,7 @@ mod discord;
 mod shell;
 mod tray;
 mod uncensor;
+mod export;
 mod dpi;
 mod caption;
 mod client;
@@ -1185,6 +1186,8 @@ struct App {
     wheel_on: bool,
     keep_track: bool,
     own_in_wave: bool,
+    /// Кнопка в уведомлении вместо «Отменить», например «Показать» у сохранённого файла.
+    notice_action: Option<(String, Box<Message>)>,
     /// Свои загруженные треки для волны и когда их список прочитан.
     own_wave: Vec<Track>,
     own_wave_at: Option<Instant>,
@@ -1572,6 +1575,11 @@ enum Message {
     KeepTrackToggle,
     UncensorToggle,
     OwnInWaveToggle,
+    /// «Скачать в файл»: трек с тегами и обложкой в «Загрузки».
+    SaveToFile(Track),
+    FileSaved(String, Result<std::path::PathBuf, String>),
+    /// Показать сохранённый файл в проводнике.
+    RevealFile(std::path::PathBuf),
     OwnWave(Result<Vec<Track>, String>),
     /// Клик по вкладке боковой панели.
     TabOpen(Section),
@@ -1956,6 +1964,7 @@ impl App {
             wheel_on: saved.wheel,
             keep_track: saved.keep_track,
             own_in_wave: saved.own_in_wave,
+            notice_action: None,
             own_wave: Vec::new(),
             own_wave_at: None,
             own_wave_used: HashSet::new(),
@@ -3912,6 +3921,7 @@ impl App {
     /// Показывает уведомление и убирает его через несколько секунд.
     fn notify(&mut self, text: String) -> Task<Message> {
         self.notice_quick = false;
+        self.notice_action = None;
         let id = self.notice.as_ref().map_or(1, |(id, _, _)| id + 1);
         self.notice = Some((id, text, false));
         Task::perform(
@@ -3926,6 +3936,7 @@ impl App {
         let id = self.notice.as_ref().map_or(1, |(id, _, _)| id + 1);
         self.notice = Some((id, text, false));
         self.notice_quick = true;
+        self.notice_action = None;
         Task::perform(background(|| std::thread::sleep(QUICK_NOTICE_TIME)), move |()| Message::NoticeClear(id))
     }
 
@@ -5891,6 +5902,26 @@ impl App {
                     self.wheel_target = (self.wheel_turn + ahead).round();
                 }
             }
+            Message::SaveToFile(track) => {
+                self.menu = None;
+                let Some(token) = self.token() else { return Task::none() };
+                let quality = self.quality.code();
+                let title = track.title.clone();
+                let notice = self.notify_quick(format!("Скачиваем «{title}» в «Загрузки»"));
+                let save = Task::perform(background(move || export::save(&track, quality, &token)), move |result| Message::FileSaved(title.clone(), result));
+                return Task::batch([notice, save]);
+            }
+            Message::FileSaved(title, result) => match result {
+                Ok(path) => {
+                    let task = self.notify(format!("«{title}» сохранён в «Загрузки»"));
+                    self.notice_action = Some(("Показать".to_string(), Box::new(Message::RevealFile(path))));
+                    return task;
+                }
+                Err(e) => return self.notify(format!("Не удалось скачать «{title}»: {e}")),
+            },
+            Message::RevealFile(path) => {
+                let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
+            }
             Message::OwnInWaveToggle => {
                 self.own_in_wave = !self.own_in_wave;
                 self.save_settings();
@@ -7688,13 +7719,19 @@ impl App {
         if let Some((notice, undo)) = &self.notice_fade.item {
             let alpha = self.notice_fade.shown();
             let mut line = row![text(human_error(notice)).color(ui::c().text.scale_alpha(alpha))].spacing(16).align_y(Alignment::Center);
-            if *undo {
-                line = line.push(shine(button(text("Отменить").font(ui::font_medium()).color(ui::c().accent.scale_alpha(alpha))).padding([4, 10]).style(ui::button_faded(ui::ghost, alpha)).on_press(Message::Undo), 16.0));
+            let action = match (&self.notice_action, *undo) {
+                (_, true) => Some(("Отменить".to_string(), Message::Undo)),
+                (Some((label, message)), false) => Some((label.clone(), (**message).clone())),
+                (None, false) => None,
+            };
+            let clickable = action.is_some();
+            if let Some((label, message)) = action {
+                line = line.push(shine(button(text(label).font(ui::font_medium()).color(ui::c().accent.scale_alpha(alpha))).padding([4, 10]).style(ui::button_faded(ui::ghost, alpha)).on_press(message), 16.0));
             }
-            let padding = if *undo { Padding::from([8, 18]).right(8) } else { Padding::from([12, 18]) };
+            let padding = if clickable { Padding::from([8, 18]).right(8) } else { Padding::from([12, 18]) };
             let body = container(line).padding(padding).style(ui::popover_faded(alpha));
             layers = layers.push(
-                container(reveal(body).shift(0.0, -16.0 * (1.0 - alpha)).scale(0.97 + 0.03 * alpha, 0.5, 0.0).inert(!(*undo && self.notice_fade.live)))
+                container(reveal(body).shift(0.0, -16.0 * (1.0 - alpha)).scale(0.97 + 0.03 * alpha, 0.5, 0.0).inert(!(clickable && self.notice_fade.live)))
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .align_x(Alignment::Center)
@@ -8194,6 +8231,11 @@ impl App {
             } else {
                 item(ui::DOWNLOAD, "Скачать", Message::Download(vec![track.clone()]))
             });
+            count += 1.0;
+        }
+        // Обычный файл с тегами и обложкой — для других плееров и устройств.
+        if !track.unavailable {
+            items = items.push(item(ui::DOWNLOAD, "Скачать в файл", Message::SaveToFile(track.clone())));
             count += 1.0;
         }
         items = items.push(item(ui::LINK, "Скопировать ссылку", Message::CopyLink(track.clone())));
@@ -11327,6 +11369,30 @@ fn smoke_spoof(id: &str) -> Result<(), String> {
     result
 }
 
+/// «Скачать в файл» во временную папку во всех качествах: файл с тегами должен играть.
+/// `TUNE_EXPORT_DIR` — куда класть; по умолчанию временная папка.
+fn smoke_export(id: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let track = api::tracks_by_ids(&[id.to_string()], &token)?.into_iter().next().ok_or("Яндекс не прислал трек")?;
+    let dir = std::env::var_os("TUNE_EXPORT_DIR").map_or_else(|| std::env::temp_dir().join("tune-export"), std::path::PathBuf::from);
+    let player = Player::new()?;
+    player.set_volume(0.0);
+    for quality in [Quality::Normal, Quality::Lossless] {
+        let path = export::save_to(&track, quality.code(), &token, &dir)?;
+        let size = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+        let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or_default().to_string();
+        let codec = match ext.as_str() {
+            "m4a" => "aac-mp4",
+            other => other,
+        };
+        let generation = player.stop();
+        player.play_file(generation, &path, codec)?;
+        std::thread::sleep(Duration::from_secs(2));
+        println!("{}: {} байт, позиция через 2 с: {:?}", path.display(), size, player.position());
+    }
+    Ok(())
+}
+
 /// Трек по номеру через «Без цензуры»: название из списка FckCensor, файл без цензуры играет.
 fn smoke_uncensor(id: &str) -> Result<(), String> {
     let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
@@ -12131,10 +12197,11 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-uncensor" || flag == "--smoke-spoof" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" || flag == "--smoke-clone" || flag == "--smoke-words" || flag == "--smoke-clip" || flag == "--smoke-ynison" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-uncensor" || flag == "--smoke-export" || flag == "--smoke-spoof" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" || flag == "--smoke-clone" || flag == "--smoke-words" || flag == "--smoke-clip" || flag == "--smoke-ynison" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
                 "--smoke-uncensor" => smoke_uncensor(query),
+                "--smoke-export" => smoke_export(query),
                 "--smoke-spoof" => smoke_spoof(query),
                 "--smoke-library" => smoke_library(query),
                 "--smoke-wave" => smoke_wave(query),
