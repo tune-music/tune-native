@@ -336,7 +336,12 @@ const ARTIST_COVER: &str = "artist:";
 const VIDEO_COVER: &str = "video:";
 const PHOTO_COVER: &str = "photo:";
 /// За сколько до конца трека начать качать следующий.
-const PRELOAD_BEFORE: Duration = Duration::from_secs(30);
+/// Переход для трека без точек Яндекса (свои, загруженные, без цензуры, подменённые):
+/// затухание за столько секунд до конца и нарастание нового в первые секунды.
+const PLAIN_FADE_OUT: f32 = 6.0;
+const PLAIN_FADE_IN: f32 = 4.0;
+/// Короче этого переход не делается: от трека почти ничего не осталось бы.
+const PLAIN_FADE_MIN: f32 = 30.0;
 /// Выпуски и книги: шаг кнопок перемотки, как часто место уходит Яндексу, и границы,
 /// внутри которых выпуск продолжается с места, а не с начала.
 const PODCAST_STEP: f32 = 15.0;
@@ -3514,13 +3519,15 @@ impl App {
         Task::batch([start, self.wave_refill(), self.words_load(index)])
     }
 
-    /// Точки перехода трека: в волне-сете свои, плотнее обычных.
+    /// Точки перехода трека: в волне-сете свои, плотнее обычных. Без точек Яндекса —
+    /// ровный переход по длительности, чтобы перетекали любые треки.
     fn fade_of(&self, track: &Track) -> Option<api::Fade> {
-        if self.wave_queue && is_mix(&self.wave_base) { track.mix_fade.or(track.fade) } else { track.fade }
+        let marked = if self.wave_queue && is_mix(&self.wave_base) { track.mix_fade.or(track.fade) } else { track.fade };
+        marked.or_else(|| plain_fade(track))
     }
 
-    /// Пора начинать переход к следующему треку: оба трека — музыка с точками перехода,
-    /// трек играет и дошёл до начала затухания. Повтор одного трека переходом не идёт.
+    /// Пора начинать переход к следующему треку: у обоих есть точки перехода (свои или
+    /// ровные), трек играет и дошёл до начала затухания. Повтор одного трека переходом не идёт.
     fn cross_next(&self) -> Option<usize> {
         if !self.crossfade || (self.repeat == Repeat::One && !self.wave_queue) || self.starting || self.seeking.is_some() || self.resume_seek.is_some() {
             return None;
@@ -3537,11 +3544,11 @@ impl App {
         self.fade_of(self.queue.get(next)?).map(|_| next)
     }
 
-    /// Незадолго до конца трека начинает качать следующий. Ошибка не важна: при запуске
-    /// файл просто запросится обычным путём.
+    /// Как только трек заиграл, начинает качать следующий: переключение на него и переход
+    /// тогда без ожидания. Ошибка не важна: при запуске файл просто запросится обычным путём.
     fn preload_next(&mut self) {
-        let (Some(track), Some(player), Some(token)) = (self.current_track(), self.player.clone(), self.token()) else { return };
-        if track.duration.saturating_sub(self.position) > PRELOAD_BEFORE || (self.repeat == Repeat::One && !self.wave_queue) {
+        let (Some(player), Some(token)) = (self.player.clone(), self.token()) else { return };
+        if !self.active || self.starting || (self.repeat == Repeat::One && !self.wave_queue) {
             return;
         }
         let Some(next) = self.next_index().and_then(|i| self.queue.get(i)) else { return };
@@ -8987,7 +8994,7 @@ impl App {
                     sound,
                     self.view_equalizer(),
                     group("Воспроизведение", vec![
-                        toggle("Плавные переходы между треками", "Конец трека перетекает в начало следующего", Some(self.crossfade), Some(Message::CrossfadeToggle)),
+                        toggle("Плавные переходы между треками", "Конец трека перетекает в начало следующего — у любых треков: свои, скачанные и без цензуры тоже", Some(self.crossfade), Some(Message::CrossfadeToggle)),
                         toggle("Одинаковая громкость треков", "Тихие и громкие записи звучат на одном уровне, по данным Яндекса о громкости трека", Some(self.normalize), Some(Message::NormalizeToggle)),
                     ]),
                 ]
@@ -10754,6 +10761,15 @@ fn grouped(n: u64) -> String {
     out
 }
 
+/// Ровный переход для трека без точек Яндекса. У выпусков, глав и отрывков его нет.
+fn plain_fade(track: &Track) -> Option<api::Fade> {
+    let length = track.duration.as_secs_f32();
+    if track.remember || track.smart_preview || length < PLAIN_FADE_MIN {
+        return None;
+    }
+    Some(api::Fade { in_start: 0.0, in_stop: PLAIN_FADE_IN, out_start: length - PLAIN_FADE_OUT, out_stop: length })
+}
+
 /// Без номера страницу исполнителя придётся искать по имени.
 fn artist_message(name: &str, id: &str) -> Message {
     if id.is_empty() {
@@ -12222,6 +12238,15 @@ mod lyrics_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn any_long_track_gets_a_plain_fade() {
+        let song = Track { duration: Duration::from_secs(180), ..Track::default() };
+        let fade = super::plain_fade(&song).unwrap();
+        assert_eq!((fade.in_start, fade.in_stop, fade.out_start, fade.out_stop), (0.0, 4.0, 174.0, 180.0));
+        assert!(super::plain_fade(&Track { remember: true, ..song.clone() }).is_none());
+        assert!(super::plain_fade(&Track { duration: Duration::from_secs(20), ..song }).is_none());
+    }
+
     #[test]
     fn spoof_form_keeps_only_changes() {
         use serde_json::json;
