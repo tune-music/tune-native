@@ -191,11 +191,13 @@ pub struct WindowPrefs {
     pub track_title: bool,
     /// «Исполнитель — трек» на панели задач и в Alt+Tab.
     pub track_taskbar: bool,
+    /// Ссылки `yandexmusic://` («Открыть в приложении» на сайте) открывает Tune.
+    pub yandex_links: bool,
 }
 
 impl Default for WindowPrefs {
     fn default() -> Self {
-        Self { autostart: false, start_minimized: false, close_to_tray: true, track_title: false, track_taskbar: false }
+        Self { autostart: false, start_minimized: false, close_to_tray: true, track_title: false, track_taskbar: false, yandex_links: false }
     }
 }
 
@@ -257,6 +259,7 @@ fn parse(v: &Value) -> Settings {
                 // заголовке нет — старое значение не переносится.
                 track_title: w["trackInTitle"].as_bool().unwrap_or(base.track_title),
                 track_taskbar: w["trackInTaskbar"].as_bool().unwrap_or(base.track_taskbar),
+                yandex_links: w["yandexLinks"].as_bool().unwrap_or(base.yandex_links),
             }
         },
     }
@@ -290,7 +293,7 @@ pub fn save(settings: Settings) {
     let l = settings.lyrics;
     let lyrics = json!({ "enabled": l.enabled, "always": l.always, "lrclib": l.lrclib, "netease": l.netease, "neteaseFirst": l.netease_first });
     let w = settings.window;
-    let window = json!({ "autostart": w.autostart, "startMinimized": w.start_minimized, "closeToTray": w.close_to_tray, "trackInTitle": w.track_title, "trackInTaskbar": w.track_taskbar });
+    let window = json!({ "autostart": w.autostart, "startMinimized": w.start_minimized, "closeToTray": w.close_to_tray, "trackInTitle": w.track_title, "trackInTaskbar": w.track_taskbar, "yandexLinks": w.yandex_links });
     let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "books": settings.books, "concerts": settings.concerts, "words": settings.words, "wheel": settings.wheel, "speed": settings.speed, "theme": settings.look.code(), "keepTrack": settings.keep_track, "uncensor": settings.uncensor, "ownInWave": settings.own_in_wave, "window": window, "volumeWheel": settings.volume_wheel, "volumeStep": settings.volume_step, "speedControl": settings.speed_control, "speedStep": settings.speed_step, "pitchWithSpeed": settings.pitch, "reverb": settings.reverb, "lyrics": lyrics, "lyricsSize": settings.lyrics_size });
     let dir = api::data_dir();
     if fs::create_dir_all(&dir).is_ok() {
@@ -314,7 +317,7 @@ mod tests {
         assert!(!parse(&json!({ "keepTrack": false })).keep_track);
         assert_eq!((parse(&json!({ "volumeStep": 2 })).volume_step, parse(&json!({ "volumeStep": 7 })).volume_step, parse(&json!({ "volumeStep": 40 })).volume_step), (2, 7, 5));
         let window = parse(&json!({ "window": { "autostart": true, "closeToTray": false } })).window;
-        assert_eq!(window, WindowPrefs { autostart: true, start_minimized: false, close_to_tray: false, track_title: false, track_taskbar: false });
+        assert_eq!(window, WindowPrefs { autostart: true, start_minimized: false, close_to_tray: false, track_title: false, track_taskbar: false, yandex_links: false });
         assert!(!parse(&json!({ "words": false })).words);
         assert_eq!((parse(&json!({ "theme": "system" })).look, parse(&json!({ "theme": "pink" })).look), (Look::System, Look::Dark));
         assert_eq!((parse(&json!({ "speed": 1.5 })).speed, parse(&json!({ "speed": 7 })).speed, parse(&json!({ "speed": 0.75 })).speed), (1.5, 1.0, 0.75));

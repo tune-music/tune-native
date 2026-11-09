@@ -21,7 +21,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, GetClientRect, IsZoomed, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_WNDPROC, HTCAPTION, HTCLIENT, HTMAXBUTTON, HTTOP, HTTOPLEFT, HTTOPRIGHT, NCCALCSIZE_PARAMS,
     SM_CXPADDEDBORDER, SM_CYFRAME, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, WM_ACTIVATE, WM_MOUSEMOVE,
-    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WNDPROC, IDC_HAND, LoadCursorW, SetCursor, WM_SETCURSOR,
+    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WNDPROC, IDC_HAND, LoadCursorW, SetCursor, WM_SETCURSOR, SIZE_MAXIMIZED, SIZE_RESTORED, WM_EXITSIZEMOVE, WM_SIZE,
 };
 
 /// Высота полосы в точках при масштабе 100%.
@@ -209,6 +209,20 @@ unsafe extern "system" fn proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             // SAFETY: системный курсор, освобождать не нужно.
             unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND)) };
             1
+        }
+        // Место и развёрнутость окна запоминаются для следующего запуска.
+        WM_EXITSIZEMOVE => {
+            let result = unsafe { next(hwnd, message, wparam, lparam) };
+            crate::placement::save(hwnd as isize);
+            result
+        }
+        WM_SIZE => {
+            match wparam as u32 {
+                SIZE_MAXIMIZED => crate::placement::zoom_changed(hwnd as isize, true),
+                SIZE_RESTORED => crate::placement::zoom_changed(hwnd as isize, false),
+                _ => {}
+            }
+            unsafe { next(hwnd, message, wparam, lparam) }
         }
         WM_ACTIVATE => {
             set(&ACTIVE, wparam & 0xFFFF != 0);

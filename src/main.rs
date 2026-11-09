@@ -12,6 +12,8 @@ mod shell;
 mod tray;
 mod uncensor;
 mod export;
+mod placement;
+mod protocol;
 mod dpi;
 mod caption;
 mod client;
@@ -68,6 +70,8 @@ const TICK: Duration = Duration::from_millis(500);
 const YNISON_TICK: Duration = Duration::from_millis(300);
 const COVER: f32 = 40.0;
 const BAR_COVER: f32 = 52.0;
+/// Ссылка, которой запустили Tune, открывается чуть позже первого экрана.
+const START_LINK_DELAY: Duration = Duration::from_millis(800);
 /// Не скачавшуюся обложку просим снова через столько.
 const COVER_RETRY: Duration = Duration::from_secs(20);
 const BAR_HEIGHT: f32 = 68.0;
@@ -122,6 +126,8 @@ const UNDO_TIME: Duration = Duration::from_secs(5);
 /// Где курсор и какого размера окно. Меняются постоянно, поэтому не идут через сообщения:
 /// иначе интерфейс перестраивался бы от каждого движения мыши.
 static CURSOR: Mutex<(f32, f32)> = Mutex::new((0.0, 0.0));
+/// Окно должно появиться при запуске (не свёрнутым в трей): его показывает `placement`.
+static START_VISIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static WINDOW: Mutex<(f32, f32)> = Mutex::new((1280.0, 820.0));
 const PIN_COVER_PREFIX: &str = "pin:";
 const AVATAR_COVER: &str = "avatar";
@@ -5976,6 +5982,11 @@ impl App {
                         return self.notify(e);
                     }
                 }
+                if prefs.yandex_links != self.window_prefs.yandex_links {
+                    if let Err(e) = protocol::set_yandex(prefs.yandex_links) {
+                        return self.notify(e);
+                    }
+                }
                 self.window_prefs = prefs;
                 self.save_settings();
             }
@@ -7151,6 +7162,13 @@ impl App {
                     paint_caption(hwnd);
                     dpi::guard(hwnd);
                     caption::install(hwnd);
+                    // Окно создано скрытым и встаёт на прежнее место; места нет — показывается как есть.
+                    if self.preview.is_none() {
+                        let visible = START_VISIBLE.load(Ordering::Relaxed);
+                        if !placement::restore(hwnd, visible) && visible {
+                            show_window(hwnd);
+                        }
+                    }
                 }
                 self.media = hwnd.map(Media::new);
                 // У предпросмотров значка нет: их закрывают снаружи, и он оставался бы висеть.
@@ -9057,6 +9075,9 @@ impl App {
                         toggle("Запускать свёрнутым", "Окно не появится при обычном запуске — откройте его из трея", Some(prefs.start_minimized), set(|p| p.start_minimized = !p.start_minimized)),
                         toggle("Сворачивать в трей при закрытии", "Музыка продолжит играть. Выйти совсем — из меню значка в трее", Some(prefs.close_to_tray), set(|p| p.close_to_tray = !p.close_to_tray)),
                     ]),
+                    group("Ссылки", vec![
+                        toggle("Открывать ссылки Яндекс Музыки в Tune", "Кнопка «Открыть в приложении» на music.yandex.ru и ссылки yandexmusic:// откроются в Tune, а не в официальном клиенте. Выключите — снова откроются в нём", Some(prefs.yandex_links), set(|p| p.yandex_links = !p.yandex_links)),
+                    ]),
                     group("Вид", vec![
                         toggle("Трек в заголовке окна", "Вместо «Tune» в верхней полосе окна — «Исполнитель — трек»", Some(prefs.track_title), set(|p| p.track_title = !p.track_title)),
                         toggle("Трек на панели задач и в Alt+Tab", "«Исполнитель — трек» на кнопке окна и в переключении окон; в заголовке окна при этом может остаться «Tune»", Some(prefs.track_taskbar), set(|p| p.track_taskbar = !p.track_taskbar)),
@@ -10718,11 +10739,12 @@ fn wait_for_exit(pid: u32) {
 
 /// Окно выходит вперёд, даже если было свёрнуто или спрятано в трей.
 fn show_window(hwnd: isize) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE};
     let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
     unsafe {
         if IsWindowVisible(hwnd) == 0 {
-            ShowWindow(hwnd, SW_SHOW);
+            // Развёрнутое до трея окно и возвращается развёрнутым.
+            crate::placement::show(hwnd as isize);
         }
         if IsIconic(hwnd) != 0 {
             ShowWindow(hwnd, SW_RESTORE);
@@ -12223,6 +12245,10 @@ fn main() -> iced::Result {
     if forwarded {
         return Ok(());
     }
+    let start_link = match args.as_slice() {
+        [_, link] if api::parse_link(link).is_some() => Some(link.clone()),
+        _ => None,
+    };
     // DirectX 12 занимает меньше всего памяти из графических API. Нет видеокарты — iced сам
     // перейдёт на отрисовку процессором.
     if std::env::var_os("WGPU_BACKEND").is_none() {
@@ -12377,7 +12403,31 @@ fn main() -> iced::Result {
         });
     }
     let visible = preview.is_some() || !(minimized || prefs.start_minimized);
-    let mut app = iced::application(move || App::new(preview.clone()), App::update, App::view);
+    // С сохранённым местом окно создаётся скрытым и показывается уже на нём, без прыжка.
+    START_VISIBLE.store(visible, Ordering::Relaxed);
+    let placed = preview.is_none() && placement::load().is_some();
+    if preview.is_none() {
+        protocol::register_own();
+        // Программу могли перенести: ссылки yandexmusic:// ведут на нынешний путь.
+        if prefs.yandex_links {
+            std::thread::spawn(|| {
+                if let Err(e) = protocol::set_yandex(true) {
+                    api::log(&e);
+                }
+            });
+        }
+    }
+    let mut app = iced::application(
+        move || {
+            let (app, task) = App::new(preview.clone());
+            // Tune запустили ссылкой: она открывается, когда главный экран уже загружается.
+            let Some(link) = start_link.clone() else { return (app, task) };
+            let open = Task::perform(background(|| std::thread::sleep(START_LINK_DELAY)), move |()| Message::LinkFromOutside(link.clone()));
+            (app, Task::batch([task, open]))
+        },
+        App::update,
+        App::view,
+    );
     for font in yandex_fonts {
         app = app.font(font);
     }
@@ -12388,7 +12438,7 @@ fn main() -> iced::Result {
         .window(window::Settings {
             size: Size::new(width, height),
             min_size: Some(Size::new(900.0, MIN_HEIGHT)),
-            visible,
+            visible: visible && !placed,
             icon: window::icon::from_file_data(&tray::ICON[..], None).ok(),
             exit_on_close_request: false,
             ..window::Settings::default()
