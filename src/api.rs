@@ -428,6 +428,8 @@ fn parse_track_artists(v: &Value) -> Vec<(String, String)> {
 }
 
 fn parse_track(v: &Value) -> Option<Track> {
+    let patched = crate::uncensor::patch_track(v);
+    let v = patched.as_ref().unwrap_or(v);
     let id = match &v["id"] {
         Value::String(s) => s.clone(),
         Value::Number(n) => n.to_string(),
@@ -989,6 +991,8 @@ fn cover_uri(v: &Value) -> Option<String> {
 }
 
 fn parse_album(v: &Value) -> Option<Album> {
+    let patched = crate::uncensor::patch_album(v);
+    let v = patched.as_ref().unwrap_or(v);
     Some(Album {
         id: id_text(&v["id"])?,
         title: v["title"].as_str().unwrap_or_default().to_string(),
@@ -1139,6 +1143,19 @@ pub fn album(id: &str, token: &str) -> Result<(Album, Vec<Track>), String> {
     if v["sortOrder"].as_str() == Some("desc") {
         disks.reverse();
         disks.iter_mut().for_each(|disk| disk.reverse());
+    }
+    // Без цензуры: треки по дискам, как в списке FckCensor, с удалёнными Яндексом.
+    if let Some(want) = crate::uncensor::album_volumes(id) {
+        let mut have: HashMap<String, Track> = disks.drain(..).flatten().map(|track| (track.id.clone(), track)).collect();
+        let missing: Vec<String> = want.iter().flatten().filter(|id| !have.contains_key(*id)).cloned().collect();
+        if !missing.is_empty() {
+            have.extend(tracks_by_ids(&missing, token).unwrap_or_default().into_iter().map(|track| (track.id.clone(), track)));
+        }
+        disks = want.iter().map(|disk| disk.iter().filter_map(|id| have.remove(id)).collect()).collect();
+        // Треки, которых нет в списке, остаются в конце.
+        if let Some(last) = disks.last_mut() {
+            last.extend(have.into_values());
+        }
     }
     let mut album = parse_album(v).ok_or("Яндекс не прислал альбом")?;
     album.disclaimer = disclaimer("albums", id, &v["disclaimers"], token);
@@ -3253,6 +3270,11 @@ fn sign(data: &str) -> String {
 }
 
 pub fn file_info(track_id: &str, quality: &str, token: &str) -> Result<FileInfo, String> {
+    // Без цензуры: файл из списка FckCensor вместо файла Яндекса. Формат узнаётся по самому
+    // файлу: в списке бывают и m4a под видом mp3.
+    if let Some(url) = crate::uncensor::file(track_id).filter(|_| quality != "smart_preview") {
+        return Ok(FileInfo { url, key: None, codec: "mp3".to_string(), bitrate: 0, quality: quality.to_string() });
+    }
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs().to_string();
     // HE-AAC просим только в MP4: его кадры декодирует декодер Windows (см. `heaac`).
     let codecs: Vec<&str> = CODECS.iter().copied().filter(|codec| *codec != "he-aac").collect();

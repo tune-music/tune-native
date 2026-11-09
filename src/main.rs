@@ -10,6 +10,7 @@ mod ynison;
 mod discord;
 mod shell;
 mod tray;
+mod uncensor;
 mod dpi;
 mod caption;
 mod client;
@@ -1053,6 +1054,7 @@ struct App {
     /// Показывать ли колесо волны.
     wheel_on: bool,
     keep_track: bool,
+    uncensor: bool,
     /// Запуск, трей и заголовок окна.
     window_prefs: settings::WindowPrefs,
     /// Статус в Discord: настройки, поток связи и что ему отправлено последним —
@@ -1429,6 +1431,7 @@ enum Message {
     WheelSpin(f32),
     WheelToggle,
     KeepTrackToggle,
+    UncensorToggle,
     /// Клик по вкладке боковой панели.
     TabOpen(Section),
     WindowPrefSet(settings::WindowPrefs),
@@ -1798,6 +1801,7 @@ impl App {
             wheel_target: 0.0,
             wheel_on: saved.wheel,
             keep_track: saved.keep_track,
+            uncensor: { uncensor::set_enabled(saved.uncensor); saved.uncensor },
             window_prefs: saved.window,
             discord_prefs: discord::load(),
             volume_wheel: saved.volume_wheel,
@@ -2164,7 +2168,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, keep_track: self.keep_track, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb, lyrics: self.lyrics_sources, lyrics_size: self.lyrics_size });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, keep_track: self.keep_track, uncensor: self.uncensor, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb, lyrics: self.lyrics_sources, lyrics_size: self.lyrics_size });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -5662,6 +5666,11 @@ impl App {
                     self.wheel_target = (self.wheel_turn + ahead).round();
                 }
             }
+            Message::UncensorToggle => {
+                self.uncensor = !self.uncensor;
+                uncensor::set_enabled(self.uncensor);
+                self.save_settings();
+            }
             Message::KeepTrackToggle => {
                 self.keep_track = !self.keep_track;
                 self.save_settings();
@@ -8142,7 +8151,7 @@ impl App {
         let name = container(name).padding(Padding::ZERO.left(14)).width(Length::Fill).height(Length::Fill).align_y(Alignment::Center).clip(true);
         let zoomed = self.hwnd.is_some_and(caption::zoomed);
         let (max_hover, max_pressed) = caption::max_state();
-        let face = |glyph, color| container(ui::icon(glyph, 16.0, color)).center_x(caption::BUTTON).center_y(caption::HEIGHT);
+        let face = |glyph, color| container(ui::icon(glyph, 20.0, color)).center_x(caption::BUTTON).center_y(caption::HEIGHT);
         let shade = |hover: bool, pressed: bool| match (hover, pressed) {
             (_, true) => Some(iced::Background::Color(ui::c().text.scale_alpha(0.12))),
             (true, _) => Some(iced::Background::Color(ui::c().text.scale_alpha(0.07))),
@@ -8648,6 +8657,7 @@ impl App {
                         container(column![column![text("Шаг громкости").color(ui::c().text), text("Для колеса мыши и стрелок ↑ и ↓").size(13).color(ui::c().muted)].spacing(2), steps].spacing(10)).padding(8),
                     ]
                     .spacing(8),
+                    group("Без цензуры", vec![toggle("Играть без цензуры", "Треки с запиканными словами играют в оригинале по открытому списку FckCensor, названия и обложки — без цензуры, удалённые треки возвращаются в альбомы. У таких треков значок открытого замка. Уже открытые страницы обновятся при следующем открытии", Some(self.uncensor), Some(Message::UncensorToggle))]),
                     group("Треки", vec![toggle("Помнить последний трек", "После запуска в плеере трек и очередь, что играли при выходе, — даже если сервер синхронизации Яндекса (Ynison) их не вернул", Some(self.keep_track), Some(Message::KeepTrackToggle))]),
                 ]
                 .spacing(28)
@@ -10133,7 +10143,8 @@ fn queue_key(tracks: &[Track], title: &str) -> u64 {
 /// (`marquee`) бегущая строка при наведении.
 fn track_title<'a>(track: &'a Track, size: f32, font: iced::Font, color: iced::Color, marquee: bool) -> Element<'a, Message> {
     let plus = if track.plus_only && !ui::HAS_PLUS.load(Ordering::Relaxed) { PLUS_RESERVE } else { 0.0 };
-    let label = fit(&track.title).size(size).font(font).reserve(if track.explicit { EXPLICIT_RESERVE } else { 0.0 } + plus);
+    let open = uncensor::has(&track.id);
+    let label = fit(&track.title).size(size).font(font).reserve(if track.explicit { EXPLICIT_RESERVE } else { 0.0 } + if open { EXPLICIT_RESERVE } else { 0.0 } + plus);
     let label = if marquee { label.marquee() } else { label };
     let title: Element<'a, Message> = if track.album.is_some() {
         hover_line(label, color, if color == ui::c().accent { ui::c().strong } else { ui::c().accent }, Message::OpenAlbum(track.clone())).into()
@@ -10141,12 +10152,15 @@ fn track_title<'a>(track: &'a Track, size: f32, font: iced::Font, color: iced::C
         label.color(color).into()
     };
     let plus = track.plus_only && !ui::HAS_PLUS.load(Ordering::Relaxed);
-    if !track.explicit && !plus {
+    if !track.explicit && !plus && !open {
         return title;
     }
     let mut line = row![title].spacing(6).align_y(Alignment::Center);
     if track.explicit {
         line = line.push(container(text("E").size(11).font(ui::font_medium()).color(ui::c().strong)).center(16).style(ui::explicit));
+    }
+    if open {
+        line = line.push(hint(container(ui::icon(ui::UNLOCKED, 12.0, ui::c().strong)).center(16).style(ui::explicit), "Без цензуры: играет оригинальная версия (список FckCensor)"));
     }
     if plus {
         line = line.push(hint(container(text("Плюс").size(11).font(ui::font_medium())).padding([1, 6]).style(ui::plus), "Целиком — с Плюсом"));
@@ -10874,6 +10888,22 @@ fn tracks_word(n: usize) -> &'static str {
 }
 
 /// Проверка без окна: поиск, ссылка на файл и несколько секунд звука.
+/// Трек по номеру через «Без цензуры»: название из списка FckCensor, файл без цензуры играет.
+fn smoke_uncensor(id: &str) -> Result<(), String> {
+    let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
+    let track = api::tracks_by_ids(&[id.to_string()], &token)?.into_iter().next().ok_or("Яндекс не прислал трек")?;
+    println!("Трек: {} — {} ({}), без цензуры: {}, недоступен: {}", track.artists, track.title, clock(track.duration), uncensor::has(&track.id), track.unavailable);
+    let info = api::file_info(&track.id, Quality::Normal.code(), &token)?;
+    println!("Файл: {} {}", info.label(), info.url);
+    let player = Player::new()?;
+    player.set_volume(0.05);
+    let generation = player.stop();
+    player.play(generation, &info)?;
+    std::thread::sleep(Duration::from_secs(3));
+    println!("Позиция через 3 с: {:?}", player.position());
+    Ok(())
+}
+
 fn smoke(query: &str) -> Result<(), String> {
     let token = api::load_token().ok_or("Сначала войдите в окне приложения")?;
     let tracks = api::search(query, &token)?;
@@ -11636,6 +11666,8 @@ fn main() -> iced::Result {
     if args.get(1).is_some_and(|flag| flag == "--login") {
         login::run();
     }
+    // Список «Без цензуры» с диска — до первого ответа Яндекса, в том числе для проверок.
+    uncensor::start();
     if let [_, flag, path] = args.as_slice() {
         if flag == "--api" {
             match api::load_token().ok_or_else(|| "Сначала войдите".to_string()).and_then(|token| api::raw(path, &token)) {
@@ -11660,9 +11692,10 @@ fn main() -> iced::Result {
         std::env::set_var("WGPU_BACKEND", "dx12");
     }
     let preview = match args.as_slice() {
-        [_, flag, query] if flag == "--smoke" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" || flag == "--smoke-clone" || flag == "--smoke-words" || flag == "--smoke-clip" || flag == "--smoke-ynison" => {
+        [_, flag, query] if flag == "--smoke" || flag == "--smoke-uncensor" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" || flag == "--smoke-clone" || flag == "--smoke-words" || flag == "--smoke-clip" || flag == "--smoke-ynison" => {
             let result = match flag.as_str() {
                 "--smoke" => smoke(query),
+                "--smoke-uncensor" => smoke_uncensor(query),
                 "--smoke-library" => smoke_library(query),
                 "--smoke-wave" => smoke_wave(query),
                 "--smoke-lyrics" => smoke_lyrics(query),

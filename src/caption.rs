@@ -21,13 +21,13 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, GetClientRect, IsZoomed, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_WNDPROC, HTCAPTION, HTCLIENT, HTMAXBUTTON, HTTOP, HTTOPLEFT, HTTOPRIGHT, NCCALCSIZE_PARAMS,
     SM_CXPADDEDBORDER, SM_CYFRAME, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, WM_ACTIVATE, WM_MOUSEMOVE,
-    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WNDPROC,
+    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WNDPROC, IDC_HAND, LoadCursorW, SetCursor, WM_SETCURSOR,
 };
 
 /// Высота полосы в точках при масштабе 100%.
-pub const HEIGHT: f32 = 32.0;
+pub const HEIGHT: f32 = 36.0;
 /// Ширина кнопки окна, как у системных.
-pub const BUTTON: f32 = 46.0;
+pub const BUTTON: f32 = 52.0;
 
 /// Обработчик, стоявший до нас (dpi и winit).
 static NEXT: AtomicIsize = AtomicIsize::new(0);
@@ -192,6 +192,12 @@ unsafe extern "system" fn proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                 toggle_maximize(hwnd as isize);
             }
             0
+        }
+        // Над «развернуть» тот же палец, что над «свернуть» и «закрыть» (их рисует iced).
+        WM_SETCURSOR if lparam & 0xFFFF == HTMAXBUTTON as LPARAM => {
+            // SAFETY: системный курсор, освобождать не нужно.
+            unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND)) };
+            1
         }
         WM_ACTIVATE => {
             set(&ACTIVE, wparam & 0xFFFF != 0);
