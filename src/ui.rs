@@ -186,6 +186,7 @@ pub const COLLECTION: Glyph = Glyph { path: HEART_OUTLINE.path, original: "navig
 pub const HOME: Glyph = Glyph { path: "M12 3 3 10.5V21h6v-6h6v6h6V10.5z", original: "home_m", selected: "home_selected_m" };
 pub const LEFT: Glyph = Glyph { path: "M15.4 6.4 14 5l-7 7 7 7 1.4-1.4L9.8 12z", original: "arrowLeft_xs", selected: "" };
 pub const RIGHT: Glyph = Glyph { path: "M8.6 6.4 10 5l7 7-7 7-1.4-1.4 5.6-5.6z", original: "arrowRight_xs", selected: "" };
+pub const UPLOAD: Glyph = Glyph { path: "M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z", original: "", selected: "" };
 pub const PLUS: Glyph = Glyph { path: "M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6z", original: "add_xs", selected: "" };
 pub const PIN: Glyph = Glyph { path: "M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z", original: "pin_xs", selected: "pin_filled_xs" };
 pub const UP: Glyph = Glyph { path: "M7.41 15.41 12 10.83l4.59 4.58L18 14l-6-6-6 6z", original: "arrowUp_xs", selected: "" };

@@ -2327,6 +2327,23 @@ pub fn upload_track(uid: &str, kind: &str, path: &std::path::Path, token: &str) 
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 pub const TOO_MANY_FILES: &str = "Превышен лимит по количеству загруженных треков";
 
+/// Номера треков плейлиста как есть, со своими загруженными (у них номер не число).
+pub fn playlist_track_ids(uid: &str, kind: &str, token: &str) -> Result<Vec<String>, String> {
+    let v = get(&format!("users/{uid}/playlists/{kind}"), &[], token)?;
+    Ok(result(&v)["tracks"].as_array().into_iter().flatten().filter_map(|item| id_text(&item["id"]).or_else(|| id_text(&item["track"]["id"]))).collect())
+}
+
+/// Загруженные треки, которые Яндекс сопоставил с треком каталога: (загруженный, из каталога).
+pub fn matched_tracks(ids: &[String], token: &str) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    for chunk in ids.chunks(200) {
+        let body = format!("track-ids={}", chunk.iter().map(|id| encode(id)).collect::<Vec<_>>().join("%2C"));
+        let v = post("tracks", "application/x-www-form-urlencoded", body, token)?;
+        out.extend(v["result"].as_array().into_iter().flatten().filter_map(|track| Some((id_text(&track["id"])?, id_text(&track["matchedTrack"]["id"])?))));
+    }
+    Ok(out)
+}
+
 /// Какие из загруженных треков Яндекс уже обработал и их можно слушать.
 pub fn uploaded_ready(ids: &[String], token: &str) -> Result<Vec<String>, String> {
     let body = format!("track-ids={}&withProgress=true", ids.join("%2C"));

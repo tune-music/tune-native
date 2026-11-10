@@ -131,6 +131,10 @@ fn mp3(bytes: &[u8], tags: &Tags) -> Vec<u8> {
         let footer = if audio[5] & 0x10 != 0 { 10 } else { 0 };
         audio = audio.get(10 + size + footer..).unwrap_or(audio);
     }
+    // Старый ID3v1 в конце («TAG» и 125 байт) тоже убирается: в нём бывает название с цензурой.
+    if audio.len() >= 128 && audio[audio.len() - 128..].starts_with(b"TAG") {
+        audio = &audio[..audio.len() - 128];
+    }
     let mut frames = Vec::new();
     let mut frame = |id: &[u8; 4], body: Vec<u8>| {
         frames.extend_from_slice(id);
@@ -348,6 +352,14 @@ mod tests {
         let size = out[6..10].iter().fold(0usize, |size, b| size << 7 | usize::from(*b));
         assert_eq!(&out[10 + size..], b"\xFF\xFBaudio");
         assert_eq!(Format::of(&out, "mp3"), Format::Mp3);
+    }
+
+    #[test]
+    fn mp3_drops_old_id3v1() {
+        let mut old = b"\xFF\xFBaudio".to_vec();
+        old.extend_from_slice(b"TAG");
+        old.extend_from_slice(&[b'x'; 125]);
+        assert!(mp3(&old, &tags()).ends_with(b"\xFF\xFBaudio"));
     }
 
     #[test]

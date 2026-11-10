@@ -12,6 +12,7 @@ mod shell;
 mod tray;
 mod uncensor;
 mod export;
+mod everywhere;
 mod placement;
 mod taste;
 mod protocol;
@@ -654,6 +655,14 @@ fn spoof_search(which: SpoofList, text: &str, token: &str) -> Result<Vec<SpoofIt
     })
 }
 
+/// Что с треком в «Без цензуры на всех устройствах».
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UcState {
+    Free,
+    Busy,
+    Done,
+}
+
 /// Сколько найденных показывать под полем добавления.
 const SPOOF_FOUND: usize = 8;
 /// Поиск в «Подменить…» ждёт, пока перестанут печатать.
@@ -807,9 +816,20 @@ fn spoof_copy(prefix: &str, id: &str, path: &std::path::Path) -> Result<String, 
     Ok(target.to_string_lossy().into_owned())
 }
 
+/// Окно «Без цензуры на всех устройствах»: треки страницы с версией без цензуры.
+#[derive(Clone, Debug, PartialEq)]
+struct UcPick {
+    /// `None`, пока треки и «Загруженное» не сверены.
+    tracks: Option<Vec<Track>>,
+    picked: HashSet<String>,
+    /// Удалены Яндексом: отмечены сразу.
+    gone: HashSet<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Dialog {
     Spoof,
+    UcPick,
     Create,
     Rename(Playlist),
     Describe(Playlist),
@@ -1115,6 +1135,8 @@ enum Preview {
     Spoof,
     /// «Подменить…» альбома или исполнителя по номеру: списки треков и вставок.
     SpoofOf(uncensor::Kind, String),
+    /// Окно «Без цензуры на всех устройствах» для всех лайков.
+    UcPick(Vec<String>),
     Account,
     LogoutAsk,
     /// Вкладка настроек.
@@ -1211,6 +1233,16 @@ struct App {
     dialog_artist: String,
     /// Сколько файлов сейчас загружается в плейлисты.
     uploading: usize,
+    /// «Без цензуры на всех устройствах»: оригинал → загруженная копия.
+    uc_uploaded: HashMap<String, String>,
+    uc_queue: VecDeque<Track>,
+    uc_now: Option<Track>,
+    /// Сколько в пачке всего, сколько загрузилось и не вышло: для «2 из 5» и итога.
+    uc_batch: usize,
+    uc_done: usize,
+    uc_moved: bool,
+    uc_failed: Vec<String>,
+    uc_pick: Option<UcPick>,
     history_tracks: Vec<Track>,
     /// Дни и места, откуда слушали: строки `history_tracks` по порядку.
     history_blocks: Vec<api::HistoryBlock>,
@@ -1981,6 +2013,16 @@ enum Message {
     SpoofReset,
     SpoofTrack(Result<Vec<Track>, String>),
     SpoofLists(String, Result<SpoofLists, String>),
+    /// Загрузить версию без цензуры в «Загруженное»: сначала сверка с ним.
+    UcUpload(Vec<Track>),
+    UcSynced(Vec<Track>, Result<HashMap<String, String>, String>),
+    UcUploaded(String, Result<(String, bool), String>),
+    /// Окно выбора по номерам треков страницы.
+    UcPickOpen(Vec<String>),
+    UcPickLoaded(Result<(HashMap<String, String>, Vec<Track>, HashSet<String>), String>),
+    UcPickToggle(String),
+    UcPickAll,
+    UcPickGo,
     SpoofMove(SpoofList, usize, bool),
     SpoofRemove(SpoofList, usize),
     SpoofSearch(SpoofList, String),
@@ -2085,6 +2127,14 @@ impl App {
             dialog_text: String::new(),
             dialog_artist: String::new(),
             uploading: 0,
+            uc_uploaded: everywhere::uploaded(),
+            uc_queue: VecDeque::new(),
+            uc_now: None,
+            uc_batch: 0,
+            uc_done: 0,
+            uc_moved: false,
+            uc_failed: Vec::new(),
+            uc_pick: None,
             history_tracks: Vec::new(),
             history_blocks: Vec::new(),
             history_rest: Vec::new(),
@@ -3359,6 +3409,7 @@ impl App {
                         items.push((ui::CHECK, label.to_string(), Message::AlbumFinished(!album.finished), false));
                     }
                     items.extend(self.download_item());
+                    items.extend(self.uc_item());
                     if let Some(album) = &self.album {
                         items.push((ui::EDIT, "Подменить…".to_string(), Message::SpoofOpen(Box::new(SpoofForm::album(album))), false));
                     }
@@ -3367,6 +3418,7 @@ impl App {
                 let mut items = link_and_pin(PinRef::Playlist(list.owner.clone(), list.kind.clone()), format!("https://music.yandex.ru/users/{}/playlists/{}", list.owner, list.kind));
                 items.push((ui::LINK, "HTML-код".to_string(), Message::DialogOpen(Dialog::Embed(Embed::playlist(&list.owner, &list.kind, &list.title))), false));
                 items.extend(self.download_item());
+                items.extend(self.uc_item());
                 if self.is_own(list) {
                     items.push((ui::EDIT, "Переименовать".to_string(), Message::DialogOpen(Dialog::Rename(list.clone())), false));
                     items.push((ui::NOTES, "Изменить описание".to_string(), Message::DialogOpen(Dialog::Describe(list.clone())), false));
@@ -3425,6 +3477,72 @@ impl App {
         self.download_ids = self.downloads.iter().map(|saved| saved.track.id.clone()).collect();
         self.download_tracks = self.downloads.iter().map(|saved| saved.track.clone()).collect();
         offline::save(&self.downloads);
+    }
+
+    /// Пункт меню страницы: загрузить её треки без цензуры в «Загруженное».
+    fn uc_item(&self) -> Option<(ui::Glyph, String, Message, bool)> {
+        let ids: Vec<String> = self.playlist_tracks.iter().filter(|track| everywhere::can(track)).map(|track| track.id.clone()).collect();
+        (!ids.is_empty()).then(|| (ui::UPLOAD, "Загрузить без цензуры…".to_string(), Message::UcPickOpen(ids), false))
+    }
+
+    fn uc_state(&self, id: &str) -> UcState {
+        if self.uc_uploaded.contains_key(id) {
+            UcState::Done
+        } else if self.uc_now.as_ref().is_some_and(|track| track.id == id) || self.uc_queue.iter().any(|track| track.id == id) {
+            UcState::Busy
+        } else {
+            UcState::Free
+        }
+    }
+
+    /// Ставит треки в очередь загрузки без цензуры; уже загруженные и загружаемые пропускаются.
+    fn uc_enqueue(&mut self, tracks: Vec<Track>) -> Task<Message> {
+        let mut fresh: Vec<Track> = Vec::new();
+        for track in tracks {
+            if self.uc_state(&track.id) == UcState::Free && everywhere::can(&track) && !fresh.iter().any(|known| known.id == track.id) {
+                fresh.push(track);
+            }
+        }
+        if fresh.is_empty() {
+            return self.notify_quick("Версия без цензуры уже в «Загруженном»".to_string());
+        }
+        if self.uc_now.is_none() && self.uc_queue.is_empty() {
+            self.uc_batch = 0;
+            self.uc_done = 0;
+            self.uc_moved = false;
+            self.uc_failed.clear();
+        }
+        self.uc_batch += fresh.len();
+        self.uc_queue.extend(fresh);
+        self.uc_next()
+    }
+
+    /// Загружает следующий трек: по одному, Яндексу нужно время на обработку.
+    fn uc_next(&mut self) -> Task<Message> {
+        if self.uc_now.is_some() {
+            return Task::none();
+        }
+        let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
+        let Some(track) = self.uc_queue.pop_front() else { return Task::none() };
+        self.uc_now = Some(track.clone());
+        let liked = self.liked_set.contains(&track.id);
+        let (quality, id) = (self.quality.code(), track.id.clone());
+        Task::perform(background(move || everywhere::upload(&track, liked, &uid, quality, &token)), move |result| Message::UcUploaded(id.clone(), result))
+    }
+
+    /// Пачка загружена: итог и сверка лайков, если они переехали на копии.
+    fn uc_finish(&mut self) -> Task<Message> {
+        let (done, failed) = (self.uc_done, self.uc_failed.len());
+        let text = match (done, failed) {
+            (0, _) => format!("Не удалось загрузить без цензуры: {}", self.uc_failed.first().cloned().unwrap_or_default()),
+            (_, 0) if self.uc_batch == 1 => "Трек без цензуры в «Загруженном»: теперь он играет на всех устройствах, и на телефоне тоже".to_string(),
+            (_, 0) => format!("Загружено без цензуры: {done}. Такие треки играют на всех устройствах, и на телефоне тоже"),
+            _ => format!("Загружено без цензуры: {done}, не вышло: {failed}"),
+        };
+        let text = if self.uc_moved { format!("{text}. Лайки перенесены на загруженные копии") } else { text };
+        let notice = self.notify(text);
+        let sync = if self.uc_moved { self.update(Message::SyncTick) } else { Task::none() };
+        Task::batch([notice, sync])
     }
 
     /// Пункт меню страницы: скачать её треки или убрать их, если скачаны все.
@@ -4874,6 +4992,11 @@ impl App {
                     Some(Preview::WaveSeeded) => self.wave_load(vec!["artist:3121".to_string()], Some(wave_label("artist:3121", "Metallica")), false),
                     Some(Preview::Likes | Preview::LikesEnd | Preview::LikesAt(_) | Preview::Menu | Preview::Panels | Preview::TrackInfo | Preview::Spoof | Preview::QueueJump) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
+                    Some(Preview::UcPick(ids)) => {
+                        let open = self.update(Message::Open(Section::Likes));
+                        let ids = if ids.is_empty() { self.liked_ids.clone() } else { ids };
+                        Task::batch([open, self.update(Message::UcPickOpen(ids))])
+                    }
                     Some(Preview::SpoofOf(kind, id)) => self.update(Message::SpoofOpen(Box::new(SpoofForm::new(kind, &id, "", &[], "")))),
                     // Превращается в обычный запуск ещё в `new`.
                     Some(Preview::CollectionEarly) => Task::none(),
@@ -6726,6 +6849,10 @@ impl App {
                 self.dialog = None;
                 return match dialog {
                     Dialog::Spoof => self.handle(Message::SpoofSave),
+                    Dialog::UcPick => {
+                        self.dialog = Some(Dialog::UcPick);
+                        self.handle(Message::UcPickGo)
+                    }
                     Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account | Dialog::Wizard | Dialog::Unsafe(..) | Dialog::Vibe(_) => Task::none(),
                     Dialog::Logout => self.handle(Message::Logout),
                     Dialog::ConcertCity => {
@@ -7554,6 +7681,104 @@ impl App {
                 };
                 return Task::batch([open, lists]);
             }
+            Message::UcUpload(tracks) => {
+                self.menu = None;
+                let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
+                return Task::perform(background(move || everywhere::sync(&uid, &token)), move |result| Message::UcSynced(tracks.clone(), result));
+            }
+            Message::UcSynced(tracks, result) => {
+                match result {
+                    Ok(map) => self.uc_uploaded = map,
+                    Err(e) => return self.notify(e),
+                }
+                return self.uc_enqueue(tracks);
+            }
+            Message::UcUploaded(id, result) => {
+                self.uc_now = None;
+                match result {
+                    Ok((copy, moved)) => {
+                        self.uc_uploaded.insert(id, copy);
+                        self.uc_done += 1;
+                        self.uc_moved |= moved;
+                    }
+                    Err(e) => {
+                        api::log(&format!("Без цензуры на всех устройствах: {id}: {e}"));
+                        if e == api::TOO_MANY_FILES {
+                            self.uc_queue.clear();
+                        }
+                        self.uc_failed.push(e);
+                    }
+                }
+                if !self.uc_queue.is_empty() {
+                    return self.uc_next();
+                }
+                return self.uc_finish();
+            }
+            Message::UcPickOpen(ids) => {
+                self.page_menu = None;
+                let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
+                self.uc_pick = Some(UcPick { tracks: None, picked: HashSet::new(), gone: HashSet::new() });
+                let open = self.update(Message::DialogOpen(Dialog::UcPick));
+                let ids: Vec<String> = ids.into_iter().filter(|id| id.bytes().all(|b| b.is_ascii_digit()) && uncensor::file(id).is_some()).collect();
+                let load = Task::perform(
+                    background(move || {
+                        let map = everywhere::sync(&uid, &token)?;
+                        let (mut tracks, mut gone) = (Vec::new(), HashSet::new());
+                        for chunk in ids.chunks(RESTORED_CHUNK) {
+                            gone.extend(api::unavailable_ids(chunk, &token)?);
+                            tracks.extend(api::tracks_by_ids(chunk, &token)?);
+                        }
+                        Ok((map, tracks, gone))
+                    }),
+                    Message::UcPickLoaded,
+                );
+                return Task::batch([open, load]);
+            }
+            Message::UcPickLoaded(result) => {
+                if self.uc_pick.is_none() {
+                    return Task::none();
+                }
+                match result {
+                    Ok((map, tracks, gone)) => {
+                        self.uc_uploaded = map;
+                        let mut tracks: Vec<Track> = tracks.into_iter().filter(everywhere::can).collect();
+                        // Сначала свободные удалённые, потом свободные с цензурой, загружаемые и загруженные.
+                        let rank = |track: &Track| match self.uc_state(&track.id) {
+                            UcState::Free if gone.contains(&track.id) => 0,
+                            UcState::Free => 1,
+                            UcState::Busy => 2,
+                            UcState::Done => 3,
+                        };
+                        tracks.sort_by_key(rank);
+                        let picked = tracks.iter().filter(|track| rank(track) == 0).map(|track| track.id.clone()).collect();
+                        self.uc_pick = Some(UcPick { tracks: Some(tracks), picked, gone });
+                    }
+                    Err(e) => {
+                        self.uc_pick = None;
+                        self.dialog = None;
+                        return self.notify(e);
+                    }
+                }
+            }
+            Message::UcPickToggle(id) => {
+                if let Some(pick) = &mut self.uc_pick {
+                    if !pick.picked.remove(&id) {
+                        pick.picked.insert(id);
+                    }
+                }
+            }
+            Message::UcPickAll => {
+                let free: Vec<String> = self.uc_pick.as_ref().and_then(|pick| pick.tracks.as_ref()).into_iter().flatten().filter(|track| self.uc_state(&track.id) == UcState::Free).map(|track| track.id.clone()).collect();
+                if let Some(pick) = &mut self.uc_pick {
+                    pick.picked = if pick.picked.len() == free.len() { HashSet::new() } else { free.into_iter().collect() };
+                }
+            }
+            Message::UcPickGo => {
+                let Some(pick) = self.uc_pick.take() else { return Task::none() };
+                self.dialog = None;
+                let tracks: Vec<Track> = pick.tracks.unwrap_or_default().into_iter().filter(|track| pick.picked.contains(&track.id)).collect();
+                return self.uc_enqueue(tracks);
+            }
             Message::SpoofLists(id, result) => {
                 let Some(form) = self.spoof.as_mut().filter(|form| form.id == id) else { return Task::none() };
                 match result {
@@ -8144,6 +8369,12 @@ impl App {
             let line = row![ui::icon(ui::PLUS, 20.0, ui::c().accent), text(format!("Загружаем {}: {}", if self.uploading == 1 { "трек" } else { "треки" }, self.uploading)).color(ui::c().text).width(Length::Fill)].spacing(12).align_y(Alignment::Center);
             page = page.push(container(line).width(Length::Fill).padding([10, 16]).style(ui::tile));
         }
+        if let Some(track) = &self.uc_now {
+            let at = (self.uc_done + self.uc_failed.len() + 1).min(self.uc_batch.max(1));
+            let label = if self.uc_batch > 1 { format!("Загружаем без цензуры {at} из {}: {}", self.uc_batch, track.title) } else { format!("Загружаем без цензуры: {}", track.title) };
+            let line = row![ui::icon(ui::UPLOAD, 20.0, ui::c().accent), text(label).color(ui::c().text).width(Length::Fill).wrapping(Wrapping::None)].spacing(12).align_y(Alignment::Center).clip(true);
+            page = page.push(container(line).width(Length::Fill).padding([10, 16]).style(ui::tile));
+        }
         if self.download_now.is_some() && matches!(self.section, Section::Downloads | Section::Likes | Section::Playlists) {
             let at = (self.download_done + self.download_failed + 1).min(self.download_batch.max(1));
             let mut line = row![ui::icon(ui::DOWNLOAD, 20.0, ui::c().accent), text(format!("Скачиваем: {at} из {}", self.download_batch.max(at))).color(ui::c().text).width(Length::Fill)].spacing(12).align_y(Alignment::Center);
@@ -8233,6 +8464,7 @@ impl App {
             Dialog::Wizard => return self.view_wizard(),
             Dialog::TrackInfo(track) => return self.view_track_info(track),
             Dialog::Spoof => return self.view_spoof(),
+            Dialog::UcPick => return self.view_uc_pick(),
             Dialog::Account => return self.view_account(),
             Dialog::Unsafe(_, go, modal) => return self.view_unsafe(go, modal),
             Dialog::Vibe(kind) => return self.view_vibe(kind),
@@ -8717,6 +8949,20 @@ impl App {
             });
             count += 1.0;
         }
+        // Версия без цензуры в «Загруженное» — играет и на телефоне.
+        if everywhere::can(track) {
+            let label = match self.uc_state(&track.id) {
+                UcState::Done => "Уже загружен без цензуры",
+                UcState::Busy => "Загружается без цензуры…",
+                UcState::Free => "Загрузить без цензуры",
+            };
+            let press = (self.uc_state(&track.id) != UcState::Busy).then(|| Message::UcUpload(vec![track.clone()]));
+            items = items.push(match press {
+                Some(press) => item(ui::UPLOAD, label, press),
+                None => item(ui::UPLOAD, label, Message::MenuClose),
+            });
+            count += 1.0;
+        }
         // Обычный файл с тегами и обложкой — для других плееров и устройств.
         if !track.unavailable {
             items = items.push(item(ui::DOWNLOAD, "Скачать в файл", Message::SaveToFile(track.clone())));
@@ -9045,6 +9291,65 @@ impl App {
         body = body.push(buttons).padding(iced::Padding::ZERO.right(14));
         let tall = WINDOW.lock().unwrap().1 - INFO_MARGIN;
         let window = reveal(container(ui::scroll(body).style(ui::scroll_still)).width(DIALOG_WIDTH).max_height(tall).padding(24).style(ui::popover_faded(alpha))).scale(0.94 + 0.06 * alpha, 0.5, 0.5).shift(0.0, 10.0 * (1.0 - alpha));
+        let dim = iced::Color::BLACK.scale_alpha(0.6 * alpha);
+        reveal(mouse_area(container(mouse_area(window).on_press(Message::DialogInput(self.dialog_text.clone()))).center(Length::Fill).style(move |_| container::Style::default().background(dim))).on_press(Message::MenuClose)).inert(!self.dialog_fade.live).into()
+    }
+
+    /// «Без цензуры на всех устройствах»: какие треки страницы загрузить в «Загруженное».
+    fn view_uc_pick(&self) -> Element<'_, Message> {
+        let alpha = self.dialog_fade.shown();
+        let Some(pick) = &self.uc_pick else { return Space::new().into() };
+        let muted = |line: String| text(line).size(13).color(ui::c().muted.scale_alpha(alpha));
+        let mut body = column![
+            text("Без цензуры на всех устройствах").size(20).font(ui::font_medium()).color(ui::c().text.scale_alpha(alpha)),
+            muted("Выбранные треки загрузятся в «Загруженное» как ваши: такие играют на всех устройствах, и в приложении на телефоне тоже. Лайк оригинала переедет на загруженную копию.".to_string()),
+        ]
+        .spacing(16);
+        let mut free = 0;
+        match &pick.tracks {
+            None => body = body.push(text("Ищем треки без цензуры…").color(ui::c().muted.scale_alpha(alpha))),
+            Some(tracks) if tracks.is_empty() => body = body.push(text("Здесь нет треков без цензуры").color(ui::c().muted.scale_alpha(alpha))),
+            Some(tracks) => {
+                let gone = &pick.gone;
+                let mut rows = column![].spacing(2);
+                for track in tracks {
+                    let state = self.uc_state(&track.id);
+                    let on = state == UcState::Free;
+                    free += usize::from(on);
+                    let checked = pick.picked.contains(&track.id);
+                    let tag = match state {
+                        UcState::Done => "уже загружен",
+                        UcState::Busy => "загружается…",
+                        UcState::Free if gone.contains(&track.id) => "удалён из Яндекса",
+                        UcState::Free => "с цензурой",
+                    };
+                    let tint = if on { ui::c().text } else { ui::c().faint };
+                    let mark: Element<'_, Message> = if checked { ui::icon(ui::CHECK, 18.0, ui::c().accent.scale_alpha(alpha)) } else { Space::new().width(18).height(18).into() };
+                    let box_ = container(mark).center(24).style(move |_| container::Style::default().border(iced::border::rounded(6).width(1.5).color(if checked { ui::c().accent } else { ui::c().muted }.scale_alpha(alpha * if on { 1.0 } else { 0.4 }))));
+                    let title = column![text(track.title.clone()).color(tint.scale_alpha(alpha)).wrapping(Wrapping::None), text(track.artists.clone()).size(13).color(ui::c().muted.scale_alpha(alpha)).wrapping(Wrapping::None)].width(Length::Fill).clip(true);
+                    let line = row![box_, title, text(tag).size(13).color(ui::c().muted.scale_alpha(alpha)).wrapping(Wrapping::None)].spacing(12).align_y(Alignment::Center);
+                    rows = rows.push(button(line).width(Length::Fill).padding([6, 12]).style(ui::button_faded(ui::row, alpha)).on_press_maybe(on.then(|| Message::UcPickToggle(track.id.clone()))));
+                }
+                body = body.push(container(rows).padding([6, 0]).style(move |_| container::Style::default().background(ui::c().tile.scale_alpha(alpha)).border(iced::border::rounded(10))));
+                if free == 0 {
+                    body = body.push(muted("Все треки здесь уже загружены или загружаются.".to_string()));
+                }
+            }
+        }
+        let count = pick.picked.len();
+        let secondary = |label: &str, message: Option<Message>| shine(button(text(label.to_string()).color(ui::c().text.scale_alpha(alpha))).padding([8, 18]).style(ui::button_faded(ui::secondary, alpha)).on_press_maybe(message), 24.0);
+        let go = if count > 0 { format!("Загрузить ({count})") } else { "Загрузить".to_string() };
+        let buttons = row![
+            Space::new().width(Length::Fill),
+            secondary("Отмена", Some(Message::MenuClose)),
+            shine(button(text(go).font(ui::font_medium()).color(ui::c().on_accent.scale_alpha(alpha))).padding([8, 18]).style(ui::button_faded(ui::accent, alpha)).on_press_maybe((count > 0).then_some(Message::UcPickGo)), 24.0),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center);
+        let buttons = if free > 0 { row![secondary("Выбрать все", Some(Message::UcPickAll)), buttons].spacing(12).align_y(Alignment::Center) } else { buttons };
+        let body = body.push(buttons).padding(iced::Padding::ZERO.right(14));
+        let tall = WINDOW.lock().unwrap().1 - INFO_MARGIN;
+        let window = reveal(container(ui::scroll(body).style(ui::scroll_still)).width(TUNE_WIDTH).max_height(tall).padding(24).style(ui::popover_faded(alpha))).scale(0.94 + 0.06 * alpha, 0.5, 0.5).shift(0.0, 10.0 * (1.0 - alpha));
         let dim = iced::Color::BLACK.scale_alpha(0.6 * alpha);
         reveal(mouse_area(container(mouse_area(window).on_press(Message::DialogInput(self.dialog_text.clone()))).center(Length::Fill).style(move |_| container::Style::default().background(dim))).on_press(Message::MenuClose)).inert(!self.dialog_fade.live).into()
     }
@@ -10044,6 +10349,16 @@ impl App {
         hint(shine(button(container(ui::icon(icon, 20.0, tint)).center(20)).padding(7).style(ui::secondary).on_press_maybe(press), 20.0), if all { "Скачано" } else { "Скачать" })
     }
 
+    /// «Мне нравится» без цензуры на всех устройствах. Удалённые треки Яндекс из списка лайков
+    /// прячет, поэтому номера — из всех лайков.
+    fn view_likes_uncensored<'a>(&self) -> Element<'a, Message> {
+        let ids: Vec<String> = self.liked_ids.iter().filter(|id| id.bytes().all(|b| b.is_ascii_digit()) && uncensor::file(id).is_some()).cloned().collect();
+        if ids.is_empty() || self.offline {
+            return Space::new().into();
+        }
+        hint(shine(button(container(ui::icon(ui::UPLOAD, 20.0, ui::c().text)).center(20)).padding(7).style(ui::secondary).on_press(Message::UcPickOpen(ids)), 20.0), "Загрузить без цензуры")
+    }
+
     fn view_filter<'a>(&self) -> Element<'a, Message> {
         let width = if self.main_width() < FILTER_WIDE { FILTER_WIDTH_SMALL } else { FILTER_WIDTH };
         let input = text_input("Поиск по трекам", &self.filter).id(FILTER_INPUT).on_input(Message::Filter).padding(Padding { top: 8.0, right: 34.0, bottom: 8.0, left: 16.0 }).size(14).width(width).style(ui::input);
@@ -10091,6 +10406,7 @@ impl App {
             container(name).width(Length::Fill).clip(true),
             self.view_likes_pin(),
             self.view_likes_download(),
+            self.view_likes_uncensored(),
             self.view_filter(),
         ]
         .spacing(12)
@@ -12895,6 +13211,8 @@ fn main() -> iced::Result {
             "menu" => Preview::Menu,
             "track-info" => Preview::TrackInfo,
             "spoof" => Preview::Spoof,
+            "uc-pick" => Preview::UcPick(Vec::new()),
+            what if what.starts_with("uc-pick:") => Preview::UcPick(what["uc-pick:".len()..].split(',').map(str::to_string).collect()),
             what if what.starts_with("spoof-album:") => Preview::SpoofOf(uncensor::Kind::Album, what["spoof-album:".len()..].to_string()),
             what if what.starts_with("spoof-artist:") => Preview::SpoofOf(uncensor::Kind::Artist, what["spoof-artist:".len()..].to_string()),
             "account" => Preview::Account,
