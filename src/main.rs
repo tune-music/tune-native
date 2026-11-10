@@ -213,6 +213,8 @@ const SEEK_STEP: f32 = 5.0;
 const ALBUM_OTHERS: usize = 8;
 const DIALOG_INPUT: &str = "dialog";
 const DIALOG_WIDTH: f32 = 400.0;
+/// Окно Моей волны на двоих с тремя кнопками.
+const VIBE_DIALOG_WIDE: f32 = 540.0;
 /// Сколько окна остаётся вокруг сведений о треке.
 const INFO_MARGIN: f32 = 80.0;
 /// Сколько последних треков показать в истории.
@@ -3143,6 +3145,8 @@ impl App {
                 vec![side("Выйти", Message::VibeExit(room.id.clone())), main("Скопировать ссылку", Message::VibeCopy(room.link()))],
             ),
         };
+        // Три кнопки («Выйти», «Скопировать ссылку», «Слушать») в обычное окно не помещаются.
+        let width = if buttons.len() > 2 { VIBE_DIALOG_WIDE } else { DIALOG_WIDTH };
         let row_of = buttons.into_iter().fold(row![Space::new().width(Length::Fill)].spacing(8), |line, button| line.push(button));
         let body = column![
             text(title).size(20).font(ui::font_medium()).color(ui::c().text.scale_alpha(alpha)),
@@ -3151,7 +3155,7 @@ impl App {
             row_of,
         ]
         .spacing(12);
-        let window = reveal(container(body).width(DIALOG_WIDTH).padding(24).style(ui::popover_faded(alpha))).scale(0.94 + 0.06 * alpha, 0.5, 0.5).shift(0.0, 10.0 * (1.0 - alpha));
+        let window = reveal(container(body).width(width).padding(24).style(ui::popover_faded(alpha))).scale(0.94 + 0.06 * alpha, 0.5, 0.5).shift(0.0, 10.0 * (1.0 - alpha));
         let dim = iced::Color::BLACK.scale_alpha(0.6 * alpha);
         reveal(mouse_area(container(window).center(Length::Fill).style(move |_| container::Style::default().background(dim)))).inert(!self.dialog_fade.live).into()
     }
@@ -3890,8 +3894,7 @@ impl App {
         self.wave_wanted = seeds.clone();
         // Прежнюю сессию продолжаем, как оригинал; если Яндекс её уже забыл — начинаем новую.
         let Some(token) = self.token() else { return Task::none() };
-        let mut asked = seeds.clone();
-        asked.extend(settings::wave_seeds(self.wave_tuning));
+        let asked = self.wave_asked(&seeds);
         let played: Vec<String> = self.queue.iter().map(Track::full_id).collect();
         let played = played[played.len().saturating_sub(WAVE_CLONE_QUEUE)..].to_vec();
         let old = saved.wave_session;
@@ -4504,13 +4507,22 @@ impl App {
         Task::batch([similar, meta, cover, Task::perform(background(move || api::playlist_tracks(&playlist, &token)), move |r| Message::PlaylistLoaded(kind.clone(), r))])
     }
 
+    /// Что просить у Яндекса: зёрна волны и настройки Моей волны. С настройками Яндекс
+    /// отбрасывает зёрна волны на двоих и включает обычную Мою волну, поэтому ей их не добавляем.
+    fn wave_asked(&self, seeds: &[String]) -> Vec<String> {
+        let mut asked = seeds.to_vec();
+        if !seeds.iter().any(|seed| seed.starts_with("multivibe:")) {
+            asked.extend(settings::wave_seeds(self.wave_tuning));
+        }
+        asked
+    }
+
     fn wave_load(&mut self, seeds: Vec<String>, title: Option<String>, autoplay: bool) -> Task<Message> {
         let Some(token) = self.token() else { return Task::none() };
         self.wave_loading = true;
         self.error = None;
         self.wave_wanted = seeds.clone();
-        let mut asked = seeds.clone();
-        asked.extend(settings::wave_seeds(self.wave_tuning));
+        let asked = self.wave_asked(&seeds);
         Task::perform(background(move || api::wave_new(&asked, &token)), move |r| Message::WaveStarted(autoplay, seeds.clone(), title.clone(), r))
     }
 
