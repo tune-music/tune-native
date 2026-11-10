@@ -152,6 +152,10 @@ struct Inner {
     ended: AtomicBool,
     loaded: AtomicBool,
     failed: Mutex<Option<String>>,
+    /// Живой фон темы: кадр поменьше, а без показа на экране плеер встаёт на паузу.
+    backdrop: bool,
+    /// Когда фон последний раз рисовался, в миллисекундах от `epoch()`.
+    seen: AtomicU64,
 }
 
 // mpv сам защищает свой объект, кадр — под замком.
@@ -255,6 +259,16 @@ impl Drop for Worker {
 impl Video {
     /// Открывает поток и начинает играть. `volume` — от 0 до 1, как у музыки.
     pub fn open(url: &str, volume: f32, start: f32) -> Result<Video, String> {
+        Self::start(url, volume, start, false)
+    }
+
+    /// Живой фон темы: файл по кругу, без звука. Пока фон не виден (окно свёрнуто или в
+    /// трее), видео стоит на паузе и не грузит процессор.
+    pub fn backdrop(path: &str) -> Result<Video, String> {
+        Self::start(path, 0.0, 0.0, true)
+    }
+
+    fn start(url: &str, volume: f32, start: f32, backdrop: bool) -> Result<Video, String> {
         let lib = load()?;
         let mpv = unsafe { (lib.create)() };
         if mpv.is_null() {
@@ -290,6 +304,18 @@ impl Video {
         if start > 0.0 {
             option("start", &format!("{start:.1}"));
         }
+        if backdrop {
+            option("aid", "no");
+            option("mute", "yes");
+            option("loop-file", "inf");
+            // Фон идёт всё время. Декодирует процессор: копировать кадр с видеокарты в память
+            // выходило втрое дороже, чем декодировать самому (замер: 15% ядра против 50%).
+            option("vd-lavc-skiploopfilter", "all");
+            // Кадры переводятся в картинку процессором: 24 в секунду и быстрый масштаб вдвое дешевле.
+            option("vf", "fps=24");
+            option("sws-scaler", "fast-bilinear");
+            option("audio-client-name", "Tune: фон");
+        }
         let code = unsafe { (lib.initialize)(mpv) };
         if code < 0 {
             unsafe { (lib.terminate_destroy)(mpv) };
@@ -306,6 +332,8 @@ impl Video {
             ended: AtomicBool::new(false),
             loaded: AtomicBool::new(false),
             failed: Mutex::new(None),
+            backdrop,
+            seen: AtomicU64::new(epoch()),
         });
         let api = c"sw";
         let mut params = [RenderParam { kind: PARAM_API_TYPE, data: api.as_ptr() as *mut c_void }, RenderParam { kind: PARAM_INVALID, data: std::ptr::null_mut() }];
@@ -403,7 +431,16 @@ impl Aligned {
 /// Поток отрисовки: ждёт сигнала от mpv, разбирает события и рисует кадр в память.
 fn run(inner: &Inner) {
     let mut buffer: Option<(usize, Aligned)> = None;
+    let mut asleep = false;
     loop {
+        // Фон давно не рисовался — его не видно: пауза, пока не покажут снова.
+        if inner.backdrop {
+            let hidden = epoch().saturating_sub(inner.seen.load(Ordering::Relaxed)) > BACKDROP_HIDDEN_MS;
+            if hidden != asleep {
+                asleep = hidden;
+                inner.set("pause", if hidden { "yes" } else { "no" });
+            }
+        }
         {
             let (lock, signal) = &inner.wake;
             let mut woken = lock.lock().unwrap();
@@ -445,7 +482,7 @@ fn run(inner: &Inner) {
         }
         let width = inner.get::<i64>("dwidth", FORMAT_INT64).unwrap_or(0);
         let height = inner.get::<i64>("dheight", FORMAT_INT64).unwrap_or(0);
-        let (width, height) = fit(width, height);
+        let (width, height) = if inner.backdrop { fit_into(width, height, BACKDROP_WIDTH, BACKDROP_HEIGHT) } else { fit(width, height) };
         let stride = (width as usize * 4).div_ceil(64) * 64;
         let size = stride * height as usize;
         if buffer.as_ref().is_none_or(|(have, _)| *have < size) {
@@ -481,10 +518,14 @@ fn run(inner: &Inner) {
 
 /// Размер кадра в памяти: как у видео, но не больше Full HD. Пока размера нет — заглушка.
 fn fit(width: i64, height: i64) -> (i64, i64) {
+    fit_into(width, height, MAX_WIDTH, MAX_HEIGHT)
+}
+
+fn fit_into(width: i64, height: i64, max_width: i64, max_height: i64) -> (i64, i64) {
     if width <= 0 || height <= 0 {
         return (8, 8);
     }
-    let scale = (MAX_WIDTH as f64 / width as f64).min(MAX_HEIGHT as f64 / height as f64).min(1.0);
+    let scale = (max_width as f64 / width as f64).min(max_height as f64 / height as f64).min(1.0);
     (((width as f64 * scale).round() as i64).max(2) & !1, ((height as f64 * scale).round() as i64).max(2) & !1)
 }
 
@@ -528,12 +569,20 @@ pub struct Pipeline {
     /// На видеокарте кадр именно этого плеера: иначе не рисуем, под видео видна обложка.
     ready: bool,
     srgb: bool,
+    /// Пустая текстура 1×1: фону без кадра она нужна для привязки.
+    empty: Option<(wgpu::Texture, wgpu::BindGroup)>,
 }
 
 impl shader::Pipeline for Pipeline {
-    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("video"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
-        let uniforms = device.create_buffer(&wgpu::BufferDescriptor { label: Some("video"), size: UNIFORMS, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+        Pipeline::build(device, queue, format, SHADER, UNIFORMS)
+    }
+}
+
+impl Pipeline {
+    fn build(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, source: &str, uniforms_size: u64) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("video"), source: wgpu::ShaderSource::Wgsl(source.into()) });
+        let uniforms = device.create_buffer(&wgpu::BufferDescriptor { label: Some("video"), size: uniforms_size, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("video"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("video"),
@@ -560,7 +609,65 @@ impl shader::Pipeline for Pipeline {
             multiview: None,
             cache: None,
         });
-        Self { pipeline, uniforms, sampler, layout, texture: None, shown: (0, u64::MAX), ready: false, srgb: format.is_srgb() }
+        let mut built = Self { pipeline, uniforms, sampler, layout, texture: None, shown: (0, u64::MAX), ready: false, srgb: format.is_srgb(), empty: None };
+        let (texture, bind) = built.texture_for(device, 1, 1);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &[0, 0, 0, 0],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        built.empty = Some((texture, bind));
+        built
+    }
+
+    fn texture_for(&self, device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::BindGroup) {
+        let format = if self.srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm };
+        let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("video"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("video"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+        (texture, bind)
+    }
+
+    /// Новый кадр плеера — на видеокарту; тот же кадр второй раз не возится.
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, inner: &Inner, owner: usize, serial: u64) {
+        if self.shown == (owner, serial) {
+            return;
+        }
+        let frame = inner.frame.lock().unwrap();
+        if frame.width > 0 {
+            let same = self.texture.as_ref().is_some_and(|(_, _, w, h)| *w == frame.width && *h == frame.height);
+            if !same {
+                let (texture, bind) = self.texture_for(device, frame.width, frame.height);
+                self.texture = Some((texture, bind, frame.width, frame.height));
+            }
+            let (texture, ..) = self.texture.as_ref().unwrap();
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                &frame.pixels,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(frame.stride as u32), rows_per_image: Some(frame.height) },
+                wgpu::Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 },
+            );
+        }
+        self.shown = (owner, serial);
     }
 }
 
@@ -570,45 +677,7 @@ impl shader::Primitive for Primitive {
     fn prepare(&self, pipeline: &mut Pipeline, device: &wgpu::Device, queue: &wgpu::Queue, bounds: &Rectangle, viewport: &Viewport) {
         let owner = Arc::as_ptr(&self.inner) as usize;
         let serial = self.inner.serial.load(Ordering::SeqCst);
-        if pipeline.shown != (owner, serial) {
-            let frame = self.inner.frame.lock().unwrap();
-            if frame.width > 0 {
-                let same = pipeline.texture.as_ref().is_some_and(|(_, _, w, h)| *w == frame.width && *h == frame.height);
-                if !same {
-                    let format = if pipeline.srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm };
-                    let size = wgpu::Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 };
-                    let texture = device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("video"),
-                        size,
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                        view_formats: &[],
-                    });
-                    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("video"),
-                        layout: &pipeline.layout,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: pipeline.uniforms.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
-                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&pipeline.sampler) },
-                        ],
-                    });
-                    pipeline.texture = Some((texture, bind, frame.width, frame.height));
-                }
-                let (texture, ..) = pipeline.texture.as_ref().unwrap();
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                    &frame.pixels,
-                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(frame.stride as u32), rows_per_image: Some(frame.height) },
-                    wgpu::Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 },
-                );
-            }
-            pipeline.shown = (owner, serial);
-        }
+        pipeline.upload(device, queue, &self.inner, owner, serial);
         let scale = viewport.scale_factor();
         let area = [bounds.x * scale, bounds.y * scale, bounds.width * scale, bounds.height * scale];
         // Кадр вписан в рамку с сохранением пропорций, по краям — чёрные поля.
@@ -672,6 +741,191 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         color = textureSampleLevel(frame, smooth_, uv, 0.0).rgb;
     }
     return vec4<f32>(color * cover, cover);
+}
+"#;
+
+/// Кадр фона: под затемнением и за стеклом больше 540p не видно, а кадр
+/// поменьше вдвое дешевле переводить в цвета и возить на видеокарту.
+const BACKDROP_WIDTH: i64 = 960;
+const BACKDROP_HEIGHT: i64 = 540;
+/// Фон не рисовался дольше — окна не видно, видео на паузу.
+const BACKDROP_HIDDEN_MS: u64 = 1500;
+/// Фон перерисовывается сам, без пересборки интерфейса: 24 кадра в секунду, как видео фона.
+const BACKDROP_FRAME: Duration = Duration::from_micros(41_667);
+
+/// Миллисекунды от запуска программы: часы фона и пузырей.
+fn epoch() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// Живой фон темы на всё окно: кадр видео как `cover` (обрезается по краям, `focus` — какая
+/// точка кадра остаётся в центре внимания), приглушённый под текст, и пузыри поверх. Без
+/// видео — только пузыри, под ними видна картинка темы.
+pub struct Backdrop {
+    inner: Option<Arc<Inner>>,
+    /// Яркость и насыщенность кадра.
+    pub bright: f32,
+    pub saturation: f32,
+    /// Сколько пузырей: 0 — без них.
+    pub bubbles: f32,
+    pub focus: (f32, f32),
+}
+
+impl Backdrop {
+    pub fn new(video: Option<&Video>) -> Self {
+        Backdrop { inner: video.map(|video| video.inner.clone()), bright: 0.62, saturation: 0.8, bubbles: 14.0, focus: (0.4, 0.5) }
+    }
+}
+
+impl<Message> shader::Program<Message> for Backdrop {
+    type State = ();
+    type Primitive = BackdropPrimitive;
+
+    fn update(&self, _: &mut (), event: &iced::Event, _: Rectangle, _: mouse::Cursor) -> Option<shader::Action<Message>> {
+        // Фон сам заказывает следующий кадр: интерфейс при этом не пересобирается.
+        let iced::Event::Window(iced::window::Event::RedrawRequested(now)) = event else { return None };
+        if let Some(inner) = &self.inner {
+            inner.seen.store(epoch(), Ordering::Relaxed);
+        }
+        Some(shader::Action::request_redraw_at(*now + BACKDROP_FRAME))
+    }
+
+    fn draw(&self, _: &(), _: mouse::Cursor, _: Rectangle) -> BackdropPrimitive {
+        BackdropPrimitive { inner: self.inner.clone(), look: [self.bright, self.saturation, self.bubbles, epoch() as f32 / 1000.0], focus: self.focus }
+    }
+}
+
+pub struct BackdropPrimitive {
+    inner: Option<Arc<Inner>>,
+    look: [f32; 4],
+    focus: (f32, f32),
+}
+
+impl std::fmt::Debug for BackdropPrimitive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("video::BackdropPrimitive")
+    }
+}
+
+/// Своё хранилище на видеокарте: фон и открытый клип рисуются одновременно.
+pub struct BackdropPipeline(Pipeline);
+
+impl shader::Pipeline for BackdropPipeline {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+        BackdropPipeline(Pipeline::build(device, queue, format, BACKDROP_SHADER, 4 * 16))
+    }
+}
+
+impl shader::Primitive for BackdropPrimitive {
+    type Pipeline = BackdropPipeline;
+
+    fn prepare(&self, pipeline: &mut BackdropPipeline, device: &wgpu::Device, queue: &wgpu::Queue, bounds: &Rectangle, viewport: &Viewport) {
+        let pipeline = &mut pipeline.0;
+        let owner = self.inner.as_ref().map_or(0, |inner| Arc::as_ptr(inner) as usize);
+        let serial = self.inner.as_ref().map_or(0, |inner| inner.serial.load(Ordering::SeqCst));
+        if let Some(inner) = &self.inner {
+            pipeline.upload(device, queue, inner, owner, serial);
+        }
+        let scale = viewport.scale_factor();
+        let area = [bounds.x * scale, bounds.y * scale, bounds.width * scale, bounds.height * scale];
+        // Кадр закрывает всё окно, лишнее обрезается; точка `focus` кадра остаётся на виду.
+        let picture = match pipeline.texture.as_ref() {
+            Some((_, _, w, h)) => {
+                let fill = (area[2] / *w as f32).max(area[3] / *h as f32);
+                let (pw, ph) = (*w as f32 * fill, *h as f32 * fill);
+                [area[0] + (area[2] - pw) * self.focus.0, area[1] + (area[3] - ph) * self.focus.1, pw, ph]
+            }
+            None => [0.0; 4],
+        };
+        pipeline.ready = pipeline.texture.is_some() && owner != 0 && owner == pipeline.shown.0 && serial > 0;
+        let has = if pipeline.ready { 1.0 } else { 0.0 };
+        let values: [[f32; 4]; 4] = [area, picture, [scale, has, 0.0, 0.0], self.look];
+        let bytes: Vec<u8> = values.iter().flatten().flat_map(|x| x.to_ne_bytes()).collect();
+        queue.write_buffer(&pipeline.uniforms, 0, &bytes);
+    }
+
+    fn draw(&self, pipeline: &BackdropPipeline, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
+        let pipeline = &pipeline.0;
+        // Без кадра шейдеру всё равно нужна привязка: пустая текстура 1×1.
+        let Some(bind) = pipeline.texture.as_ref().map(|(_, bind, ..)| bind).or(pipeline.empty.as_ref().map(|(_, bind)| bind)) else { return true };
+        render_pass.set_pipeline(&pipeline.pipeline);
+        render_pass.set_bind_group(0, bind, &[]);
+        render_pass.draw(0..3, 0..1);
+        true
+    }
+}
+
+const BACKDROP_SHADER: &str = r#"
+struct Uniforms {
+    area: vec4<f32>,
+    picture: vec4<f32>,
+    extra: vec4<f32>,
+    look: vec4<f32>,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var frame: texture_2d<f32>;
+@group(0) @binding(2) var smooth_: sampler;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+
+fn hash(n: f32) -> f32 {
+    return fract(sin(n * 127.1 + 311.7) * 43758.5453);
+}
+
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let local = pos.xy - u.area.xy;
+    if (any(local < vec2<f32>(0.0)) || any(local > u.area.zw)) {
+        return vec4<f32>(0.0);
+    }
+    var color = vec3<f32>(0.0);
+    var alpha = 0.0;
+    let uv = (pos.xy - u.picture.xy) / u.picture.zw;
+    if (u.extra.y > 0.5) {
+        let raw = textureSampleLevel(frame, smooth_, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).rgb;
+        // Как у темы в Tune Client: приглушить в холодную бирюзу, чуть контрастнее.
+        let gray = dot(raw, vec3<f32>(0.299, 0.587, 0.114));
+        var tinted = mix(vec3<f32>(gray), raw, u.look.y) * u.look.x;
+        tinted = (tinted - 0.5) * 1.05 + 0.5;
+        // Края темнее, как в глубине аквариума.
+        let center = local / u.area.zw - vec2<f32>(0.45, 0.35);
+        let shade = mix(1.0, 0.65, clamp(length(center) / 0.9, 0.0, 1.0));
+        color = clamp(tinted * shade, vec3<f32>(0.0), vec3<f32>(1.0));
+        alpha = 1.0;
+    }
+    // Пузыри: медленно поднимаются и покачиваются, у каждого свой путь и скорость.
+    let side = min(u.area.z, u.area.w);
+    let count = i32(u.look.z);
+    for (var i = 0; i < count; i = i + 1) {
+        let n = f32(i);
+        let period = 16.0 + hash(n) * 16.0;
+        let phase = fract(u.look.w / period + hash(n + 7.0));
+        let sway = (hash(n + 3.0) * 2.0 - 1.0) * 0.09 * u.area.z;
+        let lift = phase * 1.15 * u.area.w;
+        let drift = sway * sin(phase * 3.14159);
+        let radius = side * 0.011 * (0.6 + hash(n + 11.0) * 1.2);
+        let center = vec2<f32>(hash(n + 5.0) * u.area.z + drift, u.area.w * 1.08 - lift);
+        let offset = local - center;
+        let d = length(offset) / radius;
+        if (d < 1.4) {
+            // Тонкая светлая кромка, бирюзовое тело и блик сверху слева.
+            let rim = smoothstep(0.78, 0.96, d) * (1.0 - smoothstep(0.96, 1.04, d));
+            let body = (1.0 - smoothstep(0.0, 1.0, d)) * 0.18;
+            let glint = 1.0 - smoothstep(0.0, 0.28, length(offset / radius - vec2<f32>(-0.36, -0.44)));
+            let glow = (1.0 - smoothstep(1.0, 1.4, d)) * 0.12;
+            let a = clamp(rim * 0.75 + body + glint * 0.9 + glow, 0.0, 1.0) * 0.6;
+            let tint = mix(vec3<f32>(0.63, 1.0, 0.94), vec3<f32>(1.0), glint);
+            color = color * (1.0 - a) + tint * a;
+            alpha = alpha + a * (1.0 - alpha);
+        }
+    }
+    return vec4<f32>(color, alpha);
 }
 "#;
 

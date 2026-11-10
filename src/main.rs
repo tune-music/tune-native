@@ -12,6 +12,7 @@ mod shell;
 mod tray;
 mod uncensor;
 mod export;
+mod skin;
 mod everywhere;
 mod placement;
 mod taste;
@@ -63,10 +64,15 @@ use api::{Album, AlbumKind, Artist, Card, Found, Home, HomeBlock, HomeItem, Pin,
 use media::Media;
 use player::Player;
 use raw_window_handle::RawWindowHandle;
-use settings::{Look, Quality, Repeat, Settings};
+use settings::{Skin, Look, Quality, Repeat, Settings};
 
 /// Шаг перерисовки, пока идёт клип и больше ничего не движется.
 const CLIP_FRAME: Duration = Duration::from_micros(16_667);
+/// Экран загрузки: держится не меньше, чтобы не мигнуть, не дольше, если сеть молчит, и уходит плавно.
+const SPLASH_MIN: Duration = Duration::from_millis(600);
+const SPLASH_MAX: Duration = Duration::from_secs(10);
+const SPLASH_FADE: Duration = Duration::from_millis(350);
+const SPLASH_BAR: f32 = 180.0;
 const TICK: Duration = Duration::from_millis(500);
 /// Как часто окно забирает пришедшее от Ynison и отправляет своё.
 const YNISON_TICK: Duration = Duration::from_millis(300);
@@ -1137,6 +1143,8 @@ enum Preview {
     SpoofOf(uncensor::Kind, String),
     /// Окно «Без цензуры на всех устройствах» для всех лайков.
     UcPick(Vec<String>),
+    /// Экран загрузки, не уходит.
+    Splash,
     Account,
     LogoutAsk,
     /// Вкладка настроек.
@@ -1431,6 +1439,13 @@ struct App {
     reverb: u8,
     lyrics_sources: lyrics::Sources,
     lyrics_size: u8,
+    skin: Skin,
+    live_backdrop: bool,
+    /// Видео живого фона темы; `None` — фон неподвижный.
+    backdrop: Option<video::Video>,
+    backdrop_loading: bool,
+    /// Экран загрузки: когда показан и когда начал уходить.
+    splash: Option<(Instant, Option<Instant>)>,
     /// Текст песни или очередь закрываются: насколько ушли вниз и растаяли, потом — «назад».
     lyrics_closing: Option<f32>,
     /// Текст прокрутили руками: до этого времени он не возвращается к звучащей строке.
@@ -2013,6 +2028,9 @@ enum Message {
     SpoofReset,
     SpoofTrack(Result<Vec<Track>, String>),
     SpoofLists(String, Result<SpoofLists, String>),
+    SkinSet(Skin),
+    LiveBackdropToggle,
+    BackdropReady(Result<std::path::PathBuf, String>),
     /// Загрузить версию без цензуры в «Загруженное»: сначала сверка с ним.
     UcUpload(Vec<Track>),
     UcSynced(Vec<Track>, Result<HashMap<String, String>, String>),
@@ -2061,10 +2079,15 @@ impl App {
         if let Some(look) = std::env::var("TUNE_LOOK").ok().and_then(|code| Look::ALL.into_iter().find(|look| look.label() == code || format!("{look:?}").eq_ignore_ascii_case(&code))) {
             saved.look = look;
         }
+        if let Some(skin) = std::env::var("TUNE_SKIN").ok().and_then(|code| Skin::ALL.into_iter().find(|skin| skin.label().eq_ignore_ascii_case(&code))) {
+            saved.skin = skin;
+        }
         // Тема ставится до первого кадра, чтобы окно не мигнуло чужими цветами.
-        ui::set_light(look_light(saved.look));
+        ui::set_light(look_light(saved.look) && saved.skin != Skin::Aquarium);
+        ui::set_aquarium(saved.skin == Skin::Aquarium);
         let downloads = offline::load();
         let token = api::load_token();
+        let token_known = token.is_some();
         let task = match &token {
             Some(token) => load_account(token.clone()),
             None => Task::done(Message::LoginOpen),
@@ -2240,6 +2263,12 @@ impl App {
             reverb: saved.reverb,
             lyrics_sources: saved.lyrics,
             lyrics_size: saved.lyrics_size,
+            skin: saved.skin,
+            live_backdrop: saved.live_backdrop,
+            backdrop: None,
+            backdrop_loading: false,
+            // Экран загрузки, пока не пришёл аккаунт. У предпросмотров его нет: им нужна страница.
+            splash: (token_known && matches!(preview, None | Some(Preview::Splash))).then(|| (Instant::now(), None)),
             lyrics_closing: None,
             lyrics_hold: None,
             lyrics_set: 0.0,
@@ -2392,7 +2421,7 @@ impl App {
 
     /// Анимации интерфейса: им нужен каждый кадр монитора.
     fn ui_animating(&self) -> bool {
-        self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.eq_fade.busy() || self.devices_fade.busy() || self.chips_shown < 1.0 || self.lyrics_closing.is_some() || self.lyrics_dots() || (self.section == Section::Lyrics && self.lyrics_hold.is_some()) || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy() || self.wheel_turn != self.wheel_target || self.wheel_reveal != if self.wheel_open { 1.0 } else { 0.0 }
+        self.splash.is_some() || self.pin_fade.busy() || self.drag.is_some() || self.queue_scroll.is_some() || (self.section == Section::Lyrics && self.lyrics_back < 1.0) || self.page_veil > 0.0 || self.area_veil > 0.0 || self.track_veil > 0.0 || self.bar_top != self.bar_top_target() || (self.section == Section::Lyrics && self.lyrics_shown != self.lyrics_target) || !self.cover_fades.is_empty() || self.menu_fade.busy() || self.eq_fade.busy() || self.devices_fade.busy() || self.chips_shown < 1.0 || self.lyrics_closing.is_some() || self.lyrics_dots() || (self.section == Section::Lyrics && self.lyrics_hold.is_some()) || self.page_menu_fade.busy() || self.dialog_fade.busy() || self.full_fade.busy() || self.vibe_moving() || (self.full_fade.item.is_some() && !same_color(self.full_tint, self.full_target())) || self.notice_fade.busy() || self.wheel_turn != self.wheel_target || self.wheel_reveal != if self.wheel_open { 1.0 } else { 0.0 }
             || (self.wheel_ready() && self.wheel_arrow < 1.0)
             || self.word_now() != self.word_for
             || (self.word_for.is_some() && self.word_level < 1.0)
@@ -2526,8 +2555,29 @@ impl App {
     }
 
     /// Тема меняется сразу: стили читают её при каждой отрисовке. Заголовок окна — тоже.
+    /// Живой фон нужен: тема Aquarium, он включён и не лёгкая версия.
+    fn backdrop_live(&self) -> bool {
+        self.skin == Skin::Aquarium && self.live_backdrop && !self.lite
+    }
+
+    /// Запускает или гасит видео фона под текущие настройки. Видео темы при первом
+    /// включении копируется из Tune Client или скачивается.
+    fn backdrop_load(&mut self) -> Task<Message> {
+        if !self.backdrop_live() {
+            self.backdrop = None;
+            return Task::none();
+        }
+        if self.backdrop.is_some() || self.backdrop_loading {
+            return Task::none();
+        }
+        self.backdrop_loading = true;
+        let notice = if skin::video_ready() { Task::none() } else { self.notify_quick("Загружаем живой фон темы Aquarium…".to_string()) };
+        Task::batch([notice, Task::perform(background(skin::ensure_video), Message::BackdropReady)])
+    }
+
     fn apply_look(&self) {
-        ui::set_light(look_light(self.look));
+        // Aquarium всегда тёмная: белый текст на бирюзовой воде.
+        ui::set_light(look_light(self.look) && self.skin != Skin::Aquarium);
         if let Some(hwnd) = self.hwnd {
             paint_caption(hwnd);
         }
@@ -2598,7 +2648,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, keep_track: self.keep_track, own_in_wave: self.own_in_wave, restored_in_wave: self.restored_in_wave, uncensor: self.uncensor, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb, lyrics: self.lyrics_sources, lyrics_size: self.lyrics_size });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, skin: self.skin, live_backdrop: self.live_backdrop, keep_track: self.keep_track, own_in_wave: self.own_in_wave, restored_in_wave: self.restored_in_wave, uncensor: self.uncensor, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb, lyrics: self.lyrics_sources, lyrics_size: self.lyrics_size });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -4561,6 +4611,9 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if matches!(message, Message::Account(_)) {
+            self.splash_close();
+        }
         // Запрос запоминается, когда по нему что-то открыли или нажали Enter, а не на каждой букве.
         let chosen = matches!(message, Message::Search | Message::Play(Section::Search, _) | Message::ArtistOpen(_) | Message::AlbumOpen(..) | Message::ListOpen(_));
         if chosen && self.section == Section::Search && self.searched && api::parse_link(&self.query).is_none() {
@@ -4992,6 +5045,7 @@ impl App {
                     Some(Preview::WaveSeeded) => self.wave_load(vec!["artist:3121".to_string()], Some(wave_label("artist:3121", "Metallica")), false),
                     Some(Preview::Likes | Preview::LikesEnd | Preview::LikesAt(_) | Preview::Menu | Preview::Panels | Preview::TrackInfo | Preview::Spoof | Preview::QueueJump) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
+                    Some(Preview::Splash) => Task::none(),
                     Some(Preview::UcPick(ids)) => {
                         let open = self.update(Message::Open(Section::Likes));
                         let ids = if ids.is_empty() { self.liked_ids.clone() } else { ids };
@@ -7417,6 +7471,7 @@ impl App {
             Message::LiteToggle => {
                 self.lite = !self.lite;
                 self.save_settings();
+                return self.backdrop_load();
             }
             Message::NormalizeToggle => {
                 self.normalize = !self.normalize;
@@ -7519,6 +7574,33 @@ impl App {
             }
             Message::KidsSaved(Ok(())) => {}
             Message::KidsSaved(Err(e)) => eprintln!("раздел «Детям» не сохранён в аккаунте: {e}"),
+            Message::SkinSet(skin) => {
+                self.skin = skin;
+                ui::set_aquarium(skin == Skin::Aquarium);
+                self.apply_look();
+                self.save_settings();
+                return self.backdrop_load();
+            }
+            Message::LiveBackdropToggle => {
+                self.live_backdrop = !self.live_backdrop;
+                self.save_settings();
+                return self.backdrop_load();
+            }
+            Message::BackdropReady(result) => {
+                self.backdrop_loading = false;
+                match result {
+                    Ok(path) if self.backdrop_live() => match video::Video::backdrop(&path.to_string_lossy()) {
+                        Ok(video) => self.backdrop = Some(video),
+                        // Нет видеоплеера: остаётся картинка темы.
+                        Err(e) => api::log(&format!("Живой фон: {e}")),
+                    },
+                    Ok(_) => {}
+                    Err(e) => {
+                        api::log(&format!("Живой фон: {e}"));
+                        return self.notify(e);
+                    }
+                }
+            }
             Message::LookSet(look) => {
                 self.look = look;
                 self.apply_look();
@@ -7654,12 +7736,14 @@ impl App {
                     }
                 }
                 self.media = hwnd.map(Media::new);
+                let backdrop = self.backdrop_load();
                 // У предпросмотров значка нет: их закрывают снаружи, и он оставался бы висеть.
                 // Статуса в Discord у них тоже нет: он затёр бы статус настоящего Tune.
                 if self.preview.is_none() {
                     tray::start();
                     self.discord = Some(discord::spawn(self.discord_prefs.clone()));
                 }
+                return backdrop;
             }
             // Как у Tune Client: крестик прячет окно в трей, если это не выключено в настройках.
             Message::CloseWindow => match self.hwnd.filter(|_| self.window_prefs.close_to_tray) {
@@ -8233,7 +8317,18 @@ impl App {
                 }
             }
             // Кадры обрабатывает update.
-            Message::Frame(_) => {}
+            Message::Frame(_) => {
+                if let Some((shown, closing)) = self.splash {
+                    match closing {
+                        // Экран ушёл совсем.
+                        Some(at) if at.elapsed() >= SPLASH_FADE => self.splash = None,
+                        Some(_) => {}
+                        // Аккаунт так и не пришёл — не держим экран вечно.
+                        None if shown.elapsed() >= SPLASH_MAX => self.splash_close(),
+                        None => {}
+                    }
+                }
+            }
             Message::Volume(volume) => {
                 self.volume = volume;
                 self.muted = false;
@@ -8278,8 +8373,83 @@ impl App {
     fn view(&self) -> Element<'_, Message> {
         match &self.screen {
             Screen::Login(opened) => self.view_login(*opened),
-            Screen::Main(_) => self.view_main(),
+            // Пока экран загрузки закрывает всё, страницу под ним не собираем.
+            Screen::Main(_) => match self.splash_level() {
+                Some(level) if level >= 1.0 => self.view_splash(1.0),
+                Some(level) => stack![self.view_main(), self.view_splash(level)].into(),
+                None => self.view_main(),
+            },
         }
+    }
+
+    /// Насколько виден экран загрузки: 1 — целиком, `None` — уже ушёл.
+    fn splash_level(&self) -> Option<f32> {
+        let (_, closing) = self.splash?;
+        let Some(at) = closing else { return Some(1.0) };
+        let gone = at.elapsed().as_secs_f32() / SPLASH_FADE.as_secs_f32();
+        // Время ухода может быть впереди: экран держится не меньше `SPLASH_MIN`.
+        if Instant::now() < at { Some(1.0) } else { Some(1.0 - anim::ease_out(gone.min(1.0))) }
+    }
+
+    /// Аккаунт пришёл: экран загрузки уходит, но не раньше, чем через `SPLASH_MIN` после запуска.
+    fn splash_close(&mut self) {
+        if let Some((shown, closing @ None)) = &mut self.splash {
+            if !matches!(self.preview, Some(Preview::Splash)) {
+                *closing = Some((*shown + SPLASH_MIN).max(Instant::now()));
+            }
+        }
+    }
+
+    /// Экран загрузки, как у Tune Client: значок Tune и название, под ними бегущая полоса.
+    fn view_splash(&self, level: f32) -> Element<'_, Message> {
+        static LOGO: std::sync::OnceLock<image::Handle> = std::sync::OnceLock::new();
+        let logo = LOGO.get_or_init(|| image::Handle::from_bytes(include_bytes!("../assets/tune.png").as_slice())).clone();
+        let since = self.splash.map_or(0.0, |(shown, _)| shown.elapsed().as_secs_f32());
+        let rise = anim::ease_out((since / 0.5).min(1.0));
+        let alpha = level * rise;
+        let mark: Element<'_, Message> = if ui::aquarium() { iced::widget::svg(skin::logo()).width(72).height(72).opacity(alpha).into() } else { image(logo).width(72).height(72).opacity(alpha).into() };
+        let name = text("Tune").size(30).font(ui::font_medium()).color(ui::c().strong.scale_alpha(alpha));
+        // Полоса: блик пробегает за 1,1 секунды, с разгоном и торможением.
+        let cycle = (since % 1.1) / 1.1;
+        let eased = if cycle < 0.5 { 2.0 * cycle * cycle } else { 1.0 - (-2.0 * cycle + 2.0).powi(2) / 2.0 };
+        let (width, glint) = (SPLASH_BAR, SPLASH_BAR * 0.4);
+        let x = (-0.8 + 2.6 * eased) * width - glint;
+        let (start, end) = (x.max(0.0), (x + glint).min(width));
+        let accent = ui::c().accent;
+        let shine = container(Space::new()).width((end - start).max(0.0)).height(3).style(move |_| {
+            let gradient = iced::gradient::Linear::new(iced::Radians(std::f32::consts::FRAC_PI_2)).add_stop(0.0, accent.scale_alpha(0.0)).add_stop(0.5, accent.scale_alpha(alpha)).add_stop(1.0, accent.scale_alpha(0.0));
+            container::Style::default().background(iced::Background::Gradient(gradient.into())).border(iced::border::rounded(2))
+        });
+        let track = ui::c().muted.scale_alpha(0.44 * alpha);
+        let bar = container(row![Space::new().width(start), shine]).width(width).height(3).clip(true).style(move |_| container::Style::default().background(track).border(iced::border::rounded(2)));
+        let content = column![mark, name, Space::new().height(18), bar].spacing(10).align_x(Alignment::Center);
+        let content = container(column![content].padding(Padding::ZERO.top(10.0 * (1.0 - rise)))).center(Length::Fill);
+        let back = ui::c().base.scale_alpha(level);
+        let screen = container(content).width(Length::Fill).height(Length::Fill).style(move |_| container::Style::default().background(back));
+        // Пока экран уходит, он не мешает щёлкать по странице под ним.
+        let screen = reveal(screen).inert(level < 1.0);
+        if level >= 1.0 { stack![screen, self.view_caption()].into() } else { screen.into() }
+    }
+
+    /// Фон темы под окном: картинка, поверх живое видео и пузыри.
+    fn view_backdrop(&self) -> Option<Element<'_, Message>> {
+        if self.skin != Skin::Aquarium {
+            return None;
+        }
+        let poster = image(skin::poster()).content_fit(iced::ContentFit::Cover).width(Length::Fill).height(Length::Fill);
+        // Картинку приглушаем так же, как видео: переход с неё на видео незаметен.
+        let dim = container(Space::new()).width(Length::Fill).height(Length::Fill).style(|_| container::Style::default().background(iced::Color::from_rgba8(3, 30, 40, 0.45)));
+        let mut layers = stack![poster, dim];
+        if !self.lite {
+            let mut backdrop = video::Backdrop::new(self.backdrop.as_ref().filter(|_| self.backdrop_live()));
+            if !self.live_backdrop {
+                backdrop.bubbles = 0.0;
+            }
+            if self.live_backdrop {
+                layers = layers.push(iced::widget::shader(backdrop).width(Length::Fill).height(Length::Fill));
+            }
+        }
+        Some(layers.into())
     }
 
     fn view_login(&self, opened: bool) -> Element<'_, Message> {
@@ -8400,7 +8570,11 @@ impl App {
         let base = container(columns).width(Length::Fill).height(Length::Fill).style(ui::root);
         // Окно клипа непрозрачно и на всё окно: что под ним, не рисуем.
         let covered = self.clip.is_some();
-        let mut layers = stack![anim::covered(base, covered)];
+        let mut layers = stack![];
+        if let Some(backdrop) = self.view_backdrop().filter(|_| !covered) {
+            layers = layers.push(backdrop);
+        }
+        let mut layers = layers.push(anim::covered(base, covered));
         if let Some(full) = self.view_full() {
             layers = layers.push(anim::covered(full, covered));
         }
@@ -9456,7 +9630,8 @@ impl App {
         let active = caption::active();
         let tint = if active { ui::c().text } else { ui::c().muted };
         let label = self.track_caption(self.window_prefs.track_title);
-        let name = row![image(logo).width(16).height(16), text(label).size(12).color(tint).wrapping(Wrapping::None)].spacing(10).align_y(Alignment::Center);
+        let mark: Element<'_, Message> = if ui::aquarium() { iced::widget::svg(skin::logo()).width(16).height(16).into() } else { image(logo).width(16).height(16).into() };
+        let name = row![mark, text(label).size(12).color(tint).wrapping(Wrapping::None)].spacing(10).align_y(Alignment::Center);
         let name = container(name).padding(Padding::ZERO.left(14)).width(Length::Fill).height(Length::Fill).align_y(Alignment::Center).clip(true);
         let zoomed = self.hwnd.is_some_and(caption::zoomed);
         let (max_hover, max_pressed) = caption::max_state();
@@ -9870,7 +10045,16 @@ impl App {
             SettingsTab::Main => {
                 let looks = Look::ALL.into_iter().fold(row![].spacing(8), |line, look| line.push(choice(look.label(), look == self.look, Message::LookSet(look))));
                 column![
-                    column![title("Оформление"), looks, toggle("Включить lite-версию", "Визуальные эффекты и анимации будут загружаться в облегчённом формате", Some(self.lite), Some(Message::LiteToggle))].spacing(12),
+                    column![title("Оформление"), looks].spacing(12),
+                    {
+                        let skins = Skin::ALL.into_iter().fold(row![].spacing(8), |line, skin| line.push(choice(skin.label(), skin == self.skin, Message::SkinSet(skin))));
+                        let mut items = column![title("Тема"), skins].spacing(12);
+                        if self.skin == Skin::Aquarium {
+                            items = items.push(toggle("Живой фон", "Аквариум с обложки sqwore плывёт на фоне, поднимаются пузыри. Выключите, если не хватает мощности: останется картинка. Тема всегда тёмная", Some(self.live_backdrop), Some(Message::LiveBackdropToggle)));
+                        }
+                        items
+                    },
+                    column![toggle("Включить lite-версию", "Визуальные эффекты и анимации будут загружаться в облегчённом формате", Some(self.lite), Some(Message::LiteToggle))].spacing(12),
                     group("Боковая панель", vec![
                         toggle("Книги и подкасты", "Пункт «Книги и подкасты» в боковой панели: аудиокниги, подкасты и выпуски", Some(self.books_tab), Some(Message::BooksToggle)),
                         toggle("Детский раздел", "Пункт «Детям» в боковой панели: сказки, песни и аудиокниги для детей", Some(self.kids), Some(Message::KidsToggle)),
@@ -13212,6 +13396,7 @@ fn main() -> iced::Result {
             "track-info" => Preview::TrackInfo,
             "spoof" => Preview::Spoof,
             "uc-pick" => Preview::UcPick(Vec::new()),
+            "splash" => Preview::Splash,
             what if what.starts_with("uc-pick:") => Preview::UcPick(what["uc-pick:".len()..].split(',').map(str::to_string).collect()),
             what if what.starts_with("spoof-album:") => Preview::SpoofOf(uncensor::Kind::Album, what["spoof-album:".len()..].to_string()),
             what if what.starts_with("spoof-artist:") => Preview::SpoofOf(uncensor::Kind::Artist, what["spoof-artist:".len()..].to_string()),

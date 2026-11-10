@@ -88,6 +88,51 @@ pub const LIGHT: Colors = Colors {
     danger: color!(0xe5484d),
 };
 
+const fn navy(a: f32) -> Color {
+    Color { r: 6.0 / 255.0, g: 46.0 / 255.0, b: 58.0 / 255.0, a }
+}
+
+const fn sea(a: f32) -> Color {
+    Color { r: 230.0 / 255.0, g: 252.0 / 255.0, b: 250.0 / 255.0, a }
+}
+
+/// Тема Aquarium, как в Tune Client: толща бирюзовой воды. Подложки полупрозрачные — под
+/// ними живой фон; меню и окна плотнее, размытия под стеклом в iced нет.
+pub const AQUARIUM: Colors = Colors {
+    base: color!(0x04222c),
+    content: navy(0.48),
+    player: navy(0.58),
+    tile: white(0.07),
+    popover: navy(0.94),
+    menu: navy(0.96),
+    tooltip: navy(0.96),
+    strong: color!(0xffffff),
+    text: sea(1.0),
+    muted: sea(0.62),
+    faint: sea(0.36),
+    control: white(0.08),
+    control_hover: white(0.14),
+    control_pressed: white(0.2),
+    accent: color!(0x3fe0d0),
+    accent_hover: color!(0x8ff5ea),
+    on_accent: color!(0x04222c),
+    danger: color!(0xf87171),
+};
+
+/// Кромка стекла у панелей Aquarium.
+const AQUARIUM_RIM: Color = Color { r: 220.0 / 255.0, g: 1.0, b: 250.0 / 255.0, a: 0.18 };
+
+static AQUARIUM_ON: AtomicBool = AtomicBool::new(false);
+
+pub fn set_aquarium(on: bool) {
+    AQUARIUM_ON.store(on, Ordering::Relaxed);
+}
+
+/// Включена тема Aquarium: окно без сплошного фона, под ним аквариум.
+pub fn aquarium() -> bool {
+    AQUARIUM_ON.load(Ordering::Relaxed)
+}
+
 /// Светлая ли сейчас тема. Меняется на ходу: стили читают её при каждой отрисовке.
 static LIGHT_THEME: AtomicBool = AtomicBool::new(false);
 
@@ -108,6 +153,9 @@ pub fn set_full_dark(dark: bool) {
 
 /// Цвета текущей темы.
 pub fn c() -> &'static Colors {
+    if aquarium() {
+        return &AQUARIUM;
+    }
     if is_light() && !FULL_DARK.load(Ordering::Relaxed) { &LIGHT } else { &DARK }
 }
 
@@ -299,15 +347,17 @@ fn fill(color: Color) -> container::Style {
 }
 
 pub fn root(_: &Theme) -> container::Style {
-    fill(c().base)
+    fill(if aquarium() { Color::TRANSPARENT } else { c().base })
 }
 
 pub fn content(_: &Theme) -> container::Style {
-    container::Style { border: Border { color: c().control, width: 1.0, radius: 12.0.into() }, ..fill(c().content) }
+    let edge = if aquarium() { AQUARIUM_RIM } else { c().control };
+    container::Style { border: Border { color: edge, width: 1.0, radius: 12.0.into() }, ..fill(c().content) }
 }
 
 pub fn player(_: &Theme) -> container::Style {
-    container::Style { border: border::rounded(12), ..fill(c().player) }
+    let border = if aquarium() { Border { color: AQUARIUM_RIM, width: 1.0, radius: 12.0.into() } } else { border::rounded(12) };
+    container::Style { border, ..fill(c().player) }
 }
 
 pub fn tile(_: &Theme) -> container::Style {
