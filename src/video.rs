@@ -1081,11 +1081,8 @@ fn panel(pos: vec2<f32>) -> vec4<f32> {
         let wide = 1.0 - smoothstep(0.0, 14.0 * scale, -d);
         let spec = pow(max(dot(normal, light), 0.0), 1.6);
         let back = pow(max(dot(normal, -light), 0.0), 2.0);
-        // Вторая, тонкая кромка чуть внутри: у толстого стекла их две.
-        let inner = (1.0 - smoothstep(0.0, 1.2 * scale, abs(-d - 5.0 * scale)));
         color = color + vec3<f32>(1.0) * band * (0.9 * spec + 0.18) * glass;
         color = color + vec3<f32>(0.63, 1.0, 0.94) * band * back * 0.45 * glass;
-        color = color + vec3<f32>(1.0) * inner * (0.25 * spec + 0.05) * glass;
         color = color + vec3<f32>(1.0) * wide * spec * 0.08 * glass;
     }
     color = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));

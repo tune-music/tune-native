@@ -10122,12 +10122,10 @@ impl App {
 
         let content: Element<'_, Message> = match self.settings_tab {
             SettingsTab::Main => {
-                let looks = Look::ALL.into_iter().fold(row![].spacing(8), |line, look| line.push(choice(look.label(), look == self.look, Message::LookSet(look))));
                 column![
-                    column![title("Оформление"), looks].spacing(12),
                     column![
-                        title("Темы"),
-                        text("Темы, их настройки и Liquid Glass — в разделе «Кастомизация»").color(ui::c().muted),
+                        title("Оформление"),
+                        text("Цвета, темы и их настройки — в разделе «Кастомизация»").color(ui::c().muted),
                         row![link("Открыть кастомизацию", Message::Open(Section::Customize))],
                     ]
                     .spacing(12),
@@ -10308,6 +10306,11 @@ impl App {
         };
         let cards = Skin::ALL.into_iter().fold(row![].spacing(16), |cards, skin| cards.push(self.skin_card(skin)));
         let mut body = column![column![title("Темы"), cards.wrap().vertical_spacing(16)].spacing(12)].spacing(28);
+        if self.skin == Skin::Standard {
+            let choice = |label, chosen, press| shine(button(text(label)).padding([9, 18]).style(if chosen { ui::accent } else { ui::secondary }).on_press(press), 20.0);
+            let looks = Look::ALL.into_iter().fold(row![].spacing(8), |line, look| line.push(choice(look.label(), look == self.look, Message::LookSet(look))));
+            body = body.push(column![title("Цвета"), looks].spacing(12));
+        }
         if self.skin == Skin::Aquarium {
             let aq = self.aquarium;
             let percent = |value: f32| format!("{:.0}%", value * 100.0);
@@ -10322,15 +10325,18 @@ impl App {
                 knob("Плотность панелей", percent(aq.panel_density), aq.panel_density, |v| Message::AquaSet(AquaKnob::PanelDensity, v)),
             ].spacing(8));
         }
-        let mut glass = column![
-            title("Liquid Glass"),
-            toggle("Liquid Glass", "Панели как стекло Apple: края преломляют фон, цвета на кромке расслаиваются, сверху блик. Работает в темах с фоном — сейчас это Aquarium", self.glass.on, (self.skin == Skin::Aquarium).then_some(Message::GlassToggle)),
-        ]
-        .spacing(8);
-        if self.glass.on && self.skin == Skin::Aquarium {
-            glass = glass.push(knob("Сила преломления", format!("{:.0}%", self.glass.strength * 100.0), self.glass.strength, |v| Message::AquaSet(AquaKnob::GlassStrength, v)));
+        // Стеклу нужен фон за панелями, у стандартной темы его нет.
+        if self.skin == Skin::Aquarium {
+            let mut glass = column![
+                title("Liquid Glass"),
+                toggle("Liquid Glass", "Панели как стекло Apple: края преломляют фон, цвета на кромке расслаиваются, сверху блик", self.glass.on, Some(Message::GlassToggle)),
+            ]
+            .spacing(8);
+            if self.glass.on {
+                glass = glass.push(knob("Сила преломления", format!("{:.0}%", self.glass.strength * 100.0), self.glass.strength, |v| Message::AquaSet(AquaKnob::GlassStrength, v)));
+            }
+            body = body.push(glass);
         }
-        let body = body.push(glass);
         let head = text("Кастомизация").size(36).font(ui::font_headline()).color(ui::c().text);
         let scroll = ui::scroll(container(body).max_width(760).padding(Padding::ZERO.right(20))).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill);
         column![head, scroll].spacing(24).height(Length::Fill).into()
