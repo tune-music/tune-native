@@ -86,6 +86,15 @@ pub fn register_own() {
     });
 }
 
+/// Убирает `music-application://`, если он ведёт в Tune: при удалении программы.
+pub fn remove_own() {
+    if handler(OWN).as_deref().is_some_and(is_tune) {
+        let key = wide(&classes(OWN, ""));
+        // SAFETY: строка оканчивается нулём, удаляется только наш ключ протокола.
+        unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, key.as_ptr()) };
+    }
+}
+
 fn saved_path() -> std::path::PathBuf {
     crate::api::data_dir().join("yandexmusic-handler.txt")
 }

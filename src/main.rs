@@ -13,6 +13,7 @@ mod tray;
 mod uncensor;
 mod export;
 mod skin;
+mod update;
 mod everywhere;
 mod placement;
 mod taste;
@@ -175,6 +176,9 @@ const DRAG_EDGE_TOP: f32 = 180.0;
 const DRAG_SCROLL_SPEED: f32 = 900.0;
 /// Как часто сверяется тема Windows, когда выбрано «Как в системе».
 const SYSTEM_LOOK_CHECK: Duration = Duration::from_secs(2);
+/// Первая проверка обновлений — когда запуск уже улёгся, потом раз в шесть часов.
+const UPDATE_FIRST_CHECK: Duration = Duration::from_secs(10);
+const UPDATE_EVERY: Duration = Duration::from_secs(6 * 3600);
 /// Сколько треков «Знакомо вам» видно на странице исполнителя; играют все.
 const FAMILIAR_SHOWN: usize = 5;
 /// Заголовок дня и заголовок блока «откуда слушали» в истории.
@@ -885,6 +889,22 @@ enum Dialog {
     Vibe(VibeDialog),
     /// «Найти город» для концертов.
     ConcertCity,
+    /// «Что нового»: версии и их изменения.
+    News(Vec<(String, Vec<String>)>),
+}
+
+/// Что сейчас с обновлением.
+#[derive(Clone, Debug, PartialEq)]
+enum UpdStatus {
+    Idle,
+    Checking,
+    /// Проверили по кнопке: новее нет.
+    Latest,
+    Failed(String),
+    /// Скачано и всего, в байтах.
+    Loading(u64, u64),
+    /// Установщик запущен, Tune закрывается.
+    Installing,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1059,6 +1079,8 @@ struct Place {
 /// Запуск с готовым разделом: первый трек показывается в плеере, но не играет.
 #[derive(Clone)]
 enum Preview {
+    /// Окно «Что нового» со всеми версиями.
+    News,
     /// Страница «Клипы».
     Clips,
     /// Волна с открытым списком устройств.
@@ -1212,6 +1234,10 @@ struct App {
     pending: Option<(u64, Pending)>,
     /// Окно приложения: к нему привязываются системные окна.
     hwnd: Option<isize>,
+    /// Обновления: настройки, найденный релиз и что сейчас происходит.
+    upd: update::State,
+    upd_found: Option<update::Release>,
+    upd_status: UpdStatus,
     /// Перетаскивание: список, откуда взят трек, и над какой строкой он сейчас (ниже ли середины).
     drag: Option<(DragList, usize, Option<(usize, bool)>)>,
     /// Где остановились в выпусках и книгах за этот запуск: свежее ответа сервера.
@@ -2057,6 +2083,15 @@ enum Message {
     AquaToggle(AquaSwitch),
     AquaSet(AquaKnob, f32),
     GlassToggle,
+    /// Проверить обновления; `true` — по кнопке, тогда виден и ответ «новее нет».
+    UpdateCheck(bool),
+    UpdateChecked(bool, Result<Option<update::Release>, String>),
+    UpdateInstall,
+    UpdateProgress(u64, u64),
+    UpdateDone(Result<(), String>),
+    UpdateSkip,
+    UpdateAutoToggle,
+    NewsOpen,
     /// Ползунок отпустили: настройки на диск.
     CustomSave,
     BackdropReady(Result<std::path::PathBuf, String>),
@@ -2145,6 +2180,9 @@ impl App {
             progress_at: None,
             drag: None,
             hwnd: None,
+            upd: update::load(),
+            upd_found: None,
+            upd_status: UpdStatus::Idle,
             page_menu: None,
             page_menu_fade: Fade::new(POPUP_OPEN, POPUP_CLOSE),
             pending: None,
@@ -5210,6 +5248,10 @@ impl App {
                         // Отдельным сообщением: смена страницы очищает поиск уже после этого обработчика.
                         Task::batch([page, Task::done(Message::Filter(query))])
                     }
+                    Some(Preview::News) => {
+                        self.preview = None;
+                        self.update(Message::DialogOpen(Dialog::News(update::news_since("0.0.0"))))
+                    }
                     Some(Preview::Settings(tab)) => {
                         self.preview = None;
                         self.settings_tab = SettingsTab::ALL[tab.min(SettingsTab::ALL.len() - 1)];
@@ -6943,7 +6985,7 @@ impl App {
                         self.dialog = Some(Dialog::UcPick);
                         self.handle(Message::UcPickGo)
                     }
-                    Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account | Dialog::Wizard | Dialog::Unsafe(..) | Dialog::Vibe(_) => Task::none(),
+                    Dialog::WaveTune | Dialog::TrackInfo(_) | Dialog::Account | Dialog::Wizard | Dialog::Unsafe(..) | Dialog::Vibe(_) | Dialog::News(_) => Task::none(),
                     Dialog::Logout => self.handle(Message::Logout),
                     Dialog::ConcertCity => {
                         let _ = (uid, token);
@@ -7635,6 +7677,96 @@ impl App {
                     AquaKnob::GlassStrength => self.glass.strength = value,
                 }
             }
+            Message::UpdateCheck(manual) => {
+                if self.preview.is_some() || matches!(self.upd_status, UpdStatus::Checking | UpdStatus::Loading(..) | UpdStatus::Installing) {
+                    return Task::none();
+                }
+                if manual {
+                    self.upd_status = UpdStatus::Checking;
+                }
+                return Task::perform(background(update::check), move |result| Message::UpdateChecked(manual, result));
+            }
+            Message::UpdateChecked(manual, result) => {
+                if matches!(self.upd_status, UpdStatus::Loading(..) | UpdStatus::Installing) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(Some(release)) => {
+                        self.upd_status = UpdStatus::Idle;
+                        let skipped = !manual && self.upd.skipped.as_deref() == Some(release.version.as_str());
+                        let fresh = self.upd_found.as_ref().is_none_or(|known| known.version != release.version);
+                        let version = release.version.clone();
+                        self.upd_found = Some(release);
+                        // Об одной и той же версии сама проверка напоминает один раз за запуск.
+                        if !skipped && (manual || fresh) {
+                            let task = self.notify(format!("Доступна версия Tune {version}"));
+                            self.notice_action = Some(("Обновить".to_string(), Box::new(Message::UpdateInstall)));
+                            return task;
+                        }
+                    }
+                    Ok(None) => {
+                        self.upd_found = None;
+                        if manual {
+                            self.upd_status = UpdStatus::Latest;
+                        }
+                    }
+                    Err(e) if manual => self.upd_status = UpdStatus::Failed(e),
+                    Err(e) => api::log(&e),
+                }
+            }
+            Message::UpdateInstall => {
+                let Some(release) = self.upd_found.clone() else { return Task::none() };
+                if matches!(self.upd_status, UpdStatus::Loading(..) | UpdStatus::Installing) {
+                    return Task::none();
+                }
+                self.upd_status = UpdStatus::Loading(0, release.size);
+                // Ok — сколько скачано, Err — итог.
+                let (tx, rx) = mpsc::unbounded::<Result<(u64, u64), Result<(), String>>>();
+                std::thread::spawn(move || {
+                    let step = std::cell::Cell::new(u64::MAX);
+                    let result = update::install(&release, |loaded, total| {
+                        // Шаг в процент: чаще перерисовывать нечего.
+                        let mark = if total > 0 { loaded * 100 / total } else { loaded >> 20 };
+                        if step.replace(mark) != mark {
+                            let _ = tx.unbounded_send(Ok((loaded, total)));
+                        }
+                    });
+                    let _ = tx.unbounded_send(Err(result));
+                });
+                return Task::stream(rx).map(|step| match step {
+                    Ok((loaded, total)) => Message::UpdateProgress(loaded, total),
+                    Err(result) => Message::UpdateDone(result),
+                });
+            }
+            Message::UpdateProgress(loaded, total) => {
+                if matches!(self.upd_status, UpdStatus::Loading(..)) {
+                    self.upd_status = UpdStatus::Loading(loaded, total);
+                }
+            }
+            Message::UpdateDone(result) => match result {
+                Ok(()) => {
+                    self.upd_status = UpdStatus::Installing;
+                    // Установщик ждёт, пока Tune закроется, и запускает новую версию сам.
+                    return self.update(Message::Quit);
+                }
+                Err(e) => {
+                    self.upd_status = UpdStatus::Failed(e.clone());
+                    return self.notify(e);
+                }
+            },
+            Message::UpdateSkip => {
+                if let Some(release) = self.upd_found.take() {
+                    self.upd.skipped = Some(release.version);
+                    update::save(&self.upd);
+                }
+            }
+            Message::UpdateAutoToggle => {
+                self.upd.auto = !self.upd.auto;
+                update::save(&self.upd);
+            }
+            Message::NewsOpen => {
+                return self.update(Message::DialogOpen(Dialog::News(update::news_current())));
+            }
             Message::GlassToggle => {
                 self.glass.on = !self.glass.on;
                 self.save_settings();
@@ -7793,7 +7925,7 @@ impl App {
                     }
                 }
                 self.media = hwnd.map(Media::new);
-                let backdrop = self.backdrop_load();
+                let backdrop = Task::batch([self.backdrop_load(), self.updates_start()]);
                 // У предпросмотров значка нет: их закрывают снаружи, и он оставался бы висеть.
                 // Статуса в Discord у них тоже нет: он затёр бы статус настоящего Tune.
                 if self.preview.is_none() {
@@ -8424,7 +8556,8 @@ impl App {
             _ => Subscription::none(),
         };
         let look = if self.look == Look::System { time::every(SYSTEM_LOOK_CHECK).map(|_| Message::SystemLookCheck) } else { Subscription::none() };
-        Subscription::batch([ticks, frames, online, look, sync, ynison]).pipe_media()
+        let updates = if self.upd.auto && self.preview.is_none() { time::every(UPDATE_EVERY).map(|_| Message::UpdateCheck(false)) } else { Subscription::none() };
+        Subscription::batch([ticks, frames, online, look, sync, ynison, updates]).pipe_media()
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -8717,6 +8850,7 @@ impl App {
             Dialog::Unsafe(_, go, modal) => return self.view_unsafe(go, modal),
             Dialog::Vibe(kind) => return self.view_vibe(kind),
             Dialog::ConcertCity => return self.view_concert_city(),
+            Dialog::News(news) => return self.view_news(news),
             Dialog::Logout => ("Выйти из аккаунта?".to_string(), "Выйти", true),
             Dialog::DownloadLikes => {
                 let left = self.liked_ids.iter().filter(|id| !self.download_ids.contains(*id)).count();
@@ -8756,6 +8890,80 @@ impl App {
         // Затемнение ловит клики, чтобы страница под окном не реагировала.
         let dim = iced::Color::BLACK.scale_alpha(0.6 * alpha);
         reveal(mouse_area(container(mouse_area(window).on_press(Message::DialogInput(self.dialog_text.clone()))).center(Length::Fill).style(move |_| container::Style::default().background(dim))).on_press(Message::MenuClose)).inert(!self.dialog_fade.live).into()
+    }
+
+    /// «Что нового»: версии новыми сверху, у каждой — список изменений.
+    fn view_news<'a>(&'a self, news: &'a [(String, Vec<String>)]) -> Element<'a, Message> {
+        let alpha = self.dialog_fade.shown();
+        let mut list = column![].spacing(20).padding(Padding::ZERO.right(12));
+        for (version, items) in news {
+            let mut block = column![text(format!("Версия {version}")).font(ui::font_medium()).color(ui::c().text.scale_alpha(alpha))].spacing(8);
+            for item in items {
+                block = block.push(row![text("•").color(ui::c().accent.scale_alpha(alpha)), text(item.as_str()).color(ui::c().muted.scale_alpha(alpha)).width(Length::Fill)].spacing(10));
+            }
+            list = list.push(block);
+        }
+        if news.is_empty() {
+            list = list.push(text("Список изменений этой версии пуст").color(ui::c().muted.scale_alpha(alpha)));
+        }
+        let buttons = row![
+            shine(button(text("Все версии").color(ui::c().text.scale_alpha(alpha))).padding([8, 18]).style(ui::button_faded(ui::secondary, alpha)).on_press(Message::OpenLink(update::RELEASES_PAGE)), 24.0),
+            Space::new().width(Length::Fill),
+            shine(button(text("Понятно").font(ui::font_medium()).color(ui::c().on_accent.scale_alpha(alpha))).padding([8, 18]).style(ui::button_faded(ui::accent, alpha)).on_press(Message::MenuClose), 24.0),
+        ]
+        .spacing(8);
+        let body = column![
+            text("Что нового в Tune").size(20).font(ui::font_medium()).color(ui::c().text.scale_alpha(alpha)),
+            container(ui::scroll(list)).max_height(420),
+            buttons,
+        ]
+        .spacing(16);
+        let window = reveal(container(body).width(TUNE_WIDTH).padding(24).style(ui::popover_faded(alpha))).scale(0.94 + 0.06 * alpha, 0.5, 0.5).shift(0.0, 10.0 * (1.0 - alpha));
+        let dim = iced::Color::BLACK.scale_alpha(0.6 * alpha);
+        reveal(mouse_area(container(mouse_area(window).on_press(Message::DialogInput(self.dialog_text.clone()))).center(Length::Fill).style(move |_| container::Style::default().background(dim))).on_press(Message::MenuClose)).inert(!self.dialog_fade.live).into()
+    }
+
+    /// При запуске: «Что нового» после обновления и первая проверка новой версии.
+    fn updates_start(&mut self) -> Task<Message> {
+        if self.preview.is_some() {
+            return Task::none();
+        }
+        update::cleanup();
+        let mut tasks = Vec::new();
+        // Первый запуск — не обновление: окна нет, версия просто запоминается.
+        if let Some(seen) = self.upd.seen.clone().filter(|seen| update::newer(update::VERSION, seen)) {
+            let news = update::news_since(&seen);
+            if !news.is_empty() {
+                tasks.push(self.update(Message::DialogOpen(Dialog::News(news))));
+            }
+        }
+        if self.upd.seen.as_deref() != Some(update::VERSION) {
+            self.upd.seen = Some(update::VERSION.to_string());
+            update::save(&self.upd);
+        }
+        if self.upd.auto {
+            tasks.push(Task::perform(
+                background(|| {
+                    std::thread::sleep(UPDATE_FIRST_CHECK);
+                    update::check()
+                }),
+                |result| Message::UpdateChecked(false, result),
+            ));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Строка о состоянии обновления в настройках; `None` — сказать нечего.
+    fn update_line(&self) -> Option<String> {
+        Some(match &self.upd_status {
+            UpdStatus::Checking => "Проверяем…".to_string(),
+            UpdStatus::Latest => "У вас последняя версия".to_string(),
+            UpdStatus::Failed(e) => e.clone(),
+            UpdStatus::Loading(loaded, total) if *total > 0 => format!("Скачивается обновление: {}%", loaded * 100 / total),
+            UpdStatus::Loading(..) => "Скачивается обновление…".to_string(),
+            UpdStatus::Installing => "Устанавливается, Tune перезапустится".to_string(),
+            UpdStatus::Idle => format!("Доступна версия {}", self.upd_found.as_ref()?.version),
+        })
     }
 
     /// Предупреждение перед страницей, как в оригинале: «Не буду слушать» — главная кнопка.
@@ -10271,9 +10479,10 @@ impl App {
                 column![
                     title("О приложении"),
                     text(format!("Tune Native, версия {}", env!("CARGO_PKG_VERSION"))).color(ui::c().muted),
-                    row![link("Помощь", Message::OpenLink("https://yandex.ru/support/music/")), link("Условия использования", Message::OpenLink("https://yandex.ru/legal/music_termsofuse/"))].spacing(8).wrap().vertical_spacing(8),
+                    row![link("Что нового", Message::NewsOpen), link("Помощь", Message::OpenLink("https://yandex.ru/support/music/")), link("Условия использования", Message::OpenLink("https://yandex.ru/legal/music_termsofuse/"))].spacing(8).wrap().vertical_spacing(8),
                 ]
                 .spacing(12),
+                self.view_updates(),
             ]
             .spacing(28)
             .into(),
@@ -10285,6 +10494,37 @@ impl App {
         let body = container(content).max_width(700).padding(Padding::ZERO.right(20));
         let scroll = ui::scroll(body).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill);
         column![head, scroll].spacing(24).height(Length::Fill).into()
+    }
+
+    /// Настройки → Аккаунт: проверка, установка и автопроверка обновлений.
+    fn view_updates(&self) -> Element<'_, Message> {
+        let title = text("Обновления").size(20).font(ui::font_medium()).color(ui::c().text);
+        let busy = matches!(self.upd_status, UpdStatus::Checking | UpdStatus::Loading(..) | UpdStatus::Installing);
+        let link = |label: String, press: Option<Message>, main: bool| shine(button(text(label)).padding([9, 18]).style(if main { ui::accent } else { ui::secondary }).on_press_maybe(press), 20.0);
+        let mut actions = row![].spacing(8);
+        match &self.upd_found {
+            Some(release) => {
+                actions = actions.push(link(format!("Обновить до {}", release.version), (!busy).then_some(Message::UpdateInstall), true));
+                actions = actions.push(link("Пропустить эту версию".to_string(), (!busy).then_some(Message::UpdateSkip), false));
+            }
+            None => actions = actions.push(link("Проверить обновления".to_string(), (!busy).then_some(Message::UpdateCheck(true)), false)),
+        }
+        let mut block = column![title].spacing(12);
+        if self.upd_found.is_some() && !update::installed() {
+            block = block.push(text("Эта копия Tune не установлена: обновление поставит Tune в папку программ").size(13).color(ui::c().muted));
+        }
+        if let Some(line) = self.update_line() {
+            let color = if matches!(self.upd_status, UpdStatus::Failed(_)) { ui::c().danger } else { ui::c().muted };
+            block = block.push(text(line).color(color));
+        }
+        let line = row![
+            column![text("Проверять автоматически").color(ui::c().text), text("При запуске и раз в шесть часов. Новая версия ставится только по кнопке").size(13).color(ui::c().muted)].spacing(2).width(Length::Fill),
+            view_switch(Some(self.upd.auto)),
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center);
+        let auto = glow(button(line).width(Length::Fill).padding(8).style(ui::row).on_press(Message::UpdateAutoToggle), 8.0);
+        block.push(actions.wrap().vertical_spacing(8)).push(auto).into()
     }
 
     /// «Кастомизация»: темы карточками с превью, настройки выбранной темы и Liquid Glass.
@@ -11901,6 +12141,16 @@ fn set_autostart(on: bool) -> Result<(), String> {
     if status == 0 { Ok(()) } else { Err("Не удалось включить автозапуск".to_string()) }
 }
 
+/// Зовёт деинсталлятор перед удалением файлов: `yandexmusic://` возвращается прежнему
+/// обработчику, свой протокол и автозапуск убираются. Настройки и скачанное остаются.
+fn uninstall() {
+    if let Err(e) = protocol::set_yandex(false) {
+        api::log(&e);
+    }
+    protocol::remove_own();
+    let _ = set_autostart(false);
+}
+
 /// Новая копия Tune с теми же ключами; эта после вызова закрывается.
 fn restart() {
     let Ok(exe) = std::env::current_exe() else { return };
@@ -13461,6 +13711,10 @@ fn main() -> iced::Result {
     if args.get(1).is_some_and(|flag| flag == "--login") {
         login::run();
     }
+    if args.get(1).is_some_and(|flag| flag == "--uninstall") {
+        uninstall();
+        return Ok(());
+    }
     // Список «Без цензуры» с диска — до первого ответа Яндекса, в том числе для проверок.
     uncensor::start();
     if let [_, flag, path] = args.as_slice() {
@@ -13569,6 +13823,7 @@ fn main() -> iced::Result {
             "spoof" => Preview::Spoof,
             "uc-pick" => Preview::UcPick(Vec::new()),
             "splash" => Preview::Splash,
+            "news" => Preview::News,
             "customize" => Preview::Customize,
             what if what.starts_with("uc-pick:") => Preview::UcPick(what["uc-pick:".len()..].split(',').map(str::to_string).collect()),
             what if what.starts_with("spoof-album:") => Preview::SpoofOf(uncensor::Kind::Album, what["spoof-album:".len()..].to_string()),
