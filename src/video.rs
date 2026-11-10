@@ -156,6 +156,8 @@ struct Inner {
     backdrop: bool,
     /// Когда фон последний раз рисовался, в миллисекундах от `epoch()`.
     seen: AtomicU64,
+    /// Фон остановлен настройкой: стоит кадр, а стекло панелей всё равно его размывает.
+    hold: AtomicBool,
 }
 
 // mpv сам защищает свой объект, кадр — под замком.
@@ -334,6 +336,7 @@ impl Video {
             failed: Mutex::new(None),
             backdrop,
             seen: AtomicU64::new(epoch()),
+            hold: AtomicBool::new(false),
         });
         let api = c"sw";
         let mut params = [RenderParam { kind: PARAM_API_TYPE, data: api.as_ptr() as *mut c_void }, RenderParam { kind: PARAM_INVALID, data: std::ptr::null_mut() }];
@@ -399,6 +402,12 @@ impl Video {
         self.inner.command(&["loadfile", url, "replace", "-1", &format!("start={at:.2}")]);
     }
 
+    /// Остановить живой фон на текущем кадре или пустить дальше.
+    pub fn set_hold(&self, hold: bool) {
+        self.inner.hold.store(hold, Ordering::Relaxed);
+        self.inner.wake();
+    }
+
     /// Номер последнего кадра: меняется, когда пришла новая картинка.
     pub fn serial(&self) -> u64 {
         self.inner.serial.load(Ordering::SeqCst)
@@ -435,7 +444,7 @@ fn run(inner: &Inner) {
     loop {
         // Фон давно не рисовался — его не видно: пауза, пока не покажут снова.
         if inner.backdrop {
-            let hidden = epoch().saturating_sub(inner.seen.load(Ordering::Relaxed)) > BACKDROP_HIDDEN_MS;
+            let hidden = epoch().saturating_sub(inner.seen.load(Ordering::Relaxed)) > BACKDROP_HIDDEN_MS || inner.hold.load(Ordering::Relaxed);
             if hidden != asleep {
                 asleep = hidden;
                 inner.set("pause", if hidden { "yes" } else { "no" });
@@ -571,23 +580,26 @@ pub struct Pipeline {
     srgb: bool,
     /// Пустая текстура 1×1: фону без кадра она нужна для привязки.
     empty: Option<(wgpu::Texture, wgpu::BindGroup)>,
+    /// Размер ячейки параметров, если их несколько.
+    slot: Option<u64>,
 }
 
 impl shader::Pipeline for Pipeline {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
-        Pipeline::build(device, queue, format, SHADER, UNIFORMS)
+        Pipeline::build(device, queue, format, SHADER, UNIFORMS, None)
     }
 }
 
 impl Pipeline {
-    fn build(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, source: &str, uniforms_size: u64) -> Self {
+    /// `slot` — размер ячейки параметров, если их несколько (фон и панели), иначе `None`.
+    fn build(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, source: &str, uniforms_size: u64, slot: Option<u64>) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("video"), source: wgpu::ShaderSource::Wgsl(source.into()) });
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor { label: Some("video"), size: uniforms_size, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("video"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("video"),
             entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: slot.is_some(), min_binding_size: slot.and_then(wgpu::BufferSize::new) }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
             ],
@@ -609,7 +621,7 @@ impl Pipeline {
             multiview: None,
             cache: None,
         });
-        let mut built = Self { pipeline, uniforms, sampler, layout, texture: None, shown: (0, u64::MAX), ready: false, srgb: format.is_srgb(), empty: None };
+        let mut built = Self { pipeline, uniforms, sampler, layout, texture: None, shown: (0, u64::MAX), ready: false, srgb: format.is_srgb(), empty: None, slot };
         let (texture, bind) = built.texture_for(device, 1, 1);
         queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
@@ -639,7 +651,10 @@ impl Pipeline {
             label: Some("video"),
             layout: &self.layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: match self.slot {
+                    Some(size) => wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &self.uniforms, offset: 0, size: wgpu::BufferSize::new(size) }),
+                    None => self.uniforms.as_entire_binding(),
+                } },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             ],
@@ -759,9 +774,30 @@ fn epoch() -> u64 {
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
+/// Сколько места у одной ячейки параметров фона: фон и каждая стеклянная панель пишут свою.
+const SLOT_STRIDE: u64 = 256;
+const SLOT_SIZE: u64 = 8 * 16;
+/// Ячейки: 0 — фон окна, дальше панели.
+pub const SLOT_BACKDROP: u32 = 0;
+pub const SLOT_CONTENT: u32 = 1;
+pub const SLOT_PLAYER: u32 = 2;
+const SLOTS: u64 = 4;
+
+/// Стеклянная панель над фоном: под ней тот же кусок видео, что и на фоне, только
+/// размытый и подкрашенный. С `glass` — Liquid Glass: края преломляют фон, по кромке блики.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Panel {
+    pub radius: f32,
+    /// Цвет стекла, `a` — насколько оно плотное.
+    pub tint: iced::Color,
+    pub blur: f32,
+    /// Сила Liquid Glass от 0 до 1; 0 — обычное матовое стекло.
+    pub glass: f32,
+}
+
 /// Живой фон темы на всё окно: кадр видео как `cover` (обрезается по краям, `focus` — какая
-/// точка кадра остаётся в центре внимания), приглушённый под текст, и пузыри поверх. Без
-/// видео — только пузыри, под ними видна картинка темы.
+/// точка кадра остаётся на виду), приглушённый под текст, при желании размытый, и пузыри
+/// поверх. Тот же виджет с `panel` — стекло панели над этим фоном.
 pub struct Backdrop {
     inner: Option<Arc<Inner>>,
     /// Яркость и насыщенность кадра.
@@ -770,11 +806,20 @@ pub struct Backdrop {
     /// Сколько пузырей: 0 — без них.
     pub bubbles: f32,
     pub focus: (f32, f32),
+    /// Размытие фона в точках.
+    pub blur: f32,
+    panel: Option<Panel>,
+    slot: u32,
 }
 
 impl Backdrop {
     pub fn new(video: Option<&Video>) -> Self {
-        Backdrop { inner: video.map(|video| video.inner.clone()), bright: 0.62, saturation: 0.8, bubbles: 14.0, focus: (0.4, 0.5) }
+        Backdrop { inner: video.map(|video| video.inner.clone()), bright: 0.62, saturation: 0.8, bubbles: 14.0, focus: (0.4, 0.5), blur: 0.0, panel: None, slot: SLOT_BACKDROP }
+    }
+
+    /// Стекло панели над фоном `backdrop` (яркость, насыщенность и место кадра — его же).
+    pub fn panel(backdrop: &Backdrop, slot: u32, panel: Panel) -> Self {
+        Backdrop { inner: backdrop.inner.clone(), bubbles: 0.0, panel: Some(panel), slot, ..*backdrop }
     }
 }
 
@@ -783,7 +828,11 @@ impl<Message> shader::Program<Message> for Backdrop {
     type Primitive = BackdropPrimitive;
 
     fn update(&self, _: &mut (), event: &iced::Event, _: Rectangle, _: mouse::Cursor) -> Option<shader::Action<Message>> {
-        // Фон сам заказывает следующий кадр: интерфейс при этом не пересобирается.
+        // Фон сам заказывает следующий кадр: интерфейс при этом не пересобирается. Панели
+        // перерисовываются вместе с ним.
+        if self.panel.is_some() {
+            return None;
+        }
         let iced::Event::Window(iced::window::Event::RedrawRequested(now)) = event else { return None };
         if let Some(inner) = &self.inner {
             inner.seen.store(epoch(), Ordering::Relaxed);
@@ -792,7 +841,14 @@ impl<Message> shader::Program<Message> for Backdrop {
     }
 
     fn draw(&self, _: &(), _: mouse::Cursor, _: Rectangle) -> BackdropPrimitive {
-        BackdropPrimitive { inner: self.inner.clone(), look: [self.bright, self.saturation, self.bubbles, epoch() as f32 / 1000.0], focus: self.focus }
+        BackdropPrimitive {
+            inner: self.inner.clone(),
+            look: [self.bright, self.saturation, self.bubbles, (epoch() % 3_600_000) as f32 / 1000.0],
+            focus: self.focus,
+            blur: self.blur,
+            panel: self.panel,
+            slot: self.slot,
+        }
     }
 }
 
@@ -800,6 +856,9 @@ pub struct BackdropPrimitive {
     inner: Option<Arc<Inner>>,
     look: [f32; 4],
     focus: (f32, f32),
+    blur: f32,
+    panel: Option<Panel>,
+    slot: u32,
 }
 
 impl std::fmt::Debug for BackdropPrimitive {
@@ -808,12 +867,13 @@ impl std::fmt::Debug for BackdropPrimitive {
     }
 }
 
-/// Своё хранилище на видеокарте: фон и открытый клип рисуются одновременно.
+/// Своё хранилище на видеокарте: фон и открытый клип рисуются одновременно. Параметры —
+/// по ячейке на фон и каждую панель.
 pub struct BackdropPipeline(Pipeline);
 
 impl shader::Pipeline for BackdropPipeline {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
-        BackdropPipeline(Pipeline::build(device, queue, format, BACKDROP_SHADER, 4 * 16))
+        BackdropPipeline(Pipeline::build(device, queue, format, BACKDROP_SHADER, SLOT_STRIDE * SLOTS, Some(SLOT_SIZE)))
     }
 }
 
@@ -829,20 +889,26 @@ impl shader::Primitive for BackdropPrimitive {
         }
         let scale = viewport.scale_factor();
         let area = [bounds.x * scale, bounds.y * scale, bounds.width * scale, bounds.height * scale];
-        // Кадр закрывает всё окно, лишнее обрезается; точка `focus` кадра остаётся на виду.
+        let window = viewport.physical_size();
+        let (width, height) = (window.width as f32, window.height as f32);
+        // Кадр закрывает всё окно, лишнее обрезается; у панелей то же место кадра, что у фона.
         let picture = match pipeline.texture.as_ref() {
             Some((_, _, w, h)) => {
-                let fill = (area[2] / *w as f32).max(area[3] / *h as f32);
+                let fill = (width / *w as f32).max(height / *h as f32);
                 let (pw, ph) = (*w as f32 * fill, *h as f32 * fill);
-                [area[0] + (area[2] - pw) * self.focus.0, area[1] + (area[3] - ph) * self.focus.1, pw, ph]
+                [(width - pw) * self.focus.0, (height - ph) * self.focus.1, pw, ph]
             }
             None => [0.0; 4],
         };
-        pipeline.ready = pipeline.texture.is_some() && owner != 0 && owner == pipeline.shown.0 && serial > 0;
-        let has = if pipeline.ready { 1.0 } else { 0.0 };
-        let values: [[f32; 4]; 4] = [area, picture, [scale, has, 0.0, 0.0], self.look];
+        let ready = pipeline.texture.is_some() && owner != 0 && owner == pipeline.shown.0 && serial > 0;
+        let has = if ready { 1.0 } else { 0.0 };
+        let (mode, radius, tint, panel_blur, glass) = match self.panel {
+            Some(panel) => (1.0, panel.radius * scale, [panel.tint.r, panel.tint.g, panel.tint.b, panel.tint.a], panel.blur * scale, panel.glass),
+            None => (0.0, 0.0, [0.0; 4], 0.0, 0.0),
+        };
+        let values: [[f32; 4]; 8] = [area, picture, [scale, has, radius, mode], self.look, [self.blur * scale, panel_blur, glass, 0.0], tint, [width, height, 0.0, 0.0], [0.0; 4]];
         let bytes: Vec<u8> = values.iter().flatten().flat_map(|x| x.to_ne_bytes()).collect();
-        queue.write_buffer(&pipeline.uniforms, 0, &bytes);
+        queue.write_buffer(&pipeline.uniforms, u64::from(self.slot) * SLOT_STRIDE, &bytes);
     }
 
     fn draw(&self, pipeline: &BackdropPipeline, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
@@ -850,7 +916,7 @@ impl shader::Primitive for BackdropPrimitive {
         // Без кадра шейдеру всё равно нужна привязка: пустая текстура 1×1.
         let Some(bind) = pipeline.texture.as_ref().map(|(_, bind, ..)| bind).or(pipeline.empty.as_ref().map(|(_, bind)| bind)) else { return true };
         render_pass.set_pipeline(&pipeline.pipeline);
-        render_pass.set_bind_group(0, bind, &[]);
+        render_pass.set_bind_group(0, bind, &[(u64::from(self.slot) * SLOT_STRIDE) as u32]);
         render_pass.draw(0..3, 0..1);
         true
     }
@@ -860,8 +926,15 @@ const BACKDROP_SHADER: &str = r#"
 struct Uniforms {
     area: vec4<f32>,
     picture: vec4<f32>,
+    // масштаб, есть ли кадр, радиус панели, 0 — фон / 1 — панель
     extra: vec4<f32>,
+    // яркость, насыщенность, пузыри, время
     look: vec4<f32>,
+    // размытие фона, размытие панели, Liquid Glass
+    blur: vec4<f32>,
+    tint: vec4<f32>,
+    window: vec4<f32>,
+    spare: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -878,39 +951,60 @@ fn hash(n: f32) -> f32 {
     return fract(sin(n * 127.1 + 311.7) * 43758.5453);
 }
 
-@fragment
-fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let local = pos.xy - u.area.xy;
-    if (any(local < vec2<f32>(0.0)) || any(local > u.area.zw)) {
-        return vec4<f32>(0.0);
+// Шум для поворота узора размытия: без него при сильном размытии видны кольца.
+fn noise(p: vec2<f32>) -> f32 {
+    return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715))));
+}
+
+// Точка кадра под точкой окна, приглушённая в холодную бирюзу, как у темы в Tune Client.
+fn video(p: vec2<f32>) -> vec3<f32> {
+    let uv = clamp((p - u.picture.xy) / u.picture.zw, vec2<f32>(0.0), vec2<f32>(1.0));
+    let raw = textureSampleLevel(frame, smooth_, uv, 0.0).rgb;
+    let gray = dot(raw, vec3<f32>(0.299, 0.587, 0.114));
+    var tinted = mix(vec3<f32>(gray), raw, u.look.y) * u.look.x;
+    tinted = (tinted - 0.5) * 1.05 + 0.5;
+    // Края окна темнее, как в глубине аквариума.
+    let center = p / u.window.xy - vec2<f32>(0.45, 0.35);
+    let shade = mix(1.0, 0.65, clamp(length(center) / 0.9, 0.0, 1.0));
+    return clamp(tinted * shade, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// Размытие: 16 точек по спирали, узор повёрнут шумом.
+fn blurred(p: vec2<f32>, radius: f32, seed: vec2<f32>) -> vec3<f32> {
+    if (radius < 0.5) {
+        return video(p);
     }
-    var color = vec3<f32>(0.0);
-    var alpha = 0.0;
-    let uv = (pos.xy - u.picture.xy) / u.picture.zw;
-    if (u.extra.y > 0.5) {
-        let raw = textureSampleLevel(frame, smooth_, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).rgb;
-        // Как у темы в Tune Client: приглушить в холодную бирюзу, чуть контрастнее.
-        let gray = dot(raw, vec3<f32>(0.299, 0.587, 0.114));
-        var tinted = mix(vec3<f32>(gray), raw, u.look.y) * u.look.x;
-        tinted = (tinted - 0.5) * 1.05 + 0.5;
-        // Края темнее, как в глубине аквариума.
-        let center = local / u.area.zw - vec2<f32>(0.45, 0.35);
-        let shade = mix(1.0, 0.65, clamp(length(center) / 0.9, 0.0, 1.0));
-        color = clamp(tinted * shade, vec3<f32>(0.0), vec3<f32>(1.0));
-        alpha = 1.0;
+    var sum = vec3<f32>(0.0);
+    let turn = noise(seed) * 6.2831853;
+    for (var i = 0; i < 16; i = i + 1) {
+        let k = f32(i);
+        let angle = k * 2.3999632 + turn;
+        let r = radius * sqrt((k + 0.5) / 16.0);
+        sum = sum + video(p + vec2<f32>(cos(angle), sin(angle)) * r);
     }
-    // Пузыри: медленно поднимаются и покачиваются, у каждого свой путь и скорость.
-    let side = min(u.area.z, u.area.w);
+    return sum / 16.0;
+}
+
+// Расстояние до скруглённого прямоугольника: меньше нуля — внутри.
+fn rounded(p: vec2<f32>, half: vec2<f32>, r: f32) -> f32 {
+    let q = abs(p) - half + vec2<f32>(r);
+    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+fn bubbles(local: vec2<f32>, size: vec2<f32>, base: vec4<f32>) -> vec4<f32> {
+    var color = base.rgb;
+    var alpha = base.a;
+    let side = min(size.x, size.y);
     let count = i32(u.look.z);
     for (var i = 0; i < count; i = i + 1) {
         let n = f32(i);
         let period = 16.0 + hash(n) * 16.0;
         let phase = fract(u.look.w / period + hash(n + 7.0));
-        let sway = (hash(n + 3.0) * 2.0 - 1.0) * 0.09 * u.area.z;
-        let lift = phase * 1.15 * u.area.w;
+        let sway = (hash(n + 3.0) * 2.0 - 1.0) * 0.09 * size.x;
+        let lift = phase * 1.15 * size.y;
         let drift = sway * sin(phase * 3.14159);
         let radius = side * 0.011 * (0.6 + hash(n + 11.0) * 1.2);
-        let center = vec2<f32>(hash(n + 5.0) * u.area.z + drift, u.area.w * 1.08 - lift);
+        let center = vec2<f32>(hash(n + 5.0) * size.x + drift, size.y * 1.08 - lift);
         let offset = local - center;
         let d = length(offset) / radius;
         if (d < 1.4) {
@@ -926,6 +1020,80 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         }
     }
     return vec4<f32>(color, alpha);
+}
+
+fn backdrop(pos: vec2<f32>) -> vec4<f32> {
+    let local = pos - u.area.xy;
+    if (any(local < vec2<f32>(0.0)) || any(local > u.area.zw)) {
+        return vec4<f32>(0.0);
+    }
+    var base = vec4<f32>(0.0);
+    if (u.extra.y > 0.5) {
+        base = vec4<f32>(blurred(pos, u.blur.x, pos), 1.0);
+    }
+    return bubbles(local, u.area.zw, base);
+}
+
+fn panel(pos: vec2<f32>) -> vec4<f32> {
+    let half = u.area.zw * 0.5;
+    let q = pos - u.area.xy - half;
+    let r = u.extra.z;
+    let d = rounded(q, half, r);
+    let inside = clamp(0.5 - d, 0.0, 1.0);
+    if (inside <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    let scale = u.extra.x;
+    let glass = u.blur.z;
+    // Наружу от края: по разнице расстояний в соседних точках.
+    let e = 1.0;
+    let normal = normalize(vec2<f32>(rounded(q + vec2<f32>(e, 0.0), half, r) - rounded(q - vec2<f32>(e, 0.0), half, r), rounded(q + vec2<f32>(0.0, e), half, r) - rounded(q - vec2<f32>(0.0, e), half, r)) + vec2<f32>(1e-5));
+    // 0 у самого края, 1 — дальше полосы преломления.
+    let depth = clamp(-d / (44.0 * scale), 0.0, 1.0);
+    let lens = pow(1.0 - depth, 2.0);
+    // Liquid Glass прозрачнее матового стекла: фон за ним виден, а держит форму кромка.
+    let density = u.tint.a * (1.0 - 0.55 * glass);
+    var color = u.tint.rgb;
+    if (u.extra.y > 0.5) {
+        // Liquid Glass: у края фон тянется внутрь, как в толстом стекле, и расслаивается по цветам.
+        let p = pos - normal * lens * 70.0 * scale * glass;
+        let spread = lens * 6.0 * scale * glass;
+        // Посередине стекло чище, размытие сильнее к краю.
+        let soft = u.blur.y * mix(1.0, 0.6 + 0.4 * lens, glass);
+        var seen = blurred(p, soft, pos);
+        if (spread > 0.35) {
+            seen = vec3<f32>(blurred(p - normal * spread, soft, pos).r, seen.g, blurred(p + normal * spread, soft, pos).b);
+        }
+        color = mix(seen, u.tint.rgb, density);
+    }
+    if (glass > 0.0) {
+        let y = (pos.y - u.area.y) / u.area.w;
+        // Мягкий блик сверху и бирюзовое свечение снизу, как свет над водой.
+        color = color + vec3<f32>(1.0) * 0.06 * glass * (1.0 - smoothstep(0.0, 0.35, y));
+        color = color + vec3<f32>(0.47, 0.94, 0.88) * 0.08 * glass * smoothstep(0.7, 1.0, y);
+        // Кромка: яркая там, куда падает свет (сверху слева), слабее напротив.
+        let light = normalize(vec2<f32>(-0.55, -0.85));
+        let band = 1.0 - smoothstep(0.0, 2.5 * scale, -d);
+        let wide = 1.0 - smoothstep(0.0, 14.0 * scale, -d);
+        let spec = pow(max(dot(normal, light), 0.0), 1.6);
+        let back = pow(max(dot(normal, -light), 0.0), 2.0);
+        // Вторая, тонкая кромка чуть внутри: у толстого стекла их две.
+        let inner = (1.0 - smoothstep(0.0, 1.2 * scale, abs(-d - 5.0 * scale)));
+        color = color + vec3<f32>(1.0) * band * (0.9 * spec + 0.18) * glass;
+        color = color + vec3<f32>(0.63, 1.0, 0.94) * band * back * 0.45 * glass;
+        color = color + vec3<f32>(1.0) * inner * (0.25 * spec + 0.05) * glass;
+        color = color + vec3<f32>(1.0) * wide * spec * 0.08 * glass;
+    }
+    color = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));
+    return vec4<f32>(color * inside, inside);
+}
+
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    if (u.extra.w > 0.5) {
+        return panel(pos.xy);
+    }
+    return backdrop(pos.xy);
 }
 "#;
 

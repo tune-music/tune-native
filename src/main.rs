@@ -64,7 +64,7 @@ use api::{Album, AlbumKind, Artist, Card, Found, Home, HomeBlock, HomeItem, Pin,
 use media::Media;
 use player::Player;
 use raw_window_handle::RawWindowHandle;
-use settings::{Skin, Look, Quality, Repeat, Settings};
+use settings::{AquariumPrefs, GlassPrefs, Skin, Look, Quality, Repeat, Settings};
 
 /// Шаг перерисовки, пока идёт клип и больше ничего не движется.
 const CLIP_FRAME: Duration = Duration::from_micros(16_667);
@@ -481,6 +481,8 @@ enum Section {
     Concerts,
     /// Страница одного концерта.
     Concert,
+    /// Темы с превью, их настройки и Liquid Glass.
+    Customize,
 }
 
 /// Карусель, у которой есть «Показать все».
@@ -660,6 +662,27 @@ fn spoof_search(which: SpoofList, text: &str, token: &str) -> Result<Vec<SpoofIt
         }
     })
 }
+
+/// Переключатели темы Aquarium.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AquaSwitch {
+    Live,
+    Bubbles,
+}
+
+/// Ползунки «Кастомизации».
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AquaKnob {
+    Dim,
+    BackdropBlur,
+    PanelBlur,
+    PanelDensity,
+    GlassStrength,
+}
+
+/// Самое сильное размытие фона и панелей, в точках.
+const BACKDROP_BLUR_MAX: f32 = 24.0;
+const PANEL_BLUR_MAX: f32 = 40.0;
 
 /// Что с треком в «Без цензуры на всех устройствах».
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1014,7 +1037,7 @@ struct TabMemory {
 
 /// Корни вкладок боковой панели: у каждой своя история, как у вкладок браузера.
 fn is_tab(section: Section) -> bool {
-    matches!(section, Section::Home | Section::Search | Section::Wave | Section::Books | Section::Kids | Section::Concerts | Section::Collection | Section::Settings)
+    matches!(section, Section::Home | Section::Search | Section::Wave | Section::Books | Section::Kids | Section::Concerts | Section::Collection | Section::Settings | Section::Customize)
 }
 
 /// Текст песни и очередь открываются поверх страницы и сменяют друг друга, а не копятся в истории.
@@ -1145,6 +1168,7 @@ enum Preview {
     UcPick(Vec<String>),
     /// Экран загрузки, не уходит.
     Splash,
+    Customize,
     Account,
     LogoutAsk,
     /// Вкладка настроек.
@@ -1440,7 +1464,8 @@ struct App {
     lyrics_sources: lyrics::Sources,
     lyrics_size: u8,
     skin: Skin,
-    live_backdrop: bool,
+    aquarium: AquariumPrefs,
+    glass: GlassPrefs,
     /// Видео живого фона темы; `None` — фон неподвижный.
     backdrop: Option<video::Video>,
     backdrop_loading: bool,
@@ -2029,7 +2054,11 @@ enum Message {
     SpoofTrack(Result<Vec<Track>, String>),
     SpoofLists(String, Result<SpoofLists, String>),
     SkinSet(Skin),
-    LiveBackdropToggle,
+    AquaToggle(AquaSwitch),
+    AquaSet(AquaKnob, f32),
+    GlassToggle,
+    /// Ползунок отпустили: настройки на диск.
+    CustomSave,
     BackdropReady(Result<std::path::PathBuf, String>),
     /// Загрузить версию без цензуры в «Загруженное»: сначала сверка с ним.
     UcUpload(Vec<Track>),
@@ -2264,7 +2293,8 @@ impl App {
             lyrics_sources: saved.lyrics,
             lyrics_size: saved.lyrics_size,
             skin: saved.skin,
-            live_backdrop: saved.live_backdrop,
+            aquarium: saved.aquarium,
+            glass: GlassPrefs { on: saved.glass.on || std::env::var_os("TUNE_GLASS").is_some(), ..saved.glass },
             backdrop: None,
             backdrop_loading: false,
             // Экран загрузки, пока не пришёл аккаунт. У предпросмотров его нет: им нужна страница.
@@ -2555,19 +2585,24 @@ impl App {
     }
 
     /// Тема меняется сразу: стили читают её при каждой отрисовке. Заголовок окна — тоже.
-    /// Живой фон нужен: тема Aquarium, он включён и не лёгкая версия.
-    fn backdrop_live(&self) -> bool {
-        self.skin == Skin::Aquarium && self.live_backdrop && !self.lite
+    /// Видео фона стоит на одном кадре: живой фон выключен или лёгкая версия. Кадр нужен и
+    /// тогда — его размывает стекло панелей.
+    fn backdrop_hold(&self) -> bool {
+        !self.aquarium.live || self.lite
     }
 
     /// Запускает или гасит видео фона под текущие настройки. Видео темы при первом
     /// включении копируется из Tune Client или скачивается.
     fn backdrop_load(&mut self) -> Task<Message> {
-        if !self.backdrop_live() {
+        if self.skin != Skin::Aquarium {
             self.backdrop = None;
             return Task::none();
         }
-        if self.backdrop.is_some() || self.backdrop_loading {
+        if let Some(video) = &self.backdrop {
+            video.set_hold(self.backdrop_hold());
+            return Task::none();
+        }
+        if self.backdrop_loading {
             return Task::none();
         }
         self.backdrop_loading = true;
@@ -2648,7 +2683,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, skin: self.skin, live_backdrop: self.live_backdrop, keep_track: self.keep_track, own_in_wave: self.own_in_wave, restored_in_wave: self.restored_in_wave, uncensor: self.uncensor, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb, lyrics: self.lyrics_sources, lyrics_size: self.lyrics_size });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, skin: self.skin, aquarium: self.aquarium, glass: self.glass, keep_track: self.keep_track, own_in_wave: self.own_in_wave, restored_in_wave: self.restored_in_wave, uncensor: self.uncensor, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb, lyrics: self.lyrics_sources, lyrics_size: self.lyrics_size });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -4604,7 +4639,7 @@ impl App {
             Section::Dislikes => &self.disliked_list,
             Section::Downloads => &self.download_tracks,
             Section::Queue => self.current.and_then(|i| self.queue.get(i + 1..)).unwrap_or(&[]),
-            Section::Lyrics | Section::Settings | Section::Clips | Section::Concerts => &[],
+            Section::Lyrics | Section::Settings | Section::Customize | Section::Clips | Section::Concerts => &[],
             Section::Concert => self.concert.as_ref().map_or(&[], |page| page.tracks.as_slice()),
             Section::Search => &self.results,
         }
@@ -4896,7 +4931,7 @@ impl App {
             Section::Likes | Section::Playlists if self.filtering() => true,
             Section::Home | Section::Books | Section::Kids | Section::Landing => self.home_page == self.section && !self.home.blocks.is_empty(),
             Section::Wave => self.current_track().is_some(),
-            Section::Collection | Section::Settings => true,
+            Section::Collection | Section::Settings | Section::Customize => true,
             Section::Lyrics => self.lyrics.as_ref().is_some_and(|(id, _)| self.current_track().is_some_and(|track| track.id == *id)),
             Section::Albums => !self.liked_albums.is_empty(),
             Section::Artists => !self.liked_artists.is_empty(),
@@ -5046,6 +5081,7 @@ impl App {
                     Some(Preview::Likes | Preview::LikesEnd | Preview::LikesAt(_) | Preview::Menu | Preview::Panels | Preview::TrackInfo | Preview::Spoof | Preview::QueueJump) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
                     Some(Preview::Splash) => Task::none(),
+                    Some(Preview::Customize) => self.update(Message::Open(Section::Customize)),
                     Some(Preview::UcPick(ids)) => {
                         let open = self.update(Message::Open(Section::Likes));
                         let ids = if ids.is_empty() { self.liked_ids.clone() } else { ids };
@@ -7581,16 +7617,37 @@ impl App {
                 self.save_settings();
                 return self.backdrop_load();
             }
-            Message::LiveBackdropToggle => {
-                self.live_backdrop = !self.live_backdrop;
+            Message::AquaToggle(switch) => {
+                match switch {
+                    AquaSwitch::Live => self.aquarium.live = !self.aquarium.live,
+                    AquaSwitch::Bubbles => self.aquarium.bubbles = !self.aquarium.bubbles,
+                }
                 self.save_settings();
                 return self.backdrop_load();
             }
+            Message::AquaSet(knob, value) => {
+                let value = value.clamp(0.0, 1.0);
+                match knob {
+                    AquaKnob::Dim => self.aquarium.dim = value,
+                    AquaKnob::BackdropBlur => self.aquarium.backdrop_blur = value,
+                    AquaKnob::PanelBlur => self.aquarium.panel_blur = value,
+                    AquaKnob::PanelDensity => self.aquarium.panel_density = value,
+                    AquaKnob::GlassStrength => self.glass.strength = value,
+                }
+            }
+            Message::GlassToggle => {
+                self.glass.on = !self.glass.on;
+                self.save_settings();
+            }
+            Message::CustomSave => self.save_settings(),
             Message::BackdropReady(result) => {
                 self.backdrop_loading = false;
                 match result {
-                    Ok(path) if self.backdrop_live() => match video::Video::backdrop(&path.to_string_lossy()) {
-                        Ok(video) => self.backdrop = Some(video),
+                    Ok(path) if self.skin == Skin::Aquarium => match video::Video::backdrop(&path.to_string_lossy()) {
+                        Ok(video) => {
+                            video.set_hold(self.backdrop_hold());
+                            self.backdrop = Some(video);
+                        }
                         // Нет видеоплеера: остаётся картинка темы.
                         Err(e) => api::log(&format!("Живой фон: {e}")),
                     },
@@ -8407,7 +8464,7 @@ impl App {
         let since = self.splash.map_or(0.0, |(shown, _)| shown.elapsed().as_secs_f32());
         let rise = anim::ease_out((since / 0.5).min(1.0));
         let alpha = level * rise;
-        let mark: Element<'_, Message> = if ui::aquarium() { iced::widget::svg(skin::logo()).width(72).height(72).opacity(alpha).into() } else { image(logo).width(72).height(72).opacity(alpha).into() };
+        let mark = image(logo).width(72).height(72).opacity(alpha);
         let name = text("Tune").size(30).font(ui::font_medium()).color(ui::c().strong.scale_alpha(alpha));
         // Полоса: блик пробегает за 1,1 секунды, с разгоном и торможением.
         let cycle = (since % 1.1) / 1.1;
@@ -8438,18 +8495,33 @@ impl App {
         }
         let poster = image(skin::poster()).content_fit(iced::ContentFit::Cover).width(Length::Fill).height(Length::Fill);
         // Картинку приглушаем так же, как видео: переход с неё на видео незаметен.
-        let dim = container(Space::new()).width(Length::Fill).height(Length::Fill).style(|_| container::Style::default().background(iced::Color::from_rgba8(3, 30, 40, 0.45)));
-        let mut layers = stack![poster, dim];
-        if !self.lite {
-            let mut backdrop = video::Backdrop::new(self.backdrop.as_ref().filter(|_| self.backdrop_live()));
-            if !self.live_backdrop {
-                backdrop.bubbles = 0.0;
-            }
-            if self.live_backdrop {
-                layers = layers.push(iced::widget::shader(backdrop).width(Length::Fill).height(Length::Fill));
-            }
+        let shade = 0.1 + self.aquarium.dim * 0.85;
+        let dim = container(Space::new()).width(Length::Fill).height(Length::Fill).style(move |_| container::Style::default().background(iced::Color::from_rgba8(3, 30, 40, shade)));
+        Some(stack![poster, dim, iced::widget::shader(self.backdrop_program()).width(Length::Fill).height(Length::Fill)].into())
+    }
+
+    /// Фон темы с настройками: из него же стекло панелей берёт кадр, яркость и размытие.
+    fn backdrop_program(&self) -> video::Backdrop {
+        let mut backdrop = video::Backdrop::new(self.backdrop.as_ref());
+        backdrop.bright = 1.0 - self.aquarium.dim * 0.9;
+        backdrop.blur = self.aquarium.backdrop_blur * BACKDROP_BLUR_MAX;
+        if !self.aquarium.bubbles || self.lite {
+            backdrop.bubbles = 0.0;
         }
-        Some(layers.into())
+        backdrop
+    }
+
+    /// Стекло под панелью темы: размытый кусок фона, а с Liquid Glass — и преломление.
+    /// `extra` — насколько эта панель плотнее основной (плеер чуть плотнее страницы).
+    fn under_glass<'a>(&self, panel: Element<'a, Message>, slot: u32, extra: f32) -> Element<'a, Message> {
+        if self.skin != Skin::Aquarium {
+            return panel;
+        }
+        let navy = iced::Color::from_rgb8(6, 46, 58);
+        let tint = iced::Color { a: (0.1 + self.aquarium.panel_density * 0.8 + extra).min(0.97), ..navy };
+        let glass = if self.glass.on { 0.2 + self.glass.strength * 0.8 } else { 0.0 };
+        let program = video::Backdrop::panel(&self.backdrop_program(), slot, video::Panel { radius: 12.0, tint, blur: self.aquarium.panel_blur * PANEL_BLUR_MAX, glass });
+        stack![panel].push_under(iced::widget::shader(program).width(Length::Fill).height(Length::Fill)).into()
     }
 
     fn view_login(&self, opened: bool) -> Element<'_, Message> {
@@ -8473,6 +8545,7 @@ impl App {
             Section::Queue => self.view_queue(),
             Section::Lyrics => self.view_lyrics(),
             Section::Settings => self.view_settings(),
+            Section::Customize => self.view_customize(),
             Section::Discography => self.view_discography(),
             Section::Tag => self.view_tag(),
             Section::Block => self.view_block(),
@@ -8561,9 +8634,10 @@ impl App {
             }
             page = page.push(container(line).width(Length::Fill).padding([10, 16]).style(ui::tile));
         }
-        let mut main = column![container(page).padding(24).width(Length::Fill).height(Length::Fill).style(ui::content).clip(true)].spacing(12);
+        let page = container(page).padding(24).width(Length::Fill).height(Length::Fill).style(ui::content).clip(true);
+        let mut main = column![self.under_glass(page.into(), video::SLOT_CONTENT, 0.0)].spacing(12);
         if let Some(bar) = self.view_bar() {
-            main = main.push(bar);
+            main = main.push(self.under_glass(bar, video::SLOT_PLAYER, 0.12));
         }
         let main: Element<'_, Message> = container(main).padding(Padding::ZERO.right(12).bottom(12)).width(Length::Fill).height(Length::Fill).into();
         let columns = column![Space::new().height(caption::HEIGHT), row![self.view_sidebar(), main]];
@@ -9630,8 +9704,7 @@ impl App {
         let active = caption::active();
         let tint = if active { ui::c().text } else { ui::c().muted };
         let label = self.track_caption(self.window_prefs.track_title);
-        let mark: Element<'_, Message> = if ui::aquarium() { iced::widget::svg(skin::logo()).width(16).height(16).into() } else { image(logo).width(16).height(16).into() };
-        let name = row![mark, text(label).size(12).color(tint).wrapping(Wrapping::None)].spacing(10).align_y(Alignment::Center);
+        let name = row![image(logo).width(16).height(16), text(label).size(12).color(tint).wrapping(Wrapping::None)].spacing(10).align_y(Alignment::Center);
         let name = container(name).padding(Padding::ZERO.left(14)).width(Length::Fill).height(Length::Fill).align_y(Alignment::Center).clip(true);
         let zoomed = self.hwnd.is_some_and(caption::zoomed);
         let (max_hover, max_pressed) = caption::max_state();
@@ -9704,6 +9777,7 @@ impl App {
                 .extend(self.kids.then(|| item(ui::KIDS, "Детям", Section::Kids)))
                 .extend(self.concerts_tab.then(|| item(ui::CONCERTS, "Концерты", Section::Concerts)))
                 .push(item(ui::COLLECTION, "Коллекция", Section::Collection))
+                .push(item(ui::PALETTE, "Кастомизация", Section::Customize))
                 .spacing(4),
                 Space::new().height(16),
                 // Закреплённого бывает больше, чем помещается в низкое окно: оно листается,
@@ -10046,14 +10120,12 @@ impl App {
                 let looks = Look::ALL.into_iter().fold(row![].spacing(8), |line, look| line.push(choice(look.label(), look == self.look, Message::LookSet(look))));
                 column![
                     column![title("Оформление"), looks].spacing(12),
-                    {
-                        let skins = Skin::ALL.into_iter().fold(row![].spacing(8), |line, skin| line.push(choice(skin.label(), skin == self.skin, Message::SkinSet(skin))));
-                        let mut items = column![title("Тема"), skins].spacing(12);
-                        if self.skin == Skin::Aquarium {
-                            items = items.push(toggle("Живой фон", "Аквариум с обложки sqwore плывёт на фоне, поднимаются пузыри. Выключите, если не хватает мощности: останется картинка. Тема всегда тёмная", Some(self.live_backdrop), Some(Message::LiveBackdropToggle)));
-                        }
-                        items
-                    },
+                    column![
+                        title("Темы"),
+                        text("Темы, их настройки и Liquid Glass — в разделе «Кастомизация»").color(ui::c().muted),
+                        row![link("Открыть кастомизацию", Message::Open(Section::Customize))],
+                    ]
+                    .spacing(12),
                     column![toggle("Включить lite-версию", "Визуальные эффекты и анимации будут загружаться в облегчённом формате", Some(self.lite), Some(Message::LiteToggle))].spacing(12),
                     group("Боковая панель", vec![
                         toggle("Книги и подкасты", "Пункт «Книги и подкасты» в боковой панели: аудиокниги, подкасты и выпуски", Some(self.books_tab), Some(Message::BooksToggle)),
@@ -10210,6 +10282,102 @@ impl App {
         let body = container(content).max_width(700).padding(Padding::ZERO.right(20));
         let scroll = ui::scroll(body).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill);
         column![head, scroll].spacing(24).height(Length::Fill).into()
+    }
+
+    /// «Кастомизация»: темы карточками с превью, настройки выбранной темы и Liquid Glass.
+    fn view_customize(&self) -> Element<'_, Message> {
+        let title = |label| text(label).size(20).font(ui::font_medium()).color(ui::c().text);
+        let toggle = |label: &'static str, about: &'static str, on: bool, press: Option<Message>| -> Element<'_, Message> {
+            let line = row![column![text(label).color(ui::c().text), text(about).size(13).color(ui::c().muted)].spacing(2).width(Length::Fill), view_switch(Some(on))].spacing(16).align_y(Alignment::Center);
+            glow(button(line).width(Length::Fill).padding(8).style(ui::row).on_press_maybe(press), 8.0)
+        };
+        // Ползунок: название, значение и полоса, как громкость в плеере.
+        let knob = |label: &'static str, shown: String, value: f32, set: fn(f32) -> Message| -> Element<'_, Message> {
+            let line = row![
+                column![text(label).color(ui::c().text), text(shown).size(13).color(ui::c().muted)].spacing(2).width(Length::Fill),
+                canvas(seek::Seek { value, total: 1.0, on_change: set, on_done: Some(Message::CustomSave) }).width(240).height(SEEK_HEIGHT),
+            ]
+            .spacing(16)
+            .align_y(Alignment::Center);
+            container(line).padding(8).into()
+        };
+        let cards = Skin::ALL.into_iter().fold(row![].spacing(16), |cards, skin| cards.push(self.skin_card(skin)));
+        let mut body = column![column![title("Темы"), cards.wrap().vertical_spacing(16)].spacing(12)].spacing(28);
+        if self.skin == Skin::Aquarium {
+            let aq = self.aquarium;
+            let percent = |value: f32| format!("{:.0}%", value * 100.0);
+            let points = |value: f32, max: f32| if value * max < 0.5 { "Нет".to_string() } else { format!("{:.0} точек", value * max) };
+            body = body.push(column![
+                title("Aquarium"),
+                toggle("Живой фон", "Аквариум с обложки sqwore плывёт на фоне. Выключите, если не хватает мощности: останется один кадр", aq.live, Some(Message::AquaToggle(AquaSwitch::Live))),
+                toggle("Пузыри", "Медленно поднимаются по фону", aq.bubbles, Some(Message::AquaToggle(AquaSwitch::Bubbles))),
+                knob("Затемнение фона", percent(aq.dim), aq.dim, |v| Message::AquaSet(AquaKnob::Dim, v)),
+                knob("Размытие фона", points(aq.backdrop_blur, BACKDROP_BLUR_MAX), aq.backdrop_blur, |v| Message::AquaSet(AquaKnob::BackdropBlur, v)),
+                knob("Размытие панелей", points(aq.panel_blur, PANEL_BLUR_MAX), aq.panel_blur, |v| Message::AquaSet(AquaKnob::PanelBlur, v)),
+                knob("Плотность панелей", percent(aq.panel_density), aq.panel_density, |v| Message::AquaSet(AquaKnob::PanelDensity, v)),
+            ].spacing(8));
+        }
+        let mut glass = column![
+            title("Liquid Glass"),
+            toggle("Liquid Glass", "Панели как стекло Apple: края преломляют фон, цвета на кромке расслаиваются, сверху блик. Работает в темах с фоном — сейчас это Aquarium", self.glass.on, (self.skin == Skin::Aquarium).then_some(Message::GlassToggle)),
+        ]
+        .spacing(8);
+        if self.glass.on && self.skin == Skin::Aquarium {
+            glass = glass.push(knob("Сила преломления", format!("{:.0}%", self.glass.strength * 100.0), self.glass.strength, |v| Message::AquaSet(AquaKnob::GlassStrength, v)));
+        }
+        let body = body.push(glass);
+        let head = text("Кастомизация").size(36).font(ui::font_headline()).color(ui::c().text);
+        let scroll = ui::scroll(container(body).max_width(760).padding(Padding::ZERO.right(20))).id(LIST).on_scroll(|viewport| Message::Scrolled(viewport.absolute_offset().y)).width(Length::Fill).height(Length::Fill);
+        column![head, scroll].spacing(24).height(Length::Fill).into()
+    }
+
+    /// Карточка темы: уменьшенное окно Tune в её цветах, название и описание.
+    fn skin_card(&self, skin: Skin) -> Element<'_, Message> {
+        let colors = match skin {
+            Skin::Standard => &ui::DARK,
+            Skin::Aquarium => &ui::AQUARIUM,
+        };
+        let (width, height) = (300.0, 188.0);
+        let back: Element<'_, Message> = match skin {
+            Skin::Standard => container(Space::new()).width(Length::Fill).height(Length::Fill).style(move |_| container::Style::default().background(colors.base)).into(),
+            Skin::Aquarium => stack![
+                image(skin::poster()).content_fit(iced::ContentFit::Cover).width(Length::Fill).height(Length::Fill),
+                container(Space::new()).width(Length::Fill).height(Length::Fill).style(|_| container::Style::default().background(iced::Color::from_rgba8(3, 30, 40, 0.35))),
+            ]
+            .into(),
+        };
+        let panel_fill = match skin {
+            Skin::Standard => colors.content,
+            Skin::Aquarium => iced::Color::from_rgba8(6, 46, 58, 0.55),
+        };
+        let line = move |w: f32, tint: iced::Color| container(Space::new()).width(w).height(5).style(move |_| container::Style::default().background(tint).border(iced::border::rounded(3)));
+        let rows = (0..4).fold(column![].spacing(9), |rows, i| rows.push(row![container(Space::new()).width(16).height(16).style(move |_| container::Style::default().background(colors.tile).border(iced::border::rounded(3))), column![line(90.0 - i as f32 * 12.0, colors.text.scale_alpha(0.8)), line(56.0, colors.muted)].spacing(4)].spacing(8).align_y(Alignment::Center)));
+        let edge = match skin {
+            Skin::Standard => colors.control,
+            Skin::Aquarium => iced::Color { r: 220.0 / 255.0, g: 1.0, b: 250.0 / 255.0, a: 0.25 },
+        };
+        let panel = move |content: Element<'static, Message>| container(content).padding(10).style(move |_| container::Style::default().background(panel_fill).border(iced::Border { color: edge, width: 1.0, radius: 7.0.into() }));
+        let side = column![line(34.0, colors.accent), line(42.0, colors.text.scale_alpha(0.7)), line(36.0, colors.text.scale_alpha(0.7)), line(40.0, colors.text.scale_alpha(0.7))].spacing(10).padding([12, 10]).width(62);
+        let play = container(Space::new()).width(14).height(14).style(move |_| container::Style::default().background(colors.accent).border(iced::border::rounded(7)));
+        let bar = panel(row![line(60.0, colors.text.scale_alpha(0.8)), Space::new().width(Length::Fill), play, Space::new().width(Length::Fill)].align_y(Alignment::Center).into()).width(Length::Fill).height(30).padding([0, 10]).center_y(30);
+        let mock = column![row![side, panel(rows.into()).width(Length::Fill).height(Length::Fill)].height(Length::Fill), bar].spacing(6).padding(Padding::ZERO.right(8).bottom(8).top(8));
+        let preview = container(stack![back, mock]).width(width).height(height).clip(true).style(|_| container::Style::default().border(iced::border::rounded(10)));
+        let chosen = self.skin == skin;
+        let about = match skin {
+            Skin::Standard => "Как в Яндекс Музыке: тёмная, светлая или как в системе",
+            Skin::Aquarium => "Живой аквариум с обложки sqwore, бирюзовое стекло и пузыри",
+        };
+        let mut name = row![text(skin.label()).font(ui::font_medium()).color(ui::c().text)].spacing(8).align_y(Alignment::Center);
+        if chosen {
+            name = name.push(container(text("Выбрана").size(12).color(ui::c().on_accent)).padding([1, 8]).style(|_| container::Style::default().background(ui::c().accent).border(iced::border::rounded(8))));
+        }
+        let card = column![
+            container(preview).padding(3).style(move |_| container::Style::default().border(iced::Border { color: if chosen { ui::c().accent } else { iced::Color::TRANSPARENT }, width: 2.0, radius: 13.0.into() })),
+            name,
+            text(about).size(13).color(ui::c().muted).width(width),
+        ]
+        .spacing(8);
+        glow(button(card).padding(6).style(ui::card).on_press(Message::SkinSet(skin)), 14.0)
     }
 
     /// Вкладка «Discord»: те же пункты, что у Tune Client.
@@ -13397,6 +13565,7 @@ fn main() -> iced::Result {
             "spoof" => Preview::Spoof,
             "uc-pick" => Preview::UcPick(Vec::new()),
             "splash" => Preview::Splash,
+            "customize" => Preview::Customize,
             what if what.starts_with("uc-pick:") => Preview::UcPick(what["uc-pick:".len()..].split(',').map(str::to_string).collect()),
             what if what.starts_with("spoof-album:") => Preview::SpoofOf(uncensor::Kind::Album, what["spoof-album:".len()..].to_string()),
             what if what.starts_with("spoof-artist:") => Preview::SpoofOf(uncensor::Kind::Artist, what["spoof-artist:".len()..].to_string()),

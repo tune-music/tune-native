@@ -235,6 +235,7 @@ pub const HOME: Glyph = Glyph { path: "M12 3 3 10.5V21h6v-6h6v6h6V10.5z", origin
 pub const LEFT: Glyph = Glyph { path: "M15.4 6.4 14 5l-7 7 7 7 1.4-1.4L9.8 12z", original: "arrowLeft_xs", selected: "" };
 pub const RIGHT: Glyph = Glyph { path: "M8.6 6.4 10 5l7 7-7 7-1.4-1.4 5.6-5.6z", original: "arrowRight_xs", selected: "" };
 pub const UPLOAD: Glyph = Glyph { path: "M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z", original: "", selected: "" };
+pub const PALETTE: Glyph = Glyph { path: "M12 3a9 9 0 0 0 0 18c.83 0 1.5-.67 1.5-1.5 0-.39-.15-.74-.39-1.01-.23-.26-.38-.61-.38-.99 0-.83.67-1.5 1.5-1.5H16c2.76 0 5-2.24 5-5 0-4.42-4.03-8-9-8zm-5.5 9c-.83 0-1.5-.67-1.5-1.5S5.67 9 6.5 9 8 9.67 8 10.5 7.33 12 6.5 12zm3-4C8.67 8 8 7.33 8 6.5S8.67 5 9.5 5s1.5.67 1.5 1.5S10.33 8 9.5 8zm5 0c-.83 0-1.5-.67-1.5-1.5S13.67 5 14.5 5s1.5.67 1.5 1.5S15.33 8 14.5 8zm3 4c-.83 0-1.5-.67-1.5-1.5S16.67 9 17.5 9s1.5.67 1.5 1.5-.67 1.5-1.5 1.5z", original: "", selected: "" };
 pub const PLUS: Glyph = Glyph { path: "M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6z", original: "add_xs", selected: "" };
 pub const PIN: Glyph = Glyph { path: "M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z", original: "pin_xs", selected: "pin_filled_xs" };
 pub const UP: Glyph = Glyph { path: "M7.41 15.41 12 10.83l4.59 4.58L18 14l-6-6-6 6z", original: "arrowUp_xs", selected: "" };
@@ -351,13 +352,17 @@ pub fn root(_: &Theme) -> container::Style {
 }
 
 pub fn content(_: &Theme) -> container::Style {
-    let edge = if aquarium() { AQUARIUM_RIM } else { c().control };
-    container::Style { border: Border { color: edge, width: 1.0, radius: 12.0.into() }, ..fill(c().content) }
+    if aquarium() {
+        return container::Style { border: Border { color: AQUARIUM_RIM, width: 1.0, radius: 12.0.into() }, ..fill(Color::TRANSPARENT) };
+    }
+    container::Style { border: Border { color: c().control, width: 1.0, radius: 12.0.into() }, ..fill(c().content) }
 }
 
 pub fn player(_: &Theme) -> container::Style {
-    let border = if aquarium() { Border { color: AQUARIUM_RIM, width: 1.0, radius: 12.0.into() } } else { border::rounded(12) };
-    container::Style { border, ..fill(c().player) }
+    if aquarium() {
+        return container::Style { border: Border { color: AQUARIUM_RIM, width: 1.0, radius: 12.0.into() }, ..fill(Color::TRANSPARENT) };
+    }
+    container::Style { border: border::rounded(12), ..fill(c().player) }
 }
 
 pub fn tile(_: &Theme) -> container::Style {

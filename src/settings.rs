@@ -60,6 +60,44 @@ impl Skin {
     }
 }
 
+/// Настройки темы Aquarium. Ползунки — доли от 0 до 1, в точки и яркость их переводит окно.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AquariumPrefs {
+    /// Видео плывёт; выключено — стоит один кадр.
+    pub live: bool,
+    pub bubbles: bool,
+    /// Затемнение фона под текст.
+    pub dim: f32,
+    pub backdrop_blur: f32,
+    pub panel_blur: f32,
+    /// Насколько плотное стекло панелей: 0 — почти прозрачное.
+    pub panel_density: f32,
+}
+
+impl Default for AquariumPrefs {
+    fn default() -> Self {
+        AquariumPrefs { live: true, bubbles: true, dim: 0.42, backdrop_blur: 0.0, panel_blur: 0.4, panel_density: 0.45 }
+    }
+}
+
+/// Liquid Glass, как у Apple: панели — толстое стекло, края преломляют фон, по кромке блики.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlassPrefs {
+    pub on: bool,
+    pub strength: f32,
+}
+
+impl Default for GlassPrefs {
+    fn default() -> Self {
+        GlassPrefs { on: false, strength: 0.7 }
+    }
+}
+
+/// Доля от 0 до 1 из настроек; другое — значение по умолчанию.
+fn unit(v: &Value, default: f32) -> f32 {
+    v.as_f64().map(|x| x as f32).filter(|x| (0.0..=1.0).contains(x)).unwrap_or(default)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Repeat {
     Off,
@@ -163,8 +201,8 @@ pub struct Settings {
     pub speed: f32,
     pub look: Look,
     pub skin: Skin,
-    /// Видео и пузыри на фоне темы; выключено — неподвижная картинка.
-    pub live_backdrop: bool,
+    pub aquarium: AquariumPrefs,
+    pub glass: GlassPrefs,
     /// После запуска в плеере трек и очередь, что играли при выходе. Хранятся у Tune,
     /// а не на сервере: Ynison у части аккаунтов их не отдаёт.
     pub keep_track: bool,
@@ -258,7 +296,18 @@ fn parse(v: &Value) -> Settings {
         speed: v["speed"].as_f64().map(|x| ((x * 100.0).round() / 100.0) as f32).filter(|x| (SPEED_MIN..=SPEED_MAX).contains(x)).unwrap_or(1.0),
         look: Look::ALL.into_iter().find(|look| v["theme"].as_str() == Some(look.code())).unwrap_or(Look::Dark),
         skin: Skin::ALL.into_iter().find(|skin| v["skin"].as_str() == Some(skin.code())).unwrap_or(Skin::Standard),
-        live_backdrop: v["liveBackdrop"].as_bool().unwrap_or(true),
+        aquarium: {
+            let (aq, d) = (&v["aquarium"], AquariumPrefs::default());
+            AquariumPrefs {
+                live: aq["live"].as_bool().or(v["liveBackdrop"].as_bool()).unwrap_or(true),
+                bubbles: aq["bubbles"].as_bool().unwrap_or(true),
+                dim: unit(&aq["dim"], d.dim),
+                backdrop_blur: unit(&aq["backdropBlur"], d.backdrop_blur),
+                panel_blur: unit(&aq["panelBlur"], d.panel_blur),
+                panel_density: unit(&aq["panelDensity"], d.panel_density),
+            }
+        },
+        glass: GlassPrefs { on: v["liquidGlass"]["on"].as_bool().unwrap_or(false), strength: unit(&v["liquidGlass"]["strength"], GlassPrefs::default().strength) },
         keep_track: v["keepTrack"].as_bool().unwrap_or(true),
         uncensor: v["uncensor"].as_bool().unwrap_or(true),
         own_in_wave: v["ownInWave"].as_bool().unwrap_or(true),
@@ -327,7 +376,7 @@ pub fn save(settings: Settings) {
     let lyrics = json!({ "enabled": l.enabled, "always": l.always, "lrclib": l.lrclib, "netease": l.netease, "neteaseFirst": l.netease_first });
     let w = settings.window;
     let window = json!({ "autostart": w.autostart, "startMinimized": w.start_minimized, "closeToTray": w.close_to_tray, "trackInTitle": w.track_title, "trackInTaskbar": w.track_taskbar, "yandexLinks": w.yandex_links });
-    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "books": settings.books, "concerts": settings.concerts, "words": settings.words, "wheel": settings.wheel, "speed": settings.speed, "theme": settings.look.code(), "skin": settings.skin.code(), "liveBackdrop": settings.live_backdrop, "keepTrack": settings.keep_track, "uncensor": settings.uncensor, "ownInWave": settings.own_in_wave, "restoredInWave": settings.restored_in_wave, "window": window, "volumeWheel": settings.volume_wheel, "volumeStep": settings.volume_step, "speedControl": settings.speed_control, "speedStep": settings.speed_step, "pitchWithSpeed": settings.pitch, "reverb": settings.reverb, "lyrics": lyrics, "lyricsSize": settings.lyrics_size });
+    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "books": settings.books, "concerts": settings.concerts, "words": settings.words, "wheel": settings.wheel, "speed": settings.speed, "theme": settings.look.code(), "skin": settings.skin.code(), "aquarium": { "live": settings.aquarium.live, "bubbles": settings.aquarium.bubbles, "dim": settings.aquarium.dim, "backdropBlur": settings.aquarium.backdrop_blur, "panelBlur": settings.aquarium.panel_blur, "panelDensity": settings.aquarium.panel_density }, "liquidGlass": { "on": settings.glass.on, "strength": settings.glass.strength }, "keepTrack": settings.keep_track, "uncensor": settings.uncensor, "ownInWave": settings.own_in_wave, "restoredInWave": settings.restored_in_wave, "window": window, "volumeWheel": settings.volume_wheel, "volumeStep": settings.volume_step, "speedControl": settings.speed_control, "speedStep": settings.speed_step, "pitchWithSpeed": settings.pitch, "reverb": settings.reverb, "lyrics": lyrics, "lyricsSize": settings.lyrics_size });
     let dir = api::data_dir();
     if fs::create_dir_all(&dir).is_ok() {
         let _ = fs::write(dir.join("settings.json"), value.to_string());
@@ -341,9 +390,9 @@ mod tests {
     #[test]
     fn reads_saved_and_broken_values() {
         let saved = parse(&json!({ "volume": 0.25, "muted": true, "repeat": "one", "shuffle": true, "quality": "lossless", "normalize": true }));
-        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default(), crossfade: true, normalize: true, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, skin: Skin::Standard, live_backdrop: true, keep_track: true, uncensor: true, own_in_wave: true, restored_in_wave: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0, lyrics: crate::lyrics::Sources::default(), lyrics_size: 26 });
+        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default(), crossfade: true, normalize: true, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, skin: Skin::Standard, aquarium: AquariumPrefs::default(), glass: GlassPrefs::default(), keep_track: true, uncensor: true, own_in_wave: true, restored_in_wave: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0, lyrics: crate::lyrics::Sources::default(), lyrics_size: 26 });
         let empty = parse(&Value::Null);
-        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default(), crossfade: true, normalize: false, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, skin: Skin::Standard, live_backdrop: true, keep_track: true, uncensor: true, own_in_wave: true, restored_in_wave: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0, lyrics: crate::lyrics::Sources::default(), lyrics_size: 26 });
+        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default(), crossfade: true, normalize: false, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, skin: Skin::Standard, aquarium: AquariumPrefs::default(), glass: GlassPrefs::default(), keep_track: true, uncensor: true, own_in_wave: true, restored_in_wave: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0, lyrics: crate::lyrics::Sources::default(), lyrics_size: 26 });
         assert!(!parse(&json!({ "crossfade": false })).crossfade);
         assert!(!parse(&json!({ "kids": false })).kids);
         assert!(!parse(&json!({ "books": false })).books && !parse(&json!({ "concerts": false })).concerts);

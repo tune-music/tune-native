@@ -10,15 +10,12 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use iced::widget::{image, svg};
+use iced::widget::image;
 
 const VIDEO_URL: &str = "https://raw.githubusercontent.com/absolute2007/next-music-themes/main/themes/Aquarium/assets/bg.mp4";
 /// Короче — файл недокачан.
 const VIDEO_MIN: u64 = 1024 * 1024;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// Логотип темы для полосы заголовка: рыба в пузыре, как в Tune Client.
-const LOGO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><radialGradient id="o" cx="0.4" cy="0.25" r="0.8"><stop offset="0" stop-color="#b9fff4"/><stop offset="0.5" stop-color="#2bb8c4"/><stop offset="1" stop-color="#06374a"/></radialGradient></defs><circle cx="32" cy="32" r="28" fill="url(#o)" stroke="#d8fffa" stroke-opacity="0.7" stroke-width="2"/><path d="M12 34 C20 22 40 20 50 28 L58 22 L56 33 L59 42 L50 37 C40 46 20 44 12 34 Z" fill="#e9fffc" fill-opacity="0.92"/><circle cx="20" cy="31" r="1.8" fill="#06374a"/><circle cx="24" cy="14" r="2.6" fill="none" stroke="#e9fffc" stroke-width="1.4"/><circle cx="31" cy="9" r="1.6" fill="none" stroke="#e9fffc" stroke-width="1.2"/></svg>"##;
 
 pub fn video_path() -> PathBuf {
     crate::api::data_dir().join("themes").join("aquarium").join("bg.mp4")
@@ -71,9 +68,4 @@ fn download(part: &std::path::Path) -> Result<(), String> {
 pub fn poster() -> image::Handle {
     static POSTER: std::sync::OnceLock<image::Handle> = std::sync::OnceLock::new();
     POSTER.get_or_init(|| image::Handle::from_bytes(include_bytes!("../assets/aquarium-poster.jpg").as_slice())).clone()
-}
-
-pub fn logo() -> svg::Handle {
-    static HANDLE: std::sync::OnceLock<svg::Handle> = std::sync::OnceLock::new();
-    HANDLE.get_or_init(|| svg::Handle::from_memory(LOGO.as_bytes())).clone()
 }
