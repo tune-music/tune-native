@@ -24,7 +24,7 @@ const REFRESH: Duration = Duration::from_secs(3600);
 /// Не скачался — повтор через десять минут.
 const RETRY: Duration = Duration::from_secs(600);
 /// Поля, которые не подменяются напрямую: служебные и список треков альбома.
-const SKIP: [&str; 5] = ["__fckCensor", "volumes", "id", "audio", "noAuto"];
+const SKIP: [&str; 6] = ["__fckCensor", "volumes", "id", "audio", "noAuto", "insert"];
 /// Свой файл трека или обложки лежит на диске: `local:` и путь.
 pub const LOCAL: &str = "local:";
 
@@ -53,6 +53,8 @@ struct List {
     tracks: HashMap<String, Map<String, Value>>,
     albums: HashMap<String, Map<String, Value>>,
     artists: HashMap<String, Map<String, Value>>,
+    /// Исполнитель → треки и альбомы, добавленные в его профиль (`artistsInsertions`).
+    inserts: HashMap<String, (Vec<String>, Vec<String>)>,
     /// Зеркало, с которого пришёл список: с него же качаются файлы.
     mirror: usize,
 }
@@ -123,7 +125,7 @@ pub fn listed(kind: Kind, id: &str) -> bool {
     current().is_some_and(|list| match kind {
         Kind::Track => list.tracks.contains_key(id) || list.files.contains_key(id),
         Kind::Album => list.albums.contains_key(id),
-        Kind::Artist => list.artists.contains_key(id),
+        Kind::Artist => list.artists.contains_key(id) || list.inserts.contains_key(id),
     })
 }
 
@@ -246,12 +248,54 @@ fn patch(kind: Kind, v: &Value) -> Option<Value> {
     Some(Value::Object(out))
 }
 
-/// Треки альбома по дискам, как в списке: туда возвращаются удалённые Яндексом треки.
+/// Треки альбома по дискам: свой список из «Подменить…», иначе из списка FckCensor — туда
+/// возвращаются удалённые Яндексом треки.
 pub fn album_volumes(id: &str) -> Option<Vec<Vec<String>>> {
+    if let Some(volumes) = own(Kind::Album, id).get("volumes") {
+        return volumes_of(volumes);
+    }
     let list = auto(Kind::Album, id)?;
-    let volumes = list.albums.get(id)?.get("volumes")?.as_array()?;
-    let volumes: Vec<Vec<String>> = volumes.iter().map(|disk| disk.as_array().into_iter().flatten().filter_map(|track| if track.is_object() { id_of(track) } else { id_of(&json!({ "id": track })) }).filter(|id| is_id(id)).collect()).collect();
-    volumes.iter().any(|disk| !disk.is_empty()).then_some(volumes)
+    volumes_of(list.albums.get(id)?.get("volumes")?)
+}
+
+/// Треки альбома из списка FckCensor, без своих правок.
+pub fn listed_volumes(id: &str) -> Option<Vec<Vec<String>>> {
+    volumes_of(current()?.albums.get(id)?.get("volumes")?)
+}
+
+fn volumes_of(volumes: &Value) -> Option<Vec<Vec<String>>> {
+    let volumes: Vec<Vec<String>> = volumes.as_array()?.iter().map(|disk| disk.as_array().into_iter().flatten().filter_map(|track| if track.is_object() { id_of(track) } else { id_of(&json!({ "id": track })) }).filter(|id| is_id(id)).collect()).filter(|disk: &Vec<String>| !disk.is_empty()).collect();
+    (!volumes.is_empty()).then_some(volumes)
+}
+
+/// Треки и альбомы, добавленные в профиль исполнителя: свои из «Подменить…», иначе из списка.
+pub fn artist_inserts(id: &str) -> (Vec<String>, Vec<String>) {
+    if let Some(insert) = own(Kind::Artist, id).get("insert") {
+        return (id_list(&insert["tracks"]), id_list(&insert["albums"]));
+    }
+    auto(Kind::Artist, id).and_then(|list| list.inserts.get(id).cloned()).unwrap_or_default()
+}
+
+/// Вставки исполнителя из списка FckCensor, без своих правок.
+pub fn listed_inserts(id: &str) -> (Vec<String>, Vec<String>) {
+    current().and_then(|list| list.inserts.get(id).cloned()).unwrap_or_default()
+}
+
+/// Номера из списка: числа, строки или `{ releaseId | id }`, как в `artistsInsertions`.
+fn id_list(v: &Value) -> Vec<String> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let entry = if entry.is_object() { if entry["releaseId"].is_null() { &entry["id"] } else { &entry["releaseId"] } } else { entry };
+            match entry {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            }
+        })
+        .filter(|id| is_id(id))
+        .collect()
 }
 
 fn is_id(id: &str) -> bool {
@@ -269,6 +313,11 @@ fn parse(list: &Value, mirror: usize) -> List {
                 if let (true, Some(fields)) = (is_id(id), fields.as_object()) {
                     target.entry(id.clone()).or_insert_with(|| fields.clone());
                 }
+            }
+        }
+        for (id, insert) in source["artistsInsertions"].as_object().into_iter().flatten() {
+            if is_id(id) && insert.is_object() && !out.inserts.contains_key(id) {
+                out.inserts.insert(id.clone(), (id_list(&insert["tracks"]), id_list(&insert["albums"])));
             }
         }
         for storage in source["tracksStorages"].as_array().into_iter().flatten() {
@@ -384,7 +433,7 @@ mod tests {
     #[test]
     fn reads_fields_and_files() {
         let list = json!({ "sources": [
-            { "tracks": { "1": { "title": "Без цензуры", "artists": [] } }, "albums": { "7": { "title": "Альбом", "coverUri": "c/%%", "volumes": [[1, { "id": 2 }]] } } },
+            { "tracks": { "1": { "title": "Без цензуры", "artists": [] } }, "albums": { "7": { "title": "Альбом", "coverUri": "c/%%", "volumes": [[1, { "id": 2 }]] } }, "artistsInsertions": { "5": { "tracks": [{ "index": -1, "releaseId": "1" }, 2], "albums": ["7"] } } },
             { "tracks": { "1": { "title": "Второй источник" } }, "tracksStorages": [
                 { "urlTemplate": "https://example.org/%%.mp3", "trackIds": [1, { "id": 3, "durationMs": 1000 }] },
                 { "urlTemplate": "https://example.org/f/%%.mp3", "tracks": { "2": 55, "4": "https://other.org/4.mp3" } }
@@ -397,6 +446,8 @@ mod tests {
         assert_eq!(parsed.files["4"], "https://other.org/4.mp3");
         assert_eq!(parsed.tracks["3"]["durationMs"], 1000);
         assert_eq!(parsed.tracks["2"]["coverUri"], "c/%%");
+        assert_eq!(parsed.inserts["5"], (vec!["1".to_string(), "2".to_string()], vec!["7".to_string()]));
+        assert_eq!(volumes_of(&json!([[1, { "id": "2" }], []])), Some(vec![vec!["1".to_string(), "2".to_string()]]));
         let mut track = json!({ "id": 1, "title": "С цензурой", "artists": [{ "id": 5, "name": "Кто-то" }], "available": false }).as_object().unwrap().clone();
         apply(&mut track, &parsed.tracks["1"]);
         assert_eq!((track["title"].as_str(), track["artists"][0]["name"].as_str()), (Some("Без цензуры"), Some("Кто-то")));

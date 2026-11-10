@@ -526,6 +526,139 @@ enum QueueFrom {
 
 /// Окно «Подменить…», как у FckCensor: название, исполнители, обложка, свой аудиофайл и
 /// выключатель автоподмены из списка. Пустое поле — как у Яндекса.
+/// Строка списка в «Подменить…»: трек альбома или вставка исполнителя.
+#[derive(Clone, Debug, PartialEq)]
+struct SpoofItem {
+    id: String,
+    title: String,
+    sub: String,
+    /// Нет у Яндекса: подсвечивается.
+    added: bool,
+    disc: usize,
+}
+
+/// Какой список правится: треки (альбома или профиля исполнителя) или альбомы исполнителя.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpoofList {
+    Tracks,
+    Albums,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+struct SpoofLists {
+    /// Треки альбома у Яндекса: для «Как в Яндексе».
+    yandex: Vec<SpoofItem>,
+    tracks: Vec<SpoofItem>,
+    albums: Vec<SpoofItem>,
+    /// Что было при открытии: не меняли — не сохраняется.
+    start: Vec<Vec<String>>,
+}
+
+impl SpoofLists {
+    /// Альбом — номера по дискам, исполнитель — треки и альбомы.
+    fn ids(&self, kind: uncensor::Kind) -> Vec<Vec<String>> {
+        match kind {
+            uncensor::Kind::Album => spoof_volumes(&self.tracks),
+            _ => vec![self.tracks.iter().map(|item| item.id.clone()).collect(), self.albums.iter().map(|item| item.id.clone()).collect()],
+        }
+    }
+
+    fn list(&mut self, which: SpoofList) -> &mut Vec<SpoofItem> {
+        match which {
+            SpoofList::Tracks => &mut self.tracks,
+            SpoofList::Albums => &mut self.albums,
+        }
+    }
+}
+
+/// Треки по дискам в порядке списка.
+fn spoof_volumes(items: &[SpoofItem]) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for item in items {
+        if out.len() <= item.disc {
+            out.resize(item.disc + 1, Vec::new());
+        }
+        out[item.disc].push(item.id.clone());
+    }
+    out.retain(|disk| !disk.is_empty());
+    out
+}
+
+/// Номер трека или альбома из ссылки или длинного числа; иначе это поиск по названию.
+fn spoof_link_id(text: &str, kind: &str) -> Option<String> {
+    let text = text.trim();
+    if text.len() >= 6 && text.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(text.to_string());
+    }
+    let rest = &text[text.find(&format!("{kind}/"))? + kind.len() + 1..];
+    let id: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    (!id.is_empty()).then_some(id)
+}
+
+/// Списки для окна подмены альбома или исполнителя, с названиями.
+fn spoof_lists_load(kind: uncensor::Kind, id: &str, token: &str) -> Result<SpoofLists, String> {
+    let item = |id: &str, names: &HashMap<String, (String, String)>, added: bool, disc: usize| {
+        let (title, sub) = names.get(id).cloned().unwrap_or_default();
+        SpoofItem { id: id.to_string(), title, sub, added, disc }
+    };
+    let track_names = |ids: &[String]| -> Result<HashMap<String, (String, String)>, String> {
+        let mut names = HashMap::new();
+        for chunk in ids.chunks(RESTORED_CHUNK) {
+            names.extend(api::tracks_by_ids(chunk, token)?.into_iter().map(|track| (track.id.clone(), (track.title, track.artists))));
+        }
+        Ok(names)
+    };
+    let mut lists = SpoofLists::default();
+    if kind == uncensor::Kind::Album {
+        let raw = api::album_track_ids(id, token)?;
+        let current = uncensor::album_volumes(id).unwrap_or_else(|| raw.clone());
+        let mut ids: Vec<String> = Vec::new();
+        for track in raw.iter().chain(current.iter()).flatten() {
+            if !ids.contains(track) {
+                ids.push(track.clone());
+            }
+        }
+        let names = track_names(&ids)?;
+        let known: HashSet<&String> = raw.iter().flatten().collect();
+        lists.yandex = raw.iter().enumerate().flat_map(|(disc, disk)| disk.iter().map(move |track| (disc, track))).map(|(disc, track)| item(track, &names, false, disc)).collect();
+        lists.tracks = current.iter().enumerate().flat_map(|(disc, disk)| disk.iter().map(move |track| (disc, track))).map(|(disc, track)| item(track, &names, !known.contains(track), disc)).collect();
+    } else {
+        let (tracks, albums) = uncensor::artist_inserts(id);
+        let names = track_names(&tracks)?;
+        lists.tracks = tracks.iter().map(|track| item(track, &names, false, 0)).collect();
+        let names: HashMap<String, (String, String)> = api::albums_by_ids(&albums, token)?.into_iter().map(|(card, artists)| (card.id, (card.title, artists))).collect();
+        lists.albums = albums.iter().map(|album| item(album, &names, false, 0)).collect();
+    }
+    lists.start = lists.ids(kind);
+    Ok(lists)
+}
+
+/// Поиск для добавления в список подмены: по названию, ссылке или номеру.
+fn spoof_search(which: SpoofList, text: &str, token: &str) -> Result<Vec<SpoofItem>, String> {
+    let added = |id: String, title: String, sub: String| SpoofItem { id, title, sub, added: true, disc: 0 };
+    Ok(match which {
+        SpoofList::Tracks => {
+            let tracks = match spoof_link_id(text, "track") {
+                Some(id) => api::tracks_by_ids(&[id], token)?,
+                None => api::search(text, token)?,
+            };
+            tracks.into_iter().take(SPOOF_FOUND).map(|track| added(track.id, track.title, track.artists)).collect()
+        }
+        SpoofList::Albums => {
+            let albums = match spoof_link_id(text, "album") {
+                Some(id) => api::albums_by_ids(&[id], token)?,
+                None => api::search_albums(text, token)?,
+            };
+            albums.into_iter().take(SPOOF_FOUND).map(|(card, artists)| added(card.id, card.title, if artists.is_empty() { card.subtitle } else { format!("{artists} · {}", card.subtitle) })).collect()
+        }
+    })
+}
+
+/// Сколько найденных показывать под полем добавления.
+const SPOOF_FOUND: usize = 8;
+/// Поиск в «Подменить…» ждёт, пока перестанут печатать.
+const SPOOF_SEARCH_DELAY: Duration = Duration::from_millis(300);
+
 #[derive(Clone, Debug, PartialEq)]
 struct SpoofForm {
     kind: uncensor::Kind,
@@ -543,6 +676,13 @@ struct SpoofForm {
     start: (String, String),
     /// Имена и номера прежних исполнителей: совпавшее имя ведёт на ту же страницу.
     artist_ids: Vec<(String, String)>,
+    /// Треки альбома или вставки исполнителя; `None`, пока грузятся.
+    lists: Option<SpoofLists>,
+    /// Текст в полях добавления: треков и альбомов.
+    search: [String; 2],
+    search_seq: u64,
+    /// Найденное под одним из полей.
+    found: Option<(SpoofList, Vec<SpoofItem>)>,
 }
 
 impl SpoofForm {
@@ -558,6 +698,10 @@ impl SpoofForm {
             auto: own.get("noAuto").and_then(serde_json::Value::as_bool) != Some(true),
             start: (title.to_string(), line.to_string()),
             artist_ids: artists.to_vec(),
+            lists: None,
+            search: Default::default(),
+            search_seq: 0,
+            found: None,
         }
     }
 
@@ -614,6 +758,28 @@ impl SpoofForm {
             fields.remove("noAuto");
         } else {
             fields.insert("noAuto".into(), Value::Bool(true));
+        }
+        // Список меняли: совпал с тем, что и так стоит (Яндекс или список FckCensor), — своя
+        // правка не нужна.
+        if let Some(lists) = self.lists.as_ref().filter(|lists| lists.ids(self.kind) != lists.start) {
+            let now = lists.ids(self.kind);
+            match self.kind {
+                uncensor::Kind::Album => {
+                    let base = self.auto.then(|| uncensor::listed_volumes(&self.id)).flatten().unwrap_or_else(|| spoof_volumes(&lists.yandex));
+                    match now == base {
+                        true => fields.remove("volumes"),
+                        false => fields.insert("volumes".into(), json!(now)),
+                    };
+                }
+                uncensor::Kind::Artist => {
+                    let (tracks, albums) = if self.auto { uncensor::listed_inserts(&self.id) } else { Default::default() };
+                    match now == [tracks, albums] {
+                        true => fields.remove("insert"),
+                        false => fields.insert("insert".into(), json!({ "tracks": now[0], "albums": now[1] })),
+                    };
+                }
+                uncensor::Kind::Track => {}
+            }
         }
         fields
     }
@@ -947,6 +1113,8 @@ enum Preview {
     /// Сведения о первом треке лайков.
     TrackInfo,
     Spoof,
+    /// «Подменить…» альбома или исполнителя по номеру: списки треков и вставок.
+    SpoofOf(uncensor::Kind, String),
     Account,
     LogoutAsk,
     /// Вкладка настроек.
@@ -1812,6 +1980,14 @@ enum Message {
     SpoofSave,
     SpoofReset,
     SpoofTrack(Result<Vec<Track>, String>),
+    SpoofLists(String, Result<SpoofLists, String>),
+    SpoofMove(SpoofList, usize, bool),
+    SpoofRemove(SpoofList, usize),
+    SpoofSearch(SpoofList, String),
+    SpoofSearchRun(SpoofList, u64),
+    SpoofFound(SpoofList, u64, Result<Vec<SpoofItem>, String>),
+    SpoofAdd(usize),
+    SpoofAsYandex,
     Tray(tray::Event),
     Media(media::Event),
     Play(Section, usize),
@@ -4698,6 +4874,7 @@ impl App {
                     Some(Preview::WaveSeeded) => self.wave_load(vec!["artist:3121".to_string()], Some(wave_label("artist:3121", "Metallica")), false),
                     Some(Preview::Likes | Preview::LikesEnd | Preview::LikesAt(_) | Preview::Menu | Preview::Panels | Preview::TrackInfo | Preview::Spoof | Preview::QueueJump) => self.update(Message::Open(Section::Likes)),
                     Some(Preview::Collection) => self.update(Message::Open(Section::Collection)),
+                    Some(Preview::SpoofOf(kind, id)) => self.update(Message::SpoofOpen(Box::new(SpoofForm::new(kind, &id, "", &[], "")))),
                     // Превращается в обычный запуск ещё в `new`.
                     Some(Preview::CollectionEarly) => Task::none(),
                     Some(Preview::Clips) => self.update(Message::Open(Section::Clips)),
@@ -7364,8 +7541,87 @@ impl App {
             },
             Message::SpoofOpen(form) => {
                 self.page_menu = None;
+                let (kind, id) = (form.kind, form.id.clone());
                 self.spoof = Some(*form);
-                return self.update(Message::DialogOpen(Dialog::Spoof));
+                let open = self.update(Message::DialogOpen(Dialog::Spoof));
+                // У альбома — список треков, у исполнителя — вставки в профиль: их грузим следом.
+                let lists = match self.token() {
+                    Some(token) if kind != uncensor::Kind::Track => {
+                        let asked = id.clone();
+                        Task::perform(background(move || spoof_lists_load(kind, &asked, &token)), move |result| Message::SpoofLists(id.clone(), result))
+                    }
+                    _ => Task::none(),
+                };
+                return Task::batch([open, lists]);
+            }
+            Message::SpoofLists(id, result) => {
+                let Some(form) = self.spoof.as_mut().filter(|form| form.id == id) else { return Task::none() };
+                match result {
+                    Ok(lists) => form.lists = Some(lists),
+                    Err(e) => {
+                        api::log(&format!("Подмена: список не загрузился: {e}"));
+                        return self.notify_quick("Список треков не загрузился".to_string());
+                    }
+                }
+            }
+            Message::SpoofMove(which, at, up) => {
+                if let Some(list) = self.spoof.as_mut().and_then(|form| form.lists.as_mut()).map(|lists| lists.list(which)) {
+                    let to = if up { at.checked_sub(1) } else { Some(at + 1).filter(|to| *to < list.len()) };
+                    if let Some(to) = to.filter(|_| at < list.len()) {
+                        // Диск остаётся у места: трек переходит на диск соседа.
+                        list.swap(at, to);
+                        let (a, b) = (list[at].disc, list[to].disc);
+                        (list[at].disc, list[to].disc) = (b, a);
+                    }
+                }
+            }
+            Message::SpoofRemove(which, at) => {
+                if let Some(list) = self.spoof.as_mut().and_then(|form| form.lists.as_mut()).map(|lists| lists.list(which)).filter(|list| at < list.len()) {
+                    list.remove(at);
+                }
+            }
+            Message::SpoofAsYandex => {
+                if let Some(lists) = self.spoof.as_mut().and_then(|form| form.lists.as_mut()) {
+                    lists.tracks = lists.yandex.clone();
+                }
+            }
+            Message::SpoofSearch(which, text) => {
+                let Some(form) = &mut self.spoof else { return Task::none() };
+                form.search = Default::default();
+                form.search[which as usize] = text.clone();
+                form.search_seq += 1;
+                form.found = None;
+                if text.trim().is_empty() {
+                    return Task::none();
+                }
+                let seq = form.search_seq;
+                return Task::perform(background(|| std::thread::sleep(SPOOF_SEARCH_DELAY)), move |()| Message::SpoofSearchRun(which, seq));
+            }
+            Message::SpoofSearchRun(which, seq) => {
+                let (Some(form), Some(token)) = (self.spoof.as_ref(), self.token()) else { return Task::none() };
+                if form.search_seq != seq {
+                    return Task::none();
+                }
+                let text = form.search[which as usize].trim().to_string();
+                return Task::perform(background(move || spoof_search(which, &text, &token)), move |result| Message::SpoofFound(which, seq, result));
+            }
+            Message::SpoofFound(which, seq, result) => {
+                let Some(form) = self.spoof.as_mut().filter(|form| form.search_seq == seq) else { return Task::none() };
+                form.found = Some((which, result.unwrap_or_default()));
+            }
+            Message::SpoofAdd(at) => {
+                let Some(form) = &mut self.spoof else { return Task::none() };
+                let Some((which, found)) = form.found.take() else { return Task::none() };
+                form.search = Default::default();
+                let (Some(mut item), Some(lists)) = (found.into_iter().nth(at), form.lists.as_mut()) else { return Task::none() };
+                let list = lists.list(which);
+                if list.iter().any(|known| known.id == item.id) {
+                    return self.notify_quick("Уже в списке".to_string());
+                }
+                item.disc = list.last().map_or(0, |last| last.disc);
+                // Вставка исполнителя есть и у Яндекса, если трек уже его: подсвечиваем только новые в альбоме.
+                item.added = form.kind == uncensor::Kind::Album;
+                list.push(item);
             }
             Message::SpoofTitle(value) => {
                 if let Some(form) = &mut self.spoof {
@@ -8770,6 +9026,9 @@ impl App {
             }
             body = body.push(column![label("Аудио: MP3, M4A, AAC или FLAC"), line].spacing(6));
         }
+        if kind != uncensor::Kind::Track {
+            body = body.push(self.view_spoof_lists(form, alpha));
+        }
         if uncensor::listed(kind, &form.id) {
             let switch = shine(button(text(if form.auto { "Автоподмена из списка FckCensor включена" } else { "Автоподмена из списка FckCensor выключена" }).size(14)).padding([7, 16]).style(ui::chip_faded(form.auto, alpha)).on_press(Message::SpoofAutoToggle), 18.0);
             body = body.push(switch);
@@ -8782,11 +9041,86 @@ impl App {
             button(text("Сохранить").font(ui::font_medium()).color(ui::c().on_accent.scale_alpha(alpha))).padding([8, 18]).style(ui::button_faded(ui::accent, alpha)).on_press(Message::SpoofSave),
             24.0,
         ));
-        body = body.push(buttons);
+        // Справа место под полосу прокрутки: длинный список треков её показывает.
+        body = body.push(buttons).padding(iced::Padding::ZERO.right(14));
         let tall = WINDOW.lock().unwrap().1 - INFO_MARGIN;
         let window = reveal(container(ui::scroll(body).style(ui::scroll_still)).width(DIALOG_WIDTH).max_height(tall).padding(24).style(ui::popover_faded(alpha))).scale(0.94 + 0.06 * alpha, 0.5, 0.5).shift(0.0, 10.0 * (1.0 - alpha));
         let dim = iced::Color::BLACK.scale_alpha(0.6 * alpha);
         reveal(mouse_area(container(mouse_area(window).on_press(Message::DialogInput(self.dialog_text.clone()))).center(Length::Fill).style(move |_| container::Style::default().background(dim))).on_press(Message::MenuClose)).inert(!self.dialog_fade.live).into()
+    }
+
+    /// Списки окна подмены: треки альбома или треки и альбомы в профиле исполнителя, с
+    /// порядком, удалением и полем добавления.
+    fn view_spoof_lists<'a>(&'a self, form: &'a SpoofForm, alpha: f32) -> Element<'a, Message> {
+        let label = |name: &str| text(name.to_string()).size(13).color(ui::c().muted.scale_alpha(alpha));
+        let Some(lists) = &form.lists else {
+            let what = if form.kind == uncensor::Kind::Album { "Треки альбома" } else { "Треки и альбомы в профиле" };
+            return column![label(what), text("Загрузка…").color(ui::c().muted.scale_alpha(alpha))].spacing(6).into();
+        };
+        let tool = |glyph: ui::Glyph, tip: Option<Message>| {
+            let on = tip.is_some();
+            button(ui::icon(glyph, 16.0, if on { ui::c().text } else { ui::c().faint }.scale_alpha(alpha))).padding(6).style(ui::button_faded(ui::ghost, alpha)).on_press_maybe(tip)
+        };
+        let list_view = |which: SpoofList, items: &'a [SpoofItem], empty: &'static str| -> Element<'a, Message> {
+            if items.is_empty() {
+                return container(text(empty).color(ui::c().muted.scale_alpha(alpha))).padding([10, 12]).into();
+            }
+            let discs = items.iter().any(|item| item.disc != items[0].disc);
+            let mut rows = column![].spacing(2);
+            let mut disc = None;
+            for (at, item) in items.iter().enumerate() {
+                if discs && disc != Some(item.disc) {
+                    rows = rows.push(container(text(format!("Диск {}", item.disc + 1)).size(13).font(ui::font_medium()).color(ui::c().muted.scale_alpha(alpha))).padding([6, 12]));
+                }
+                disc = Some(item.disc);
+                let name = if item.title.is_empty() { format!("id {}", item.id) } else { item.title.clone() };
+                let tint = if item.added { ui::c().accent } else { ui::c().text };
+                let title = column![text(name).color(tint.scale_alpha(alpha)).wrapping(Wrapping::None), text(item.sub.clone()).size(13).color(ui::c().muted.scale_alpha(alpha)).wrapping(Wrapping::None)].width(Length::Fill).clip(true);
+                rows = rows.push(
+                    row![
+                        text(format!("{}", at + 1)).size(13).color(ui::c().muted.scale_alpha(alpha)).width(28),
+                        title,
+                        tool(ui::UP, (at > 0).then_some(Message::SpoofMove(which, at, true))),
+                        tool(ui::COLLAPSE, (at + 1 < items.len()).then_some(Message::SpoofMove(which, at, false))),
+                        tool(ui::CLOSE, Some(Message::SpoofRemove(which, at))),
+                    ]
+                    .spacing(4)
+                    .padding([2, 8])
+                    .align_y(Alignment::Center),
+                );
+            }
+            container(rows).padding([6, 0]).style(move |_| container::Style::default().background(ui::c().tile.scale_alpha(alpha)).border(iced::border::rounded(10))).into()
+        };
+        let search = |which: SpoofList, hint: &'static str| -> Element<'a, Message> {
+            let field = text_input(hint, &form.search[which as usize]).on_input(move |value| Message::SpoofSearch(which, value)).on_submit(Message::SpoofAdd(0)).padding([10, 16]).style(ui::input_faded(alpha));
+            let mut out = column![field].spacing(4);
+            if let Some((_, found)) = form.found.as_ref().filter(|(at, _)| *at == which) {
+                if found.is_empty() {
+                    out = out.push(container(text("Ничего не нашлось").color(ui::c().muted.scale_alpha(alpha))).padding([8, 16]));
+                }
+                for (at, item) in found.iter().enumerate() {
+                    let line = row![text(item.title.clone()).color(ui::c().text.scale_alpha(alpha)).wrapping(Wrapping::None), text(item.sub.clone()).size(13).color(ui::c().muted.scale_alpha(alpha)).wrapping(Wrapping::None)].spacing(8).align_y(Alignment::Center).clip(true);
+                    out = out.push(button(line).width(Length::Fill).padding([8, 16]).style(ui::button_faded(ui::row, alpha)).on_press(Message::SpoofAdd(at)));
+                }
+            }
+            out.into()
+        };
+        if form.kind == uncensor::Kind::Album {
+            let yandex = button(text("Как в Яндексе").color(ui::c().text.scale_alpha(alpha))).padding([8, 14]).style(ui::button_faded(ui::secondary, alpha)).on_press_maybe((lists.tracks != lists.yandex).then_some(Message::SpoofAsYandex));
+            column![label("Треки альбома — новые подсвечены"), list_view(SpoofList::Tracks, &lists.tracks, "В альбоме нет треков"), search(SpoofList::Tracks, "Добавить трек: название или ссылка"), yandex].spacing(8).into()
+        } else {
+            column![
+                label("Треки в профиле — сверху «Популярных треков»"),
+                list_view(SpoofList::Tracks, &lists.tracks, "Не добавлено ни одного трека"),
+                search(SpoofList::Tracks, "Добавить трек: название или ссылка"),
+                Space::new().height(8),
+                label("Альбомы в профиле — в начале альбомов"),
+                list_view(SpoofList::Albums, &lists.albums, "Не добавлено ни одного альбома"),
+                search(SpoofList::Albums, "Добавить альбом: название или ссылка"),
+            ]
+            .spacing(8)
+            .into()
+        }
     }
 
     /// Подмену сохранили: обложка перечитывается, трек — с сервера, открытая страница — заново.
@@ -12561,6 +12895,8 @@ fn main() -> iced::Result {
             "menu" => Preview::Menu,
             "track-info" => Preview::TrackInfo,
             "spoof" => Preview::Spoof,
+            what if what.starts_with("spoof-album:") => Preview::SpoofOf(uncensor::Kind::Album, what["spoof-album:".len()..].to_string()),
+            what if what.starts_with("spoof-artist:") => Preview::SpoofOf(uncensor::Kind::Artist, what["spoof-artist:".len()..].to_string()),
             "account" => Preview::Account,
             "settings" => Preview::Settings(0),
             what if what.starts_with("settings:") => Preview::Settings(what["settings:".len()..].parse().unwrap_or(0)),
@@ -12701,6 +13037,17 @@ mod lyrics_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spoof_lists_keep_discs_and_read_links() {
+        let item = |id: &str, disc| super::SpoofItem { id: id.to_string(), title: String::new(), sub: String::new(), added: false, disc };
+        assert_eq!(super::spoof_volumes(&[item("1", 0), item("2", 1), item("3", 0)]), [vec!["1", "3"], vec!["2"]]);
+        assert_eq!(super::spoof_volumes(&[item("2", 1)]), [vec!["2"]]);
+        assert_eq!(super::spoof_link_id("https://music.yandex.ru/album/1/track/22?x=1", "track").as_deref(), Some("22"));
+        assert_eq!(super::spoof_link_id("https://music.yandex.ru/album/1/track/22", "album").as_deref(), Some("1"));
+        assert_eq!(super::spoof_link_id("142512511", "track").as_deref(), Some("142512511"));
+        assert_eq!(super::spoof_link_id("1984", "track"), None);
+    }
+
     #[test]
     fn search_words_ignore_case_and_marks() {
         assert_eq!(super::search_words("Гидропон, CUPSIZE!"), ["гидропон", "cupsize"]);

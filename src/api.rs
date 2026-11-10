@@ -1181,6 +1181,41 @@ pub fn album(id: &str, token: &str) -> Result<(Album, Vec<Track>), String> {
     Ok((album, disks.into_iter().flatten().collect()))
 }
 
+/// Треки альбома у Яндекса по дискам, как есть: для «Как в Яндексе» в «Подменить…».
+pub fn album_track_ids(id: &str, token: &str) -> Result<Vec<Vec<String>>, String> {
+    let v = get(&format!("albums/{id}/with-tracks"), &[], token)?;
+    let v = result(&v);
+    let mut disks: Vec<Vec<String>> = v["volumes"].as_array().into_iter().flatten().map(|disk| disk.as_array().into_iter().flatten().filter_map(|track| id_text(&track["id"])).collect()).collect();
+    if v["sortOrder"].as_str() == Some("desc") {
+        disks.reverse();
+        disks.iter_mut().for_each(|disk| disk.reverse());
+    }
+    disks.retain(|disk| !disk.is_empty());
+    Ok(disks)
+}
+
+/// Альбомы по номерам: карточка и исполнители через запятую.
+pub fn albums_by_ids(ids: &[String], token: &str) -> Result<Vec<(Card, String)>, String> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let v = get("albums", &[("album-ids", &ids.join(","))], token)?;
+    Ok(result(&v).as_array().into_iter().flatten().filter_map(album_with_artists).collect())
+}
+
+/// Поиск альбомов для «Подменить…».
+pub fn search_albums(text: &str, token: &str) -> Result<Vec<(Card, String)>, String> {
+    let v = get("search", &[("text", text), ("type", "album"), ("page", "0")], token)?;
+    Ok(v["result"]["albums"]["results"].as_array().into_iter().flatten().filter_map(album_with_artists).collect())
+}
+
+fn album_with_artists(v: &Value) -> Option<(Card, String)> {
+    let patched = crate::uncensor::patch_album(v);
+    let v = patched.as_ref().unwrap_or(v);
+    let artists = v["artists"].as_array().into_iter().flatten().filter_map(|artist| artist["name"].as_str()).collect::<Vec<_>>().join(", ");
+    Some((album_card(v)?, artists))
+}
+
 pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
     let v = get(&format!("artists/{id}/brief-info"), &[], token)?;
     // Несуществующего исполнителя Яндекс отдаёт пустым, с пометкой вместо 404.
@@ -1205,6 +1240,14 @@ pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
     let limit = FAMILIAR_LIMIT.to_string();
     if let Ok(v) = get(&format!("artists/{id}/familiar-you"), &[("waveTracksLimit", &limit), ("collectionTracksLimit", &limit), ("collectionAlbumsLimit", "0")], token) {
         (artist.familiar_collection, artist.familiar_wave) = parse_familiar(result(&v));
+    }
+    // Как в Tune Client: добавленные в профиль треки — в начало популярных, альбомы — в начало альбомов.
+    let (tracks, albums) = crate::uncensor::artist_inserts(id);
+    if let Ok(found) = tracks_by_ids(&tracks, token).map(|found| found.into_iter().filter(|track| !artist.popular.iter().any(|known| known.id == track.id)).collect::<Vec<_>>()) {
+        artist.popular.splice(0..0, found);
+    }
+    if let Ok(found) = albums_by_ids(&albums, token).map(|found| found.into_iter().map(|(card, _)| card).filter(|card| !artist.albums.iter().any(|known| known.id == card.id)).collect::<Vec<_>>()) {
+        artist.albums.splice(0..0, found);
     }
     Ok(artist)
 }
