@@ -9919,17 +9919,20 @@ impl App {
         reveal(container(stack![page, wheel]).width(Length::Fill).height(Length::Fill)).clip().into()
     }
 
-    /// Большой плеер на всё окно: обложка, название, перемотка и кнопки.
-    /// `back` — цвет фона, которым на миг закрывается смена трека.
-    fn player_body<'a>(&'a self, track: &'a Track, art: f32, line: f32, back: iced::Color) -> Element<'a, Message> {
+    /// Большой плеер на всё окно: обложка, название, перемотка и кнопки. Новый трек
+    /// проявляется прозрачностью: фон плеера — градиент, сплошная вуаль легла бы на него
+    /// тёмным прямоугольником.
+    fn player_body<'a>(&'a self, track: &'a Track, art: f32, line: f32) -> Element<'a, Message> {
+        let rest = 1.0 - anim::ease_out(1.0 - self.track_veil);
+        let alpha = 1.0 - rest;
         let side = |icon, message, label| hint(glow(button(ui::icon(icon, 32.0, ui::c().text)).padding(8).style(ui::ghost).on_press(message), 20.0), label);
         let name_size = (line / (track.title.chars().count().max(1) as f32 * 0.62)).clamp(20.0, 34.0);
         let names: Element<'_, Message> = if track.artist_list.is_empty() {
-            fit(&track.artists).size(18).color(ui::c().muted).marquee().into()
+            fit(&track.artists).size(18).color(ui::c().muted.scale_alpha(alpha)).marquee().into()
         } else {
-            artist_links(&track.artist_list, 18.0, ui::font(), ui::c().muted)
+            artist_links(&track.artist_list, 18.0, ui::font(), ui::c().muted.scale_alpha(alpha))
         };
-        let about = column![track_title(track, name_size, ui::font_headline(), ui::c().strong, true), names].spacing(4).align_x(Alignment::Center);
+        let about = column![track_title(track, name_size, ui::font_headline(), ui::c().strong.scale_alpha(alpha), true), names].spacing(4).align_x(Alignment::Center);
         let info = row![self.like_button(track, 24.0), container(about).center_x(Length::Fill).clip(true), self.more_button(track, 22.0)].spacing(12).align_y(Alignment::Center).width(line);
         let mode = |icon, on: bool, message, label| hint(glow(button(ui::icon(icon, 24.0, if on { ui::c().accent } else { ui::c().muted })).padding(8).style(ui::ghost).on_press(message), 20.0), label);
         let mut transport = row![].spacing(20).align_y(Alignment::Center);
@@ -9946,13 +9949,15 @@ impl App {
             transport = transport.push(mode(icon, self.repeat != Repeat::Off, Message::RepeatNext, repeat_hint(self.repeat)));
         }
 
-        let rest = 1.0 - anim::ease_out(1.0 - self.track_veil);
         let shift = 10.0 * rest;
-        let veil = back.scale_alpha(rest);
+        let cover: Element<'a, Message> = match self.covers.get(&format!("{WAVE_BIG}{}", track.id)).or_else(|| self.covers.get(&track.id)) {
+            Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle) * alpha).width(art).height(art).border_radius(12).into(),
+            None => container(Space::new()).width(art).height(art).style(move |theme| ui::tile(theme).background(ui::c().tile.scale_alpha(alpha))).into(),
+        };
         column![
-            reveal(self.wave_cover(track, art)).shift(0.0, shift).veil(veil),
+            reveal(cover).shift(0.0, shift),
             Space::new().height(20),
-            reveal(info).shift(0.0, shift).veil(veil),
+            reveal(info).shift(0.0, shift),
             Space::new().height(12),
             self.seek_line(track, Length::Fixed(line)),
             Space::new().height(8),
@@ -9979,7 +9984,7 @@ impl App {
         let head = row![collapse, container(label).center_x(Length::Fill), Space::new().width(44)].align_y(Alignment::Center);
         let tools = row![Space::new().width(Length::Fill), self.view_tools(22.0, true, false), self.view_volume(22.0, Some(120.0))].spacing(10).align_y(Alignment::Center);
         // Сверху своя полоса заголовка окна: «Свернуть» — под ней.
-        let page = column![head, container(self.player_body(track, art, line, top)).center(Length::Fill), tools].padding(Padding::new(24.0).top(caption::HEIGHT + 8.0)).width(Length::Fill).height(Length::Fill);
+        let page = column![head, container(self.player_body(track, art, line)).center(Length::Fill), tools].padding(Padding::new(24.0).top(caption::HEIGHT + 8.0)).width(Length::Fill).height(Length::Fill);
         let back = move |_: &iced::Theme| container::Style {
             background: Some(iced::Background::Gradient(iced::Gradient::Linear(iced::gradient::Linear::new(iced::Radians(std::f32::consts::PI)).add_stop(0.0, top).add_stop(0.35, shade(FULL_TINT * 0.72)).add_stop(0.7, shade(FULL_TINT * 0.42)).add_stop(1.0, shade(FULL_TINT * 0.22))))),
             ..container::Style::default()
@@ -10339,10 +10344,10 @@ impl App {
         };
         let (width, height) = (300.0, 188.0);
         let back: Element<'_, Message> = match skin {
-            Skin::Standard => container(Space::new()).width(Length::Fill).height(Length::Fill).style(move |_| container::Style::default().background(colors.base)).into(),
+            Skin::Standard => container(Space::new()).width(Length::Fill).height(Length::Fill).style(move |_| container::Style::default().background(colors.base).border(iced::border::rounded(10))).into(),
             Skin::Aquarium => stack![
-                image(skin::poster()).content_fit(iced::ContentFit::Cover).width(Length::Fill).height(Length::Fill),
-                container(Space::new()).width(Length::Fill).height(Length::Fill).style(|_| container::Style::default().background(iced::Color::from_rgba8(3, 30, 40, 0.35))),
+                image(skin::poster()).content_fit(iced::ContentFit::Cover).width(Length::Fill).height(Length::Fill).border_radius(10),
+                container(Space::new()).width(Length::Fill).height(Length::Fill).style(|_| container::Style::default().background(iced::Color::from_rgba8(3, 30, 40, 0.35)).border(iced::border::rounded(10))),
             ]
             .into(),
         };
@@ -10361,7 +10366,7 @@ impl App {
         let play = container(Space::new()).width(14).height(14).style(move |_| container::Style::default().background(colors.accent).border(iced::border::rounded(7)));
         let bar = panel(row![line(60.0, colors.text.scale_alpha(0.8)), Space::new().width(Length::Fill), play, Space::new().width(Length::Fill)].align_y(Alignment::Center).into()).width(Length::Fill).height(30).padding([0, 10]).center_y(30);
         let mock = column![row![side, panel(rows.into()).width(Length::Fill).height(Length::Fill)].height(Length::Fill), bar].spacing(6).padding(Padding::ZERO.right(8).bottom(8).top(8));
-        let preview = container(stack![back, mock]).width(width).height(height).clip(true).style(|_| container::Style::default().border(iced::border::rounded(10)));
+        let preview = container(stack![back, mock]).width(width).height(height);
         let chosen = self.skin == skin;
         let about = match skin {
             Skin::Standard => "Как в Яндекс Музыке: тёмная, светлая или как в системе",
@@ -11535,13 +11540,6 @@ impl App {
     }
 
     /// Обложка играющего трека в волне: пока нет крупной, показывает обычную.
-    fn wave_cover<'a>(&'a self, track: &Track, size: f32) -> Element<'a, Message> {
-        match self.covers.get(&format!("{WAVE_BIG}{}", track.id)).or_else(|| self.covers.get(&track.id)) {
-            Some(handle) => image(handle.clone()).opacity(self.cover_alpha(handle)).width(size).height(size).border_radius(12).into(),
-            None => container(Space::new()).width(size).height(size).style(ui::tile).into(),
-        }
-    }
-
     /// Полоска перемотки с подписями времени по краям. Подписи одной ширины, чтобы полоска не дёргалась.
     fn seek_line<'a>(&self, track: &Track, width: Length) -> Element<'a, Message> {
         let total = track.duration.as_secs_f32().max(1.0);

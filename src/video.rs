@@ -1045,11 +1045,15 @@ fn panel(pos: vec2<f32>) -> vec4<f32> {
     }
     let scale = u.extra.x;
     let glass = u.blur.z;
-    // Наружу от края: по разнице расстояний в соседних точках.
+    // Линза считается по прямоугольнику с большим скруглением: у обычного направление от
+    // края на диагонали угла скачет, и угол делился бы швом надвое.
+    let band = 44.0 * scale;
+    let soft_r = min(max(r, band * 1.6), min(half.x, half.y));
+    let lens_d = rounded(q, half, soft_r);
     let e = 1.0;
-    let normal = normalize(vec2<f32>(rounded(q + vec2<f32>(e, 0.0), half, r) - rounded(q - vec2<f32>(e, 0.0), half, r), rounded(q + vec2<f32>(0.0, e), half, r) - rounded(q - vec2<f32>(0.0, e), half, r)) + vec2<f32>(1e-5));
+    let normal = normalize(vec2<f32>(rounded(q + vec2<f32>(e, 0.0), half, soft_r) - rounded(q - vec2<f32>(e, 0.0), half, soft_r), rounded(q + vec2<f32>(0.0, e), half, soft_r) - rounded(q - vec2<f32>(0.0, e), half, soft_r)) + vec2<f32>(1e-5));
     // 0 у самого края, 1 — дальше полосы преломления.
-    let depth = clamp(-d / (44.0 * scale), 0.0, 1.0);
+    let depth = clamp(-lens_d / band, 0.0, 1.0);
     let lens = pow(1.0 - depth, 2.0);
     // Liquid Glass прозрачнее матового стекла: фон за ним виден, а держит форму кромка.
     let density = u.tint.a * (1.0 - 0.55 * glass);
