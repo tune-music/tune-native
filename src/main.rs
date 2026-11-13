@@ -2087,6 +2087,8 @@ enum Message {
     GlassToggle,
     /// Проверить обновления; `true` — по кнопке, тогда виден и ответ «новее нет».
     UpdateCheck(bool),
+    /// Перезапуск, чтобы применить новую отрисовку.
+    RenderRestart,
     UpdateChecked(bool, Result<Option<update::Release>, String>),
     UpdateInstall,
     UpdateProgress(u64, u64),
@@ -7689,6 +7691,10 @@ impl App {
                     AquaKnob::GlassStrength => self.glass.strength = value,
                 }
             }
+            Message::RenderRestart => {
+                restart();
+                return self.update(Message::Quit);
+            }
             Message::UpdateCheck(manual) => {
                 if self.preview.is_some() || matches!(self.upd_status, UpdStatus::Checking | UpdStatus::Loading(..) | UpdStatus::Installing) {
                     return Task::none();
@@ -10375,6 +10381,26 @@ impl App {
                     group("Ссылки", vec![
                         toggle("Открывать ссылки Яндекс Музыки в Tune", "Кнопка «Открыть в приложении» на music.yandex.ru и ссылки yandexmusic:// откроются в Tune, а не в официальном клиенте. Выключите — снова откроются в нём", Some(prefs.yandex_links), set(|p| p.yandex_links = !p.yandex_links)),
                     ]),
+                    {
+                        let choice = |render: settings::Render| {
+                            let chosen = prefs.render == render;
+                            shine(button(text(render.label())).padding([9, 18]).style(if chosen { ui::accent } else { ui::secondary }).on_press(Message::WindowPrefSet(settings::WindowPrefs { render, ..prefs })), 20.0)
+                        };
+                        let choices = settings::Render::ALL.into_iter().fold(row![].spacing(8), |line, render| line.push(choice(render)));
+                        let about = match prefs.render {
+                            settings::Render::Auto => "Видеокарта через DirectX 12: меньше всего памяти. Если окно рябит, мерцает или по нему идут полосы, попробуйте Vulkan",
+                            settings::Render::Vulkan => "Видеокарта через Vulkan: помогает, когда у DirectX 12 на этой видеокарте рябь или полосы",
+                            settings::Render::Cpu => "Без видеокарты: работает везде, но прокрутка медленнее, а живой фон тем и клипы не показываются",
+                        };
+                        let mut block = column![title("Отрисовка"), choices.wrap().vertical_spacing(8), text(about).size(13).color(ui::c().muted)].spacing(12);
+                        if prefs.render != render_started() {
+                            block = block.push(row![
+                                text("Применится после перезапуска").color(ui::c().text),
+                                shine(button(text("Перезапустить")).padding([9, 18]).style(ui::accent).on_press(Message::RenderRestart), 20.0),
+                            ].spacing(16).align_y(Alignment::Center));
+                        }
+                        Element::<Message>::from(block)
+                    },
                     group("Вид", vec![
                         toggle("Трек в заголовке окна", "Вместо «Tune» в верхней полосе окна — «Исполнитель — трек»", Some(prefs.track_title), set(|p| p.track_title = !p.track_title)),
                         toggle("Трек на панели задач и в Alt+Tab", "«Исполнитель — трек» на кнопке окна и в переключении окон; в заголовке окна при этом может остаться «Tune»", Some(prefs.track_taskbar), set(|p| p.track_taskbar = !p.track_taskbar)),
@@ -12164,6 +12190,13 @@ fn uninstall() {
 }
 
 /// Новая копия Tune с теми же ключами; эта после вызова закрывается.
+/// Чем рисуется окно в этом запуске: настройка меняется сразу, а отрисовка — после перезапуска.
+static RENDER_STARTED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn render_started() -> settings::Render {
+    settings::Render::ALL[RENDER_STARTED.load(Ordering::Relaxed) as usize % settings::Render::ALL.len()]
+}
+
 fn restart() {
     let Ok(exe) = std::env::current_exe() else { return };
     let mut args: Vec<String> = std::env::args().skip(1).filter(|arg| !arg.starts_with(RESTART_FLAG) && arg != MINIMIZED_FLAG).collect();
@@ -13752,9 +13785,21 @@ fn main() -> iced::Result {
         _ => None,
     };
     // DirectX 12 занимает меньше всего памяти из графических API. Нет видеокарты — iced сам
-    // перейдёт на отрисовку процессором.
-    if std::env::var_os("WGPU_BACKEND").is_none() {
-        std::env::set_var("WGPU_BACKEND", "dx12");
+    // перейдёт на отрисовку процессором. На некоторых видеокартах DirectX 12 рябит или
+    // рисует полосы — тогда в настройках выбирают Vulkan или процессор.
+    let render = settings::load().window.render;
+    RENDER_STARTED.store(render as u8, Ordering::Relaxed);
+    match render {
+        settings::Render::Auto => {
+            if std::env::var_os("WGPU_BACKEND").is_none() {
+                std::env::set_var("WGPU_BACKEND", "dx12");
+            }
+        }
+        settings::Render::Vulkan => {
+            std::env::set_var("WGPU_BACKEND", "vulkan");
+            std::env::remove_var("ICED_BACKEND");
+        }
+        settings::Render::Cpu => std::env::set_var("ICED_BACKEND", "tiny-skia"),
     }
     let preview = match args.as_slice() {
         [_, flag, query] if flag == "--smoke" || flag == "--smoke-restored" || flag == "--smoke-uncensor" || flag == "--smoke-export" || flag == "--smoke-spoof" || flag == "--smoke-library" || flag == "--smoke-quality" || flag == "--smoke-wave" || flag == "--smoke-lyrics" || flag == "--smoke-settings" || flag == "--smoke-plays" || flag == "--smoke-home" || flag == "--smoke-mix" || flag == "--smoke-crossfade" || flag == "--smoke-move" || flag == "--smoke-cover" || flag == "--smoke-pause-seek" || flag == "--smoke-speed" || flag == "--smoke-artist-dislike" || flag == "--smoke-download" || flag == "--smoke-offline" || flag == "--smoke-device" || flag == "--smoke-after" || flag == "--smoke-format" || flag == "--smoke-get" || flag == "--smoke-catalog" || flag == "--smoke-filters" || flag == "--smoke-preview" || flag == "--smoke-clone" || flag == "--smoke-words" || flag == "--smoke-clip" || flag == "--smoke-ynison" => {

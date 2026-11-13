@@ -246,6 +246,37 @@ pub const SPEED_MAX: f32 = 2.0;
 pub const VOLUME_STEPS: [u8; 4] = [1, 2, 5, 10];
 pub const VOLUME_STEP_MAX: u8 = 25;
 
+/// Чем рисуется окно. Меняется только перезапуском: выбирается до создания окна.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Render {
+    /// Видеокарта через DirectX 12: меньше всего памяти.
+    Auto,
+    /// Видеокарта через Vulkan: если у DirectX 12 на этой видеокарте рябь или полосы.
+    Vulkan,
+    /// Процессор: без видеокарты совсем.
+    Cpu,
+}
+
+impl Render {
+    pub const ALL: [Render; 3] = [Render::Auto, Render::Vulkan, Render::Cpu];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Render::Auto => "auto",
+            Render::Vulkan => "vulkan",
+            Render::Cpu => "cpu",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Render::Auto => "DirectX 12",
+            Render::Vulkan => "Vulkan",
+            Render::Cpu => "Процессор",
+        }
+    }
+}
+
 /// Окно и запуск — как во вкладке «Окно» у Tune Client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowPrefs {
@@ -261,11 +292,12 @@ pub struct WindowPrefs {
     pub track_taskbar: bool,
     /// Ссылки `yandexmusic://` («Открыть в приложении» на сайте) открывает Tune.
     pub yandex_links: bool,
+    pub render: Render,
 }
 
 impl Default for WindowPrefs {
     fn default() -> Self {
-        Self { autostart: false, start_minimized: false, close_to_tray: true, track_title: false, track_taskbar: false, yandex_links: false }
+        Self { autostart: false, start_minimized: false, close_to_tray: true, track_title: false, track_taskbar: false, yandex_links: false, render: Render::Auto }
     }
 }
 
@@ -342,6 +374,7 @@ fn parse(v: &Value) -> Settings {
                 track_title: w["trackInTitle"].as_bool().unwrap_or(base.track_title),
                 track_taskbar: w["trackInTaskbar"].as_bool().unwrap_or(base.track_taskbar),
                 yandex_links: w["yandexLinks"].as_bool().unwrap_or(base.yandex_links),
+                render: Render::ALL.into_iter().find(|render| w["render"].as_str() == Some(render.code())).unwrap_or(base.render),
             }
         },
     }
@@ -375,7 +408,7 @@ pub fn save(settings: Settings) {
     let l = settings.lyrics;
     let lyrics = json!({ "enabled": l.enabled, "always": l.always, "lrclib": l.lrclib, "netease": l.netease, "neteaseFirst": l.netease_first });
     let w = settings.window;
-    let window = json!({ "autostart": w.autostart, "startMinimized": w.start_minimized, "closeToTray": w.close_to_tray, "trackInTitle": w.track_title, "trackInTaskbar": w.track_taskbar, "yandexLinks": w.yandex_links });
+    let window = json!({ "autostart": w.autostart, "startMinimized": w.start_minimized, "closeToTray": w.close_to_tray, "trackInTitle": w.track_title, "trackInTaskbar": w.track_taskbar, "yandexLinks": w.yandex_links, "render": w.render.code() });
     let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "books": settings.books, "concerts": settings.concerts, "words": settings.words, "wheel": settings.wheel, "speed": settings.speed, "theme": settings.look.code(), "skin": settings.skin.code(), "aquarium": { "live": settings.aquarium.live, "bubbles": settings.aquarium.bubbles, "dim": settings.aquarium.dim, "backdropBlur": settings.aquarium.backdrop_blur, "panelBlur": settings.aquarium.panel_blur, "panelDensity": settings.aquarium.panel_density }, "liquidGlass": { "on": settings.glass.on, "strength": settings.glass.strength }, "keepTrack": settings.keep_track, "uncensor": settings.uncensor, "ownInWave": settings.own_in_wave, "restoredInWave": settings.restored_in_wave, "window": window, "volumeWheel": settings.volume_wheel, "volumeStep": settings.volume_step, "speedControl": settings.speed_control, "speedStep": settings.speed_step, "pitchWithSpeed": settings.pitch, "reverb": settings.reverb, "lyrics": lyrics, "lyricsSize": settings.lyrics_size });
     let dir = api::data_dir();
     if fs::create_dir_all(&dir).is_ok() {
@@ -399,7 +432,9 @@ mod tests {
         assert!(!parse(&json!({ "keepTrack": false })).keep_track);
         assert_eq!((parse(&json!({ "volumeStep": 2 })).volume_step, parse(&json!({ "volumeStep": 7 })).volume_step, parse(&json!({ "volumeStep": 40 })).volume_step), (2, 7, 5));
         let window = parse(&json!({ "window": { "autostart": true, "closeToTray": false } })).window;
-        assert_eq!(window, WindowPrefs { autostart: true, start_minimized: false, close_to_tray: false, track_title: false, track_taskbar: false, yandex_links: false });
+        assert_eq!(window, WindowPrefs { autostart: true, start_minimized: false, close_to_tray: false, track_title: false, track_taskbar: false, yandex_links: false, render: Render::Auto });
+        assert_eq!(parse(&json!({ "window": { "render": "vulkan" } })).window.render, Render::Vulkan);
+        assert_eq!(parse(&json!({ "window": { "render": "opengl" } })).window.render, Render::Auto);
         assert!(!parse(&json!({ "words": false })).words);
         assert_eq!((parse(&json!({ "theme": "system" })).look, parse(&json!({ "theme": "pink" })).look), (Look::System, Look::Dark));
         assert_eq!((parse(&json!({ "speed": 1.5 })).speed, parse(&json!({ "speed": 7 })).speed, parse(&json!({ "speed": 0.75 })).speed), (1.5, 1.0, 0.75));
