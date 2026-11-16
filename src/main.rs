@@ -5610,8 +5610,15 @@ impl App {
                 let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) else { return Task::none() };
                 self.sync_ticks += 1;
                 let pages = if self.sync_ticks % SYNC_PAGES_EVERY == 0 { self.liked_pages_load() } else { Task::none() };
+                let full = self.sync_ticks % SYNC_PAGES_EVERY == 0;
                 let (revision, edits) = (self.likes_revision, self.likes_edits);
-                let likes = Task::perform(background(move || api::likes_since(&uid, revision, &token)), move |r| Message::LikesSynced(edits, r));
+                let likes = Task::perform(background(move || {
+                    let changed = api::likes_since(&uid, revision, &token)?;
+                    if changed.is_none() && full {
+                        return api::full_liked_ids(&token).map(|ids| Some((ids, revision)));
+                    }
+                    Ok(changed)
+                }), move |r| Message::LikesSynced(edits, r));
                 return Task::batch([pages, likes]);
             }
             Message::LikesSynced(edits, Ok(Some((ids, revision)))) => {

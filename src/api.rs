@@ -548,8 +548,23 @@ fn short_date(stamp: &str) -> Option<String> {
 
 /// Номера треков из «Мне нравится», сначала новые.
 pub fn liked_ids(uid: &str, token: &str) -> Result<Vec<String>, String> {
+    if let Ok(ids) = full_liked_ids(token) {
+        return Ok(ids);
+    }
     let v = get(&format!("users/{uid}/likes/tracks"), &[], token)?;
     Ok(parse_liked_ids(result(&v)))
+}
+
+pub fn full_liked_ids(token: &str) -> Result<Vec<String>, String> {
+    let value = post("collection/sync", "application/json", r#"{"likedTracks":{"revision":0}}"#.to_string(), token)?;
+    parse_full_liked_ids(result(&value))
+}
+
+fn parse_full_liked_ids(value: &Value) -> Result<Vec<String>, String> {
+    let rows = value["values"]["likedTracks"]["values"]["liked"].as_array().ok_or("Яндекс не прислал полный список лайков")?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(rows.iter().filter_map(|track| id_text(&track["trackId"]).or_else(|| id_text(&track["id"])))
+        .filter(|id| seen.insert(id.clone())).collect())
 }
 
 fn parse_liked_ids(v: &Value) -> Vec<String> {
@@ -561,7 +576,10 @@ fn parse_liked_ids(v: &Value) -> Vec<String> {
 pub fn likes_since(uid: &str, revision: u64, token: &str) -> Result<Option<(Vec<String>, u64)>, String> {
     let since = revision.to_string();
     let v = get(&format!("users/{uid}/likes/tracks"), &[("if-modified-since-revision", &since)], token)?;
-    parse_likes_since(&v, revision)
+    let Some((_, next_revision)) = parse_likes_since(&v, revision)? else { return Ok(None) };
+    // Some removed tracks are absent from the public playlist, even though their like is saved.
+    let ids = full_liked_ids(token)?;
+    Ok(Some((ids, next_revision)))
 }
 
 fn parse_likes_since(v: &Value, revision: u64) -> Result<Option<(Vec<String>, u64)>, String> {
@@ -582,7 +600,12 @@ pub fn tracks_by_ids(ids: &[String], token: &str) -> Result<Vec<Track>, String> 
     let body = format!("track-ids={}", ids.join("%2C"));
     let v = post("tracks", "application/x-www-form-urlencoded", body, token)?;
     let found: Vec<Track> = v["result"].as_array().into_iter().flatten().filter_map(parse_track).collect();
-    Ok(ids.iter().filter_map(|id| found.iter().find(|t| t.id == *id).cloned()).collect())
+    Ok(ids.iter().filter_map(|id| {
+        found.iter().find(|t| t.id == *id).cloned().or_else(|| {
+            if crate::uncensor::file(id).is_none() { return None }
+            parse_track(&json!({"id": id, "available": false}))
+        })
+    }).collect())
 }
 
 /// Какие из треков Яндекс закрыл или удалил: `available: false` в ответе как есть, до
@@ -670,7 +693,7 @@ pub fn set_liked(uid: &str, track_id: &str, liked: bool, token: &str) -> Result<
         format!("users/{uid}/likes/tracks/{track_id}/remove")
     };
     let v = post(&path, "application/x-www-form-urlencoded", String::new(), token)?;
-    if result(&v)["revision"].is_null() {
+    if result(&v)["revision"].is_null() && !full_liked_ids(token).is_ok_and(|ids| ids.iter().any(|id| id == track_id) == liked) {
         return Err("Яндекс не сохранил лайк".into());
     }
     Ok(())
@@ -3699,6 +3722,16 @@ mod tests {
     fn liked_ids_parse() {
         let v = serde_json::json!({"library": {"revision": 5, "tracks": [{"id": "1", "albumId": "2"}, {"id": 3}]}});
         assert_eq!(parse_liked_ids(&v), vec!["1".to_string(), "3".to_string()]);
+    }
+
+    #[test]
+    fn full_likes_include_hidden_ids_and_accept_empty_lists() {
+        let value = json!({"values":{"likedTracks":{"values":{"liked":[
+            {"trackId":"110945084"},{"trackId":110945084},{"trackId":"ugc-1"}
+        ]}}}});
+        assert_eq!(parse_full_liked_ids(&value).unwrap(), vec!["110945084", "ugc-1"]);
+        assert!(parse_full_liked_ids(&json!({"values":{"likedTracks":{"values":{"liked":[]}}}})).unwrap().is_empty());
+        assert!(parse_full_liked_ids(&json!({})).is_err());
     }
 
     #[test]
