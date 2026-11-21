@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use crate::api;
 use crate::equalizer::{self, EqSettings};
+use crate::spatial::{self, EightDMode, EightDSettings};
 
 /// Тема оформления. «Как в системе» следит за настройкой Windows.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -225,6 +226,8 @@ pub struct Settings {
     pub pitch: bool,
     /// Реверб, 0–100 %: доля зала в звуке.
     pub reverb: u8,
+    /// Настройки 8D звука.
+    pub eight_d: EightDSettings,
     /// Откуда брать текст песен.
     pub lyrics: crate::lyrics::Sources,
     /// Размер строк текста песен.
@@ -349,6 +352,7 @@ fn parse(v: &Value) -> Settings {
         speed_step: v["speedStep"].as_f64().map(|x| ((x * 100.0).round() / 100.0) as f32).filter(|x| (SPEED_STEP_MIN..=SPEED_STEP_MAX).contains(x)).unwrap_or(0.25),
         pitch: v["pitchWithSpeed"].as_bool().unwrap_or(false),
         reverb: v["reverb"].as_u64().map_or(0, |x| x.min(100) as u8),
+        eight_d: parse_eight_d(&v["eightD"]),
         lyrics: {
             let base = crate::lyrics::Sources::default();
             let l = &v["lyrics"];
@@ -391,6 +395,18 @@ fn parse_eq(v: &Value) -> EqSettings {
     }
 }
 
+fn parse_eight_d(v: &Value) -> EightDSettings {
+    let base = EightDSettings::default();
+    EightDSettings {
+        enabled: v["enabled"].as_bool().unwrap_or(base.enabled),
+        mode: v["mode"].as_str().map_or(base.mode, EightDMode::from_code),
+        period: v["period"].as_f64().map_or(base.period, |x| (x as f32).clamp(spatial::PERIOD_MIN, spatial::PERIOD_MAX)),
+        smoothness: unit(&v["smoothness"], base.smoothness),
+        depth: unit(&v["depth"], base.depth),
+        sensitivity: v["sensitivity"].as_f64().map_or(base.sensitivity, |x| (x as f32).clamp(spatial::SENSITIVITY_MIN, spatial::SENSITIVITY_MAX)),
+    }
+}
+
 pub fn load() -> Settings {
     let text = fs::read(api::data_dir().join("settings.json")).unwrap_or_default();
     parse(&serde_json::from_slice(&text).unwrap_or(Value::Null))
@@ -409,7 +425,9 @@ pub fn save(settings: Settings) {
     let lyrics = json!({ "enabled": l.enabled, "always": l.always, "lrclib": l.lrclib, "netease": l.netease, "neteaseFirst": l.netease_first });
     let w = settings.window;
     let window = json!({ "autostart": w.autostart, "startMinimized": w.start_minimized, "closeToTray": w.close_to_tray, "trackInTitle": w.track_title, "trackInTaskbar": w.track_taskbar, "yandexLinks": w.yandex_links, "render": w.render.code() });
-    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "books": settings.books, "concerts": settings.concerts, "words": settings.words, "wheel": settings.wheel, "speed": settings.speed, "theme": settings.look.code(), "skin": settings.skin.code(), "aquarium": { "live": settings.aquarium.live, "bubbles": settings.aquarium.bubbles, "dim": settings.aquarium.dim, "backdropBlur": settings.aquarium.backdrop_blur, "panelBlur": settings.aquarium.panel_blur, "panelDensity": settings.aquarium.panel_density }, "liquidGlass": { "on": settings.glass.on, "strength": settings.glass.strength }, "keepTrack": settings.keep_track, "uncensor": settings.uncensor, "ownInWave": settings.own_in_wave, "restoredInWave": settings.restored_in_wave, "window": window, "volumeWheel": settings.volume_wheel, "volumeStep": settings.volume_step, "speedControl": settings.speed_control, "speedStep": settings.speed_step, "pitchWithSpeed": settings.pitch, "reverb": settings.reverb, "lyrics": lyrics, "lyricsSize": settings.lyrics_size });
+    let s8 = settings.eight_d;
+    let eight_d = json!({ "enabled": s8.enabled, "mode": s8.mode.code(), "period": s8.period, "smoothness": s8.smoothness, "depth": s8.depth, "sensitivity": s8.sensitivity });
+    let value = json!({ "volume": settings.volume, "muted": settings.muted, "repeat": repeat, "shuffle": settings.shuffle, "quality": settings.quality.code(), "wave": settings.wave, "equalizer": equalizer, "crossfade": settings.crossfade, "normalize": settings.normalize, "lite": settings.lite, "kids": settings.kids, "books": settings.books, "concerts": settings.concerts, "words": settings.words, "wheel": settings.wheel, "speed": settings.speed, "theme": settings.look.code(), "skin": settings.skin.code(), "aquarium": { "live": settings.aquarium.live, "bubbles": settings.aquarium.bubbles, "dim": settings.aquarium.dim, "backdropBlur": settings.aquarium.backdrop_blur, "panelBlur": settings.aquarium.panel_blur, "panelDensity": settings.aquarium.panel_density }, "liquidGlass": { "on": settings.glass.on, "strength": settings.glass.strength }, "keepTrack": settings.keep_track, "uncensor": settings.uncensor, "ownInWave": settings.own_in_wave, "restoredInWave": settings.restored_in_wave, "window": window, "volumeWheel": settings.volume_wheel, "volumeStep": settings.volume_step, "speedControl": settings.speed_control, "speedStep": settings.speed_step, "pitchWithSpeed": settings.pitch, "reverb": settings.reverb, "eightD": eight_d, "lyrics": lyrics, "lyricsSize": settings.lyrics_size });
     let dir = api::data_dir();
     if fs::create_dir_all(&dir).is_ok() {
         let _ = fs::write(dir.join("settings.json"), value.to_string());
@@ -423,9 +441,11 @@ mod tests {
     #[test]
     fn reads_saved_and_broken_values() {
         let saved = parse(&json!({ "volume": 0.25, "muted": true, "repeat": "one", "shuffle": true, "quality": "lossless", "normalize": true }));
-        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default(), crossfade: true, normalize: true, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, skin: Skin::Standard, aquarium: AquariumPrefs::default(), glass: GlassPrefs::default(), keep_track: true, uncensor: true, own_in_wave: true, restored_in_wave: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0, lyrics: crate::lyrics::Sources::default(), lyrics_size: 26 });
+        assert_eq!(saved, Settings { volume: 0.25, muted: true, repeat: Repeat::One, shuffle: true, wave: [0; 4], quality: Quality::Lossless, eq: EqSettings::default(), crossfade: true, normalize: true, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, skin: Skin::Standard, aquarium: AquariumPrefs::default(), glass: GlassPrefs::default(), keep_track: true, uncensor: true, own_in_wave: true, restored_in_wave: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0, eight_d: EightDSettings::default(), lyrics: crate::lyrics::Sources::default(), lyrics_size: 26 });
         let empty = parse(&Value::Null);
-        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default(), crossfade: true, normalize: false, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, skin: Skin::Standard, aquarium: AquariumPrefs::default(), glass: GlassPrefs::default(), keep_track: true, uncensor: true, own_in_wave: true, restored_in_wave: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0, lyrics: crate::lyrics::Sources::default(), lyrics_size: 26 });
+        assert_eq!(empty, Settings { volume: 0.8, muted: false, repeat: Repeat::Off, shuffle: false, wave: [0; 4], quality: Quality::Normal, eq: EqSettings::default(), crossfade: true, normalize: false, lite: false, kids: true, books: true, concerts: true, words: true, wheel: true, speed: 1.0, look: Look::Dark, skin: Skin::Standard, aquarium: AquariumPrefs::default(), glass: GlassPrefs::default(), keep_track: true, uncensor: true, own_in_wave: true, restored_in_wave: true, window: WindowPrefs::default(), volume_wheel: true, volume_step: 5, speed_control: false, speed_step: 0.25, pitch: false, reverb: 0, eight_d: EightDSettings::default(), lyrics: crate::lyrics::Sources::default(), lyrics_size: 26 });
+        let eight_d = parse(&json!({ "eightD": { "enabled": true, "mode": "beats", "period": 12.0, "smoothness": 0.4, "depth": 0.9, "sensitivity": 0.8 } })).eight_d;
+        assert_eq!(eight_d, EightDSettings { enabled: true, mode: EightDMode::Beats, period: 12.0, smoothness: 0.4, depth: 0.9, sensitivity: 0.8 });
         assert!(!parse(&json!({ "crossfade": false })).crossfade);
         assert!(!parse(&json!({ "kids": false })).kids);
         assert!(!parse(&json!({ "books": false })).books && !parse(&json!({ "concerts": false })).concerts);

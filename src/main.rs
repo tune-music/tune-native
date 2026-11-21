@@ -40,6 +40,7 @@ use fit::{fit, fit_row};
 mod pick;
 mod equalizer;
 mod reverb;
+mod spatial;
 mod settings;
 mod ui;
 mod vibe;
@@ -56,7 +57,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use iced::futures::channel::{mpsc, oneshot};
 use iced::widget::text::Wrapping;
 use iced::keyboard;
-use iced::widget::{button, canvas, column, container, image, mouse_area, operation, pick_list, pin, responsive, row, scrollable, stack, text, text_input, tooltip, vertical_slider, Id, Space};
+use iced::widget::{button, canvas, column, container, image, mouse_area, operation, pick_list, pin, responsive, row, scrollable, slider, stack, text, text_input, tooltip, vertical_slider, Id, Space};
 use anim::{hover_line, reveal, smooth, Fade};
 use glow::{glow, shine};
 use iced::{event, mouse, time, window, Alignment, Event, Element, Length, Padding, Size, Subscription, Task};
@@ -1489,6 +1490,7 @@ struct App {
     speed_step: f32,
     pitch: bool,
     reverb: u8,
+    eight_d: spatial::EightDSettings,
     lyrics_sources: lyrics::Sources,
     lyrics_size: u8,
     skin: Skin,
@@ -1885,6 +1887,13 @@ enum Message {
     SpeedStepSet(u8),
     PitchToggle,
     ReverbSet(u8),
+    EightDToggle,
+    EightDModeSet(spatial::EightDMode),
+    EightDPeriod(f32),
+    EightDSmoothness(f32),
+    EightDDepth(f32),
+    EightDSensitivity(f32),
+    EightDSave,
     LyricsSourcesSet(lyrics::Sources),
     LyricsSizeSet(u8),
     /// Кнопка скорости: шаг вверх или вниз (колесо), 0 — обычная скорость.
@@ -2332,6 +2341,7 @@ impl App {
             speed_step: saved.speed_step,
             pitch: saved.pitch,
             reverb: saved.reverb,
+            eight_d: saved.eight_d,
             lyrics_sources: saved.lyrics,
             lyrics_size: saved.lyrics_size,
             skin: saved.skin,
@@ -2713,7 +2723,9 @@ impl App {
         if let Some(p) = &self.player {
             p.set_speed(self.current_track().map_or(1.0, |track| self.speed_for(track)));
             p.set_pitch(self.speed_control && self.pitch);
-            p.set_reverb(f32::from(self.reverb) / 100.0);
+            let reverb = f32::from(self.reverb) / 100.0;
+            p.set_reverb(if self.eight_d.enabled { reverb.max(0.16 * self.eight_d.depth) } else { reverb });
+            p.set_eight_d(self.eight_d);
         }
     }
 
@@ -2725,7 +2737,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, skin: self.skin, aquarium: self.aquarium, glass: self.glass, keep_track: self.keep_track, own_in_wave: self.own_in_wave, restored_in_wave: self.restored_in_wave, uncensor: self.uncensor, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb, lyrics: self.lyrics_sources, lyrics_size: self.lyrics_size });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, skin: self.skin, aquarium: self.aquarium, glass: self.glass, keep_track: self.keep_track, own_in_wave: self.own_in_wave, restored_in_wave: self.restored_in_wave, uncensor: self.uncensor, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb, eight_d: self.eight_d, lyrics: self.lyrics_sources, lyrics_size: self.lyrics_size });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -7884,6 +7896,35 @@ impl App {
                 self.apply_speed();
                 self.save_settings();
             }
+            Message::EightDToggle => {
+                self.eight_d.enabled = !self.eight_d.enabled;
+                self.apply_speed();
+                self.save_settings();
+            }
+            Message::EightDModeSet(mode) => {
+                self.eight_d.mode = mode;
+                self.apply_speed();
+                self.save_settings();
+            }
+            Message::EightDPeriod(period) => {
+                self.eight_d.period = (period * 2.0).round() / 2.0;
+                self.apply_speed();
+            }
+            Message::EightDSmoothness(percent) => {
+                self.eight_d.smoothness = (percent / 100.0).clamp(0.0, 1.0);
+                self.apply_speed();
+            }
+            Message::EightDDepth(percent) => {
+                self.eight_d.depth = (percent / 100.0).clamp(0.0, 1.0);
+                self.apply_speed();
+            }
+            Message::EightDSensitivity(percent) => {
+                self.eight_d.sensitivity = (percent / 100.0).clamp(spatial::SENSITIVITY_MIN, spatial::SENSITIVITY_MAX);
+                self.apply_speed();
+            }
+            Message::EightDSave => {
+                self.save_settings();
+            }
             Message::EqOpen => self.eq_menu = Some(eq_place(*CURSOR.lock().unwrap())),
             Message::EqToggle => {
                 self.eq.enabled = !self.eq.enabled;
@@ -10474,7 +10515,44 @@ impl App {
                                 .push(container(column![column![text("Шаг скорости").color(ui::c().text), text("Свой — от 0,01 до 0,5").size(13).color(ui::c().muted)].spacing(2), steps.wrap().vertical_spacing(8)].spacing(10)).padding(8))
                                 .push(toggle("Тон вместе со скоростью", "Быстрее — выше, как в найткоре; медленнее — ниже, как в слоуде. Иначе голос звучит своим тоном на любой скорости", Some(self.pitch), Some(Message::PitchToggle)));
                         }
-                        effects.push(container(column![column![text("Реверб").color(ui::c().text), text("Эхо большого зала поверх трека — с замедлением получается slowed + reverb. Свой — от 0 до 100 %").size(13).color(ui::c().muted)].spacing(2), reverbs.wrap().vertical_spacing(8)].spacing(10)).padding(8))
+                        effects = effects.push(container(column![column![text("Реверб").color(ui::c().text), text("Эхо большого зала поверх трека — с замедлением получается slowed + reverb. Свой — от 0 до 100 %").size(13).color(ui::c().muted)].spacing(2), reverbs.wrap().vertical_spacing(8)].spacing(10)).padding(8));
+                        effects = effects.push(toggle("8D звук", "Пространственное вращение звука вокруг головы", Some(self.eight_d.enabled), Some(Message::EightDToggle)));
+                        if self.eight_d.enabled {
+                            let modes = spatial::EightDMode::ALL.into_iter().fold(row![].spacing(8), |line, mode| {
+                                line.push(shine(button(text(mode.label()).size(14)).padding([7, 16]).style(ui::chip(mode == self.eight_d.mode)).on_press(Message::EightDModeSet(mode)), 18.0))
+                            });
+                            let slider_row = |label: &'static str, value_text: String, bar: iced::widget::Slider<'static, f32, Message>| {
+                                row![
+                                    text(label).size(14).color(ui::c().text).width(92),
+                                    container(bar).width(Length::Fill),
+                                    text(value_text).size(13).color(ui::c().muted).width(58).align_x(iced::alignment::Horizontal::Right),
+                                ]
+                                .spacing(12)
+                                .align_y(iced::Alignment::Center)
+                            };
+                            let period_label = if self.eight_d.mode == spatial::EightDMode::Fixed { "Период" } else { "База" };
+                            let period_text = format!("{:.1} с", self.eight_d.period).replace('.', ",");
+                            let smooth_pct = (self.eight_d.smoothness * 100.0).round();
+                            let depth_pct = (self.eight_d.depth * 100.0).round();
+                            let sens_pct = (self.eight_d.sensitivity * 100.0).round();
+                            let mut eight_d_box = column![
+                                column![
+                                    text("Режим").color(ui::c().text),
+                                    text(self.eight_d.mode.description()).size(13).color(ui::c().muted),
+                                ]
+                                .spacing(2),
+                                modes.wrap().vertical_spacing(8),
+                                slider_row(period_label, period_text, slider(spatial::PERIOD_MIN..=spatial::PERIOD_MAX, self.eight_d.period, Message::EightDPeriod).step(0.5).on_release(Message::EightDSave).style(ui::eq_slider(true, 1.0))),
+                                slider_row("Плавность", format!("{smooth_pct:.0}%"), slider(0.0..=100.0, smooth_pct, Message::EightDSmoothness).step(1.0).on_release(Message::EightDSave).style(ui::eq_slider(true, 1.0))),
+                                slider_row("Ширина", format!("{depth_pct:.0}%"), slider(0.0..=100.0, depth_pct, Message::EightDDepth).step(1.0).on_release(Message::EightDSave).style(ui::eq_slider(true, 1.0))),
+                            ]
+                            .spacing(10);
+                            if self.eight_d.mode != spatial::EightDMode::Fixed {
+                                eight_d_box = eight_d_box.push(slider_row("Отклик", format!("{sens_pct:.0}%"), slider(10.0..=100.0, sens_pct, Message::EightDSensitivity).step(1.0).on_release(Message::EightDSave).style(ui::eq_slider(true, 1.0))));
+                            }
+                            effects = effects.push(container(eight_d_box).padding(8));
+                        }
+                        effects
                     },
                     column![
                         title("Управление"),

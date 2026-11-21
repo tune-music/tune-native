@@ -259,6 +259,7 @@ pub struct Player {
     /// Скорость и место играющего трека: при ускорении счётчик вывода отстаёт от трека.
     speed: Speed,
     reverb: crate::reverb::Amount,
+    eight_d: crate::spatial::Shared,
     clock: Arc<Mutex<Option<Clock>>>,
     _device: Arc<Mutex<Option<SendDevice>>>,
     /// Сигнал, что устройство пропало и его надо открыть заново.
@@ -437,6 +438,7 @@ impl Player {
             eq: Shared::default(),
             speed: Speed::default(),
             reverb: crate::reverb::Amount::default(),
+            eight_d: crate::spatial::Shared::default(),
             clock: Arc::default(),
             _device: slot,
             device_lost: signal,
@@ -572,7 +574,8 @@ impl Player {
         let clock = Clock::default();
         *self.clock.lock().unwrap() = Some(clock.clone());
         let stretched = Stretched::new(Faded::new(Equalized::new(decoder, self.eq.clone()), fade_in, fade_out), self.speed.clone(), clock);
-        output.append(crate::reverb::Reverb::new(stretched, self.reverb.clone()));
+        let spatial = crate::spatial::Spatial::new(stretched, self.eight_d.clone());
+        output.append(crate::reverb::Reverb::new(spatial, self.reverb.clone()));
         // Если переход начинается не с нуля, новый трек сразу встаёт на свою точку.
         if let Some((start, _)) = fade_in.filter(|(start, _)| *start > 0.05) {
             let _ = output.try_seek(Duration::from_secs_f32(start));
@@ -644,6 +647,11 @@ impl Player {
     /// Доля зала 0…1; слышна сразу, в том числе в играющем треке.
     pub fn set_reverb(&self, amount: f32) {
         self.reverb.set(amount);
+    }
+
+    /// Настройки 8D звука; слышны сразу, в том числе в играющем треке.
+    pub fn set_eight_d(&self, settings: crate::spatial::EightDSettings) {
+        self.eight_d.set(settings);
     }
 
     /// Новые настройки эквалайзера слышны сразу, в том числе в играющем треке.
