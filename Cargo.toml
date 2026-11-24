@@ -3,6 +3,7 @@ name = "tune-native"
 version = "0.1.4"
 description = "Нативный клиент Яндекс Музыки на Rust"
 edition = "2021"
+license = "GPL-3.0-only"
 publish = false
 
 [dependencies]
