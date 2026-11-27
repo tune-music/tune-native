@@ -265,6 +265,7 @@ pub fn login_data_dir() -> PathBuf {
 }
 
 pub fn logout() {
+    clear_sync_session();
     forget_cache();
     let _ = std::fs::remove_file(token_path());
     let _ = std::fs::remove_dir_all(login_data_dir());
@@ -312,6 +313,19 @@ fn cacheable(path: &str) -> bool {
     !path.starts_with("music-history") && !path.contains("file-info") && !path.starts_with("rotor") && !path.ends_with("/lyrics")
 }
 
+fn get_fresh(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, String> {
+    let mut waits = BUSY_WAITS.iter();
+    loop {
+        match fetch(path, query, token) {
+            Err(e) if e == BUSY => match waits.next() {
+                Some(wait) => std::thread::sleep(*wait),
+                None => return Err(e),
+            },
+            other => return other,
+        }
+    }
+}
+
 fn get(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, String> {
     let key = format!("{path}?{query:?}");
     if cacheable(path) {
@@ -319,16 +333,7 @@ fn get(path: &str, query: &[(&str, &str)], token: &str) -> Result<Value, String>
             return Ok(value);
         }
     }
-    let mut waits = BUSY_WAITS.iter();
-    let value = loop {
-        match fetch(path, query, token) {
-            Err(e) if e == BUSY => match waits.next() {
-                Some(wait) => std::thread::sleep(*wait),
-                None => return Err(e),
-            },
-            other => break other?,
-        }
-    };
+    let value = get_fresh(path, query, token)?;
     if cacheable(path) {
         CACHE.lock().unwrap().put(key, value.clone(), Instant::now());
     }
@@ -465,7 +470,14 @@ fn parse_track(v: &Value) -> Option<Track> {
 
 pub fn search(text: &str, token: &str) -> Result<Vec<Track>, String> {
     let v = get("search", &[("text", text), ("type", "track"), ("page", "0")], token)?;
-    Ok(v["result"]["tracks"]["results"].as_array().into_iter().flatten().filter_map(parse_track).collect())
+    let mut out: Vec<Track> = crate::uncensor::search_tracks(text).iter().filter_map(parse_track).collect();
+    let mut seen: std::collections::HashSet<String> = out.iter().map(|t| t.id.clone()).collect();
+    for track in v["result"]["tracks"]["results"].as_array().into_iter().flatten().filter_map(parse_track) {
+        if seen.insert(track.id.clone()) {
+            out.push(track);
+        }
+    }
+    Ok(out)
 }
 
 /// Сырой ответ API для разбора новых запросов: `tune-native --api путь`.
@@ -546,18 +558,33 @@ fn short_date(stamp: &str) -> Option<String> {
     Some(format!("{day}.{month}.{year}"))
 }
 
+fn merge_prefix_ids(prefix: Vec<String>, base: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(prefix.len() + base.len());
+    for id in prefix.into_iter().chain(base) {
+        if seen.insert(id.clone()) {
+            out.push(id);
+        }
+    }
+    out
+}
+
 /// Номера треков из «Мне нравится», сначала новые.
 pub fn liked_ids(uid: &str, token: &str) -> Result<Vec<String>, String> {
     if let Ok(ids) = full_liked_ids(token) {
         return Ok(ids);
     }
     let v = get(&format!("users/{uid}/likes/tracks"), &[], token)?;
-    Ok(parse_liked_ids(result(&v)))
+    Ok(merge_prefix_ids(
+        crate::uncensor::local_liked_tracks(),
+        parse_liked_ids(result(&v)),
+    ))
 }
 
 pub fn full_liked_ids(token: &str) -> Result<Vec<String>, String> {
     let value = post("collection/sync", "application/json", r#"{"likedTracks":{"revision":0}}"#.to_string(), token)?;
-    parse_full_liked_ids(result(&value))
+    let ids = parse_full_liked_ids(result(&value))?;
+    Ok(merge_prefix_ids(crate::uncensor::local_liked_tracks(), ids))
 }
 
 fn parse_full_liked_ids(value: &Value) -> Result<Vec<String>, String> {
@@ -597,13 +624,27 @@ fn parse_likes_since(v: &Value, revision: u64) -> Result<Option<(Vec<String>, u6
 
 /// Сведения о треках в том же порядке, что и номера.
 pub fn tracks_by_ids(ids: &[String], token: &str) -> Result<Vec<Track>, String> {
-    let body = format!("track-ids={}", ids.join("%2C"));
-    let v = post("tracks", "application/x-www-form-urlencoded", body, token)?;
-    let found: Vec<Track> = v["result"].as_array().into_iter().flatten().filter_map(parse_track).collect();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let yandex_ids: Vec<&str> = ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !crate::uncensor::is_synthetic_track_id(id))
+        .collect();
+    let found: Vec<Track> = if yandex_ids.is_empty() {
+        Vec::new()
+    } else {
+        let body = format!("track-ids={}", yandex_ids.join("%2C"));
+        let v = post("tracks", "application/x-www-form-urlencoded", body, token)?;
+        v["result"].as_array().into_iter().flatten().filter_map(parse_track).collect()
+    };
     Ok(ids.iter().filter_map(|id| {
         found.iter().find(|t| t.id == *id).cloned().or_else(|| {
-            if crate::uncensor::file(id).is_none() { return None }
-            parse_track(&json!({"id": id, "available": false}))
+            crate::uncensor::catalog_track_json(id).as_ref().and_then(parse_track).or_else(|| {
+                if crate::uncensor::file(id).is_none() { return None }
+                parse_track(&json!({"id": id, "available": false}))
+            })
         })
     }).collect())
 }
@@ -618,6 +659,9 @@ pub fn unavailable_ids(ids: &[String], token: &str) -> Result<Vec<String>, Strin
 
 /// Номера похожих исполнителей.
 pub fn similar_artist_ids(id: &str, token: &str) -> Result<Vec<String>, String> {
+    if crate::uncensor::is_synthetic_artist_id(id) {
+        return Ok(Vec::new());
+    }
     let v = get(&format!("artists/{id}/similar"), &[], token)?;
     Ok(result(&v)["similarArtists"].as_array().into_iter().flatten().filter_map(|a| id_text(&a["id"])).collect())
 }
@@ -632,12 +676,48 @@ fn parse_filter_ids(v: &Value) -> Vec<String> {
 
 /// Поиск внутри плейлиста на сервере. Лайки для него тоже плейлист.
 pub fn search_playlist(uid: &str, kind: &str, part: &str, token: &str) -> Result<Vec<Track>, String> {
-    let v = get(&format!("search-playlist/{uid}/{kind}"), &[("part", part)], token)?;
-    let mut tracks = Vec::new();
-    for page in parse_filter_ids(&v).chunks(FILTER_PAGE) {
-        tracks.extend(tracks_by_ids(page, token)?);
+    if uid == crate::uncensor::CATALOG_OWNER {
+        let (_, ids) = crate::uncensor::catalog_playlist(kind)
+            .ok_or_else(|| "Плейлист не найден в каталоге Tune".to_string())?;
+        let matched: Vec<String> = ids
+            .into_iter()
+            .filter(|id| crate::uncensor::track_matches_query(id, part))
+            .take(FILTER_LIMIT)
+            .collect();
+        return tracks_by_ids(&matched, token);
     }
-    Ok(tracks)
+    let local_candidates = if kind == "3" {
+        crate::uncensor::local_liked_tracks()
+    } else {
+        crate::uncensor::local_playlist_tracks(uid, kind)
+    };
+    let local_ids: Vec<String> = local_candidates
+        .into_iter()
+        .filter(|id| crate::uncensor::track_matches_query(id, part))
+        .take(FILTER_LIMIT)
+        .collect();
+    let local_tracks = if local_ids.is_empty() {
+        Vec::new()
+    } else {
+        tracks_by_ids(&local_ids, token).unwrap_or_default()
+    };
+
+    let mut tracks = local_tracks;
+    let mut seen: HashSet<String> = tracks.iter().map(|t| t.id.clone()).collect();
+    match get(&format!("search-playlist/{uid}/{kind}"), &[("part", part)], token) {
+        Ok(v) => {
+            for page in parse_filter_ids(&v).chunks(FILTER_PAGE) {
+                for track in tracks_by_ids(page, token)? {
+                    if seen.insert(track.id.clone()) {
+                        tracks.push(track);
+                    }
+                }
+            }
+            Ok(tracks)
+        }
+        Err(_) if !tracks.is_empty() => Ok(tracks),
+        Err(e) => Err(e),
+    }
 }
 
 fn parse_credits(v: &Value) -> Vec<(String, String)> {
@@ -680,6 +760,34 @@ fn parse_details(full: &Value, genres: &Value, credits: Vec<(String, String)>) -
 
 /// Авторы — главное в окне, остальное дополняет их и может не прийти.
 pub fn track_details(id: &str, token: &str) -> Result<TrackDetails, String> {
+    if crate::uncensor::is_synthetic_track_id(id) {
+        let mut facts = vec![("Источник".to_string(), "Каталог Tune".to_string())];
+        let mut similar = Vec::new();
+        if let Some(track) = crate::uncensor::catalog_track_json(id).as_ref().and_then(parse_track) {
+            if let Some(album_id) = track.album.as_deref() {
+                if !track.album_title.is_empty() {
+                    facts.push(("Альбом".to_string(), track.album_title.clone()));
+                }
+                if let Some(alb) = crate::uncensor::catalog_album_json(album_id) {
+                    if let Some(year) = alb["year"].as_u64() {
+                        facts.push(("Год".to_string(), year.to_string()));
+                    }
+                }
+                if let Some(volumes) = crate::uncensor::album_volumes(album_id) {
+                    let peers: Vec<String> = volumes
+                        .into_iter()
+                        .flatten()
+                        .filter(|tid| tid != id)
+                        .take(15)
+                        .collect();
+                    if !peers.is_empty() {
+                        similar = tracks_by_ids(&peers, token).unwrap_or_default();
+                    }
+                }
+            }
+        }
+        return Ok(TrackDetails { facts, similar });
+    }
     let credits = parse_credits(&get(&format!("tracks/{id}/credits"), &[], token)?);
     let full = get(&format!("tracks/{id}/full-info"), &[], token).map(|v| result(&v).clone()).unwrap_or(Value::Null);
     let genres = get("genres", &[], token).map(|v| result(&v).clone()).unwrap_or(Value::Null);
@@ -687,6 +795,9 @@ pub fn track_details(id: &str, token: &str) -> Result<TrackDetails, String> {
 }
 
 pub fn set_liked(uid: &str, track_id: &str, liked: bool, token: &str) -> Result<(), String> {
+    if crate::uncensor::is_synthetic_track_id(track_id) {
+        return crate::uncensor::set_local_track_liked(track_id, liked);
+    }
     let path = if liked {
         format!("users/{uid}/likes/tracks/add?track-id={track_id}")
     } else {
@@ -701,6 +812,9 @@ pub fn set_liked(uid: &str, track_id: &str, liked: bool, token: &str) -> Result<
 
 /// Дизлайк: Яндекс больше не предложит этот трек.
 pub fn set_disliked(uid: &str, track_id: &str, disliked: bool, token: &str) -> Result<(), String> {
+    if crate::uncensor::is_synthetic_track_id(track_id) {
+        return crate::uncensor::set_local_track_disliked(track_id, disliked);
+    }
     let path = if disliked {
         format!("users/{uid}/dislikes/tracks/add?track-id={track_id}")
     } else {
@@ -716,14 +830,175 @@ pub fn set_disliked(uid: &str, track_id: &str, disliked: bool, token: &str) -> R
 pub fn disliked_ids(uid: &str, token: &str) -> Result<Vec<String>, String> {
     let v = get(&format!("users/{uid}/dislikes/tracks"), &[], token)?;
     let tracks = result(&v)["library"]["tracks"].as_array().cloned().unwrap_or_default();
-    Ok(tracks
+    let yandex_ids: Vec<String> = tracks
         .iter()
         .filter_map(|t| match &t["id"] {
             Value::String(s) => Some(s.clone()),
             Value::Number(n) => Some(n.to_string()),
             _ => None,
         })
-        .collect())
+        .collect();
+    Ok(merge_prefix_ids(crate::uncensor::local_disliked_tracks(), yandex_ids))
+}
+
+const TUNE_AVATAR_PNG: &[u8] = include_bytes!("../assets/tune.png");
+const SYNC_COALESCE_DELAY: Duration = Duration::from_millis(200);
+
+#[derive(Default)]
+struct PushQueue {
+    running: bool,
+    pending: Option<(String, String)>,
+}
+
+static SYNC_SESSION: LazyLock<Mutex<Option<(String, String)>>> = LazyLock::new(Mutex::default);
+static PUSH_QUEUE: LazyLock<Mutex<PushQueue>> = LazyLock::new(Mutex::default);
+static SYNC_IO_LOCK: LazyLock<Mutex<()>> = LazyLock::new(Mutex::default);
+
+pub fn set_sync_session(uid: &str, token: &str) {
+    if !uid.is_empty() && !token.is_empty() {
+        *SYNC_SESSION.lock().unwrap() = Some((uid.to_string(), token.to_string()));
+    }
+}
+
+pub fn clear_sync_session() {
+    *SYNC_SESSION.lock().unwrap() = None;
+    PUSH_QUEUE.lock().unwrap().pending = None;
+}
+
+fn is_sync_playlist_json(v: &Value) -> bool {
+    let title = v["title"].as_str().unwrap_or("");
+    let desc = v["description"].as_str().unwrap_or("");
+    crate::uncensor::is_sync_playlist(title, desc)
+}
+
+fn has_custom_playlist_cover(v: &Value) -> bool {
+    v["cover"]["custom"].as_bool() == Some(true)
+        || (v["cover"]["type"].as_str() == Some("pic")
+            && v["cover"]["uri"].as_str().is_some_and(|s| !s.is_empty()))
+}
+
+fn extract_sync_shards(v: &Value) -> Vec<crate::uncensor::SyncShardInfo> {
+    v["result"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| is_sync_playlist_json(p))
+        .filter_map(|p| {
+            Some(crate::uncensor::SyncShardInfo {
+                kind: id_text(&p["kind"])?,
+                title: p["title"].as_str().unwrap_or("").to_string(),
+                description: p["description"].as_str().unwrap_or("").to_string(),
+                has_custom_cover: has_custom_playlist_cover(p),
+            })
+        })
+        .collect()
+}
+
+fn upload_sync_cover(uid: &str, kind: &str, token: &str) {
+    if let Err(png_err) = upload_cover(uid, kind, TUNE_AVATAR_PNG.to_vec(), "image/png", token) {
+        let jpeg_res = image::load_from_memory(TUNE_AVATAR_PNG)
+            .map_err(|e| e.to_string())
+            .and_then(|img| {
+                let rgb = img.to_rgb8();
+                let mut out = Vec::new();
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 92)
+                    .encode_image(&rgb)
+                    .map_err(|e| e.to_string())?;
+                Ok(out)
+            })
+            .and_then(|bytes| upload_cover(uid, kind, bytes, "image/jpeg", token));
+        if let Err(jpeg_err) = jpeg_res {
+            log(&format!("Tune Sync обложка {kind}: png: {png_err}; jpeg: {jpeg_err}"));
+        }
+    }
+}
+
+fn sync_push_once(uid: &str, token: &str) -> Result<(), String> {
+    let _guard = SYNC_IO_LOCK.lock().unwrap();
+    let v = get_fresh(&format!("users/{uid}/playlists/list"), &[], token)?;
+    let shards = extract_sync_shards(&v);
+    let Some(plan) = crate::uncensor::build_sync_push_plan(uid, &shards) else {
+        return Ok(());
+    };
+
+    for kind in plan.delete_kinds {
+        if let Err(e) = post(
+            &format!("users/{uid}/playlists/{kind}/delete"),
+            "application/x-www-form-urlencoded",
+            String::new(),
+            token,
+        ) {
+            log(&format!("Tune Sync удаление лишнего плейлиста {kind}: {e}"));
+        }
+    }
+
+    for target in plan.targets {
+        match target.existing_kind {
+            Some(kind) => {
+                if target.existing_title.as_deref() != Some(target.title.as_str()) {
+                    rename_playlist(uid, &kind, &target.title, token)?;
+                }
+                if target.existing_description.as_deref() != Some(target.description.as_str()) {
+                    set_description(uid, &kind, &target.description, token)?;
+                }
+                if target.needs_cover {
+                    upload_sync_cover(uid, &kind, token);
+                }
+            }
+            None => {
+                let created = create_playlist(uid, &target.title, token)?;
+                upload_sync_cover(uid, &created.kind, token);
+                set_description(uid, &created.kind, &target.description, token)?;
+            }
+        }
+    }
+    forget_cache();
+    Ok(())
+}
+
+pub fn schedule_sync_push() {
+    let Some((uid, token)) = SYNC_SESSION.lock().unwrap().clone() else {
+        return;
+    };
+    let mut queue = PUSH_QUEUE.lock().unwrap();
+    queue.pending = Some((uid, token));
+    if queue.running {
+        return;
+    }
+    queue.running = true;
+    drop(queue);
+
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(SYNC_COALESCE_DELAY);
+            let next = {
+                let mut queue = PUSH_QUEUE.lock().unwrap();
+                match queue.pending.take() {
+                    Some(req) => req,
+                    None => {
+                        queue.running = false;
+                        break;
+                    }
+                }
+            };
+            if let Err(e) = sync_push_once(&next.0, &next.1) {
+                log(&format!("Tune Sync отправка: {e}"));
+            }
+        }
+    });
+}
+
+pub fn sync_pull(uid: &str, token: &str) -> Result<bool, String> {
+    set_sync_session(uid, token);
+    let _guard = SYNC_IO_LOCK.lock().unwrap();
+    let v = get_fresh(&format!("users/{uid}/playlists/list"), &[], token)?;
+    let shards = extract_sync_shards(&v);
+    let outcome = crate::uncensor::apply_remote_sync_shards(uid, &shards);
+    drop(_guard);
+    if outcome.needs_push {
+        schedule_sync_push();
+    }
+    Ok(outcome.active_changed)
 }
 
 fn parse_playlist(v: &Value, uid: &str) -> Option<Playlist> {
@@ -740,8 +1015,24 @@ fn parse_playlist(v: &Value, uid: &str) -> Option<Playlist> {
 }
 
 pub fn playlists(uid: &str, token: &str) -> Result<Vec<Playlist>, String> {
-    let v = get(&format!("users/{uid}/playlists/list"), &[], token)?;
-    Ok(v["result"].as_array().into_iter().flatten().filter_map(|p| parse_playlist(p, uid)).collect())
+    set_sync_session(uid, token);
+    let v = get_fresh(&format!("users/{uid}/playlists/list"), &[], token)?;
+    let shards = extract_sync_shards(&v);
+    let outcome = crate::uncensor::apply_remote_sync_shards(uid, &shards);
+    if outcome.needs_push {
+        schedule_sync_push();
+    }
+    Ok(v["result"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| !is_sync_playlist_json(p))
+        .filter_map(|p| parse_playlist(p, uid))
+        .map(|mut pl| {
+            pl.count = pl.count.saturating_add(crate::uncensor::local_playlist_tracks(&pl.owner, &pl.kind).len() as u64);
+            pl
+        })
+        .collect())
 }
 
 fn id_text(v: &Value) -> Option<String> {
@@ -764,9 +1055,13 @@ fn parse_pin(item: &Value) -> Option<Pin> {
     };
     match item["type"].as_str()? {
         "playlist_item" => {
+            let title = data["title"].as_str()?.to_string();
+            let desc = data["description"].as_str().unwrap_or("");
+            if crate::uncensor::is_sync_playlist(&title, desc) {
+                return None;
+            }
             let cover = data["cover"]["uri"].as_str().or(data["cover"]["itemsUri"][0].as_str()).map(str::to_string);
             let owner = id_text(&data["uid"])?;
-            let title = data["title"].as_str()?.to_string();
             let target = Playlist { source: Source::Playlist, owner, kind: id_text(&data["kind"])?, title: title.clone(), count: 0, cover: cover.clone() };
             Some(Pin { target: PinTarget::List(target), title, subtitle: "Плейлист".to_string(), cover, round: false, color: None })
         }
@@ -792,6 +1087,42 @@ fn parse_pin(item: &Value) -> Option<Pin> {
     }
 }
 
+fn resolve_local_pins() -> Vec<Pin> {
+    let mut out = Vec::new();
+    for key in crate::uncensor::local_pins() {
+        if let Some(id) = key.strip_prefix("album:") {
+            if let Some(raw) = crate::uncensor::catalog_album_json(id) {
+                let title = raw["title"].as_str().unwrap_or("Альбом").to_string();
+                let cover = cover_uri(&raw);
+                let list = Playlist { cover: cover.clone(), ..Playlist::album(id, &title) };
+                out.push(Pin { target: PinTarget::List(list), title, subtitle: "Альбом".to_string(), cover, round: false, color: None });
+            }
+        } else if let Some(id) = key.strip_prefix("artist:") {
+            if let Some((raw, _, _)) = crate::uncensor::catalog_artist_json(id) {
+                let name = raw["name"].as_str().unwrap_or("Исполнитель").to_string();
+                let cover = cover_uri(&raw);
+                let list = Playlist { cover: cover.clone(), ..Playlist::artist(id, &name) };
+                out.push(Pin { target: PinTarget::List(list), title: name, subtitle: "Исполнитель".to_string(), cover, round: true, color: None });
+            }
+        } else if let Some(kind) = key.strip_prefix(&format!("playlist:{}:", crate::uncensor::CATALOG_OWNER)) {
+            if let Some((fields, tracks)) = crate::uncensor::catalog_playlist(kind) {
+                let title = fields.get("title").and_then(Value::as_str).unwrap_or("Плейлист").to_string();
+                let cover = fields.get("coverUri").and_then(Value::as_str).map(str::to_string);
+                let list = Playlist {
+                    source: Source::Playlist,
+                    owner: crate::uncensor::CATALOG_OWNER.to_string(),
+                    kind: kind.to_string(),
+                    title: title.clone(),
+                    count: tracks.len() as u64,
+                    cover: cover.clone(),
+                };
+                out.push(Pin { target: PinTarget::List(list), title, subtitle: "Плейлист".to_string(), cover, round: false, color: None });
+            }
+        }
+    }
+    out
+}
+
 /// Закреплённое. Ответ сохраняется: без сети показывается то, что было в прошлый раз.
 pub fn pins(token: &str) -> Result<Vec<Pin>, String> {
     let saved = data_dir().join("pins.json");
@@ -804,15 +1135,33 @@ pub fn pins(token: &str) -> Result<Vec<Pin>, String> {
         Err(e) if network_error(&e) => std::fs::read(&saved).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).ok_or(e)?,
         Err(e) => return Err(e),
     };
-    Ok(result(&v)["pins"].as_array().into_iter().flatten().filter_map(parse_pin).collect())
+    let mut out = resolve_local_pins();
+    let mut seen: HashSet<String> = out.iter().map(Pin::key).collect();
+    for pin in result(&v)["pins"].as_array().into_iter().flatten().filter_map(parse_pin) {
+        if seen.insert(pin.key()) {
+            out.push(pin);
+        }
+    }
+    Ok(out)
 }
 
 pub fn playlist_tracks(playlist: &Playlist, token: &str) -> Result<Vec<Track>, String> {
     match playlist.source {
+        Source::Playlist if playlist.owner == crate::uncensor::CATALOG_OWNER => {
+            let (_, ids) = crate::uncensor::catalog_playlist(&playlist.kind)
+                .ok_or_else(|| "Плейлист не найден в каталоге Tune".to_string())?;
+            return tracks_by_ids(&ids, token);
+        }
         Source::Playlist => {}
+        Source::Album if crate::uncensor::is_synthetic_album_id(&playlist.kind) => {
+            return album(&playlist.kind, token).map(|(_, tracks)| tracks);
+        }
         Source::Album => {
             let v = get(&format!("albums/{}/with-tracks", playlist.kind), &[], token)?;
             return Ok(result(&v)["volumes"].as_array().into_iter().flatten().flat_map(|disk| disk.as_array().into_iter().flatten()).filter_map(parse_track).collect());
+        }
+        Source::Artist if crate::uncensor::is_synthetic_artist_id(&playlist.kind) => {
+            return artist(&playlist.kind, token).map(|a| a.popular);
         }
         Source::Artist => {
             let v = get(&format!("artists/{}/tracks", playlist.kind), &[("page-size", "100")], token)?;
@@ -820,7 +1169,19 @@ pub fn playlist_tracks(playlist: &Playlist, token: &str) -> Result<Vec<Track>, S
         }
     }
     let v = get(&format!("users/{}/playlists/{}", playlist.owner, playlist.kind), &[("rich-tracks", "true")], token)?;
-    Ok(result(&v)["tracks"].as_array().into_iter().flatten().filter_map(|item| parse_track(&item["track"])).collect())
+    let local_ids = crate::uncensor::local_playlist_tracks(&playlist.owner, &playlist.kind);
+    let mut out = if local_ids.is_empty() {
+        Vec::new()
+    } else {
+        tracks_by_ids(&local_ids, token).unwrap_or_default()
+    };
+    let mut seen: HashSet<String> = out.iter().map(|t| t.id.clone()).collect();
+    for track in result(&v)["tracks"].as_array().into_iter().flatten().filter_map(|item| parse_track(&item["track"])) {
+        if seen.insert(track.id.clone()) {
+            out.push(track);
+        }
+    }
+    Ok(out)
 }
 
 fn parse_sequence(v: &Value) -> Vec<Track> {
@@ -1161,22 +1522,80 @@ fn parse_about(v: &Value) -> (String, Vec<ArtistLink>) {
 
 /// Свои релизы (`direct-albums`) или сборники с исполнителем (`also-albums`).
 pub fn releases(id: &str, also: bool, by_year: bool, page: u64, token: &str) -> Result<Releases, String> {
+    if crate::uncensor::is_synthetic_artist_id(id) {
+        if also || page > 0 {
+            return Ok(Releases { albums: Vec::new(), total: 0 });
+        }
+        let (_, _, album_ids) = crate::uncensor::catalog_artist_json(id).ok_or_else(|| NOT_FOUND.to_string())?;
+        let albums: Vec<Card> = albums_by_ids(&album_ids, token).unwrap_or_default().into_iter().map(|(card, _)| card).collect();
+        let total = albums.len() as u64;
+        return Ok(Releases { albums, total });
+    }
     let path = format!("artists/{id}/{}", if also { "also-albums" } else { "direct-albums" });
-    let (page, size) = (page.to_string(), RELEASES_PAGE.to_string());
-    let v = get(&path, &[("page", &page), ("pageSize", &size), ("sort-by", if by_year { "year" } else { "rating" }), ("sort-order", "desc")], token)?;
+    let (page_str, size) = (page.to_string(), RELEASES_PAGE.to_string());
+    let v = get(&path, &[("page", &page_str), ("pageSize", &size), ("sort-by", if by_year { "year" } else { "rating" }), ("sort-order", "desc")], token)?;
     let v = result(&v);
-    Ok(Releases { albums: parse_cards(&v["albums"], album_card), total: v["pager"]["total"].as_u64().unwrap_or(0) })
+    let mut albums = parse_cards(&v["albums"], album_card);
+    let mut total = v["pager"]["total"].as_u64().unwrap_or(0);
+    if !also && page == 0 {
+        let (_, ins_albums) = crate::uncensor::artist_inserts(id);
+        if !ins_albums.is_empty() {
+            let extra: Vec<Card> = albums_by_ids(&ins_albums, token)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(card, _)| card)
+                .filter(|card| !albums.iter().any(|known| known.id == card.id))
+                .collect();
+            let extra_len = extra.len() as u64;
+            if extra_len > 0 {
+                albums.splice(0..0, extra);
+                total = total.max(albums.len() as u64).saturating_add(extra_len);
+            }
+        }
+    }
+    Ok(Releases { albums, total })
 }
 
 /// Так же, как настоящий 404: страницы нет, показываем «Ничего не нашлось».
 const NOT_FOUND: &str = "Яндекс ответил 404: not-found";
 
+fn catalog_album(id: &str, token: &str) -> Option<(Album, Vec<Track>)> {
+    let raw = crate::uncensor::catalog_album_json(id)?;
+    let mut alb = parse_album(&raw)?;
+    let volumes = crate::uncensor::album_volumes(id).unwrap_or_default();
+    let flat: Vec<String> = volumes.iter().flatten().cloned().collect();
+    let tracks = tracks_by_ids(&flat, token).unwrap_or_default();
+    let by_id: HashMap<String, Track> = tracks.into_iter().map(|t| (t.id.clone(), t)).collect();
+    let mut ordered = Vec::new();
+    let mut sizes = Vec::new();
+    for disk in &volumes {
+        let mut count = 0;
+        for tid in disk {
+            if let Some(t) = by_id.get(tid) {
+                ordered.push(t.clone());
+                count += 1;
+            }
+        }
+        if count > 0 {
+            sizes.push(count);
+        }
+    }
+    alb.volumes = sizes;
+    Some((alb, ordered))
+}
+
 pub fn album(id: &str, token: &str) -> Result<(Album, Vec<Track>), String> {
+    if crate::uncensor::is_synthetic_album_id(id) {
+        return catalog_album(id, token).ok_or_else(|| NOT_FOUND.to_string());
+    }
     // Как в официальном клиенте: у выпусков и глав приходят место, где остановились, и дата выхода.
-    let v = get(&format!("albums/{id}/with-tracks"), &[("resumeStream", "true"), ("richTracks", "true"), ("withListeningFinished", "true")], token)?;
+    let v = match get(&format!("albums/{id}/with-tracks"), &[("resumeStream", "true"), ("richTracks", "true"), ("withListeningFinished", "true")], token) {
+        Ok(v) => v,
+        Err(err) => return catalog_album(id, token).ok_or(err),
+    };
     let v = result(&v);
     if v["error"].as_str() == Some("not-found") {
-        return Err(NOT_FOUND.to_string());
+        return catalog_album(id, token).ok_or_else(|| NOT_FOUND.to_string());
     }
     let mut disks: Vec<Vec<Track>> = v["volumes"].as_array().into_iter().flatten().map(|disk| disk.as_array().into_iter().flatten().filter_map(parse_track).collect()).collect();
     // Подкасты приходят от новых выпусков к старым: здесь всегда от первого сезона к последнему.
@@ -1222,14 +1641,49 @@ pub fn albums_by_ids(ids: &[String], token: &str) -> Result<Vec<(Card, String)>,
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let v = get("albums", &[("album-ids", &ids.join(","))], token)?;
-    Ok(result(&v).as_array().into_iter().flatten().filter_map(album_with_artists).collect())
+    let yandex_ids: Vec<&str> = ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !crate::uncensor::is_synthetic_album_id(id))
+        .collect();
+    let mut found: HashMap<String, (Card, String)> = if yandex_ids.is_empty() {
+        HashMap::new()
+    } else {
+        let v = get("albums", &[("album-ids", &yandex_ids.join(","))], token)?;
+        result(&v)
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(album_with_artists)
+            .map(|pair| (pair.0.id.clone(), pair))
+            .collect()
+    };
+    Ok(ids
+        .iter()
+        .filter_map(|id| {
+            found.remove(id).or_else(|| {
+                crate::uncensor::catalog_album_json(id)
+                    .as_ref()
+                    .and_then(album_with_artists)
+            })
+        })
+        .collect())
 }
 
 /// Поиск альбомов для «Подменить…».
 pub fn search_albums(text: &str, token: &str) -> Result<Vec<(Card, String)>, String> {
     let v = get("search", &[("text", text), ("type", "album"), ("page", "0")], token)?;
-    Ok(v["result"]["albums"]["results"].as_array().into_iter().flatten().filter_map(album_with_artists).collect())
+    let mut out: Vec<(Card, String)> = crate::uncensor::search_albums(text)
+        .iter()
+        .filter_map(album_with_artists)
+        .collect();
+    let mut seen: std::collections::HashSet<String> = out.iter().map(|(c, _)| c.id.clone()).collect();
+    for pair in v["result"]["albums"]["results"].as_array().into_iter().flatten().filter_map(album_with_artists) {
+        if seen.insert(pair.0.id.clone()) {
+            out.push(pair);
+        }
+    }
+    Ok(out)
 }
 
 fn album_with_artists(v: &Value) -> Option<(Card, String)> {
@@ -1239,11 +1693,52 @@ fn album_with_artists(v: &Value) -> Option<(Card, String)> {
     Some((album_card(v)?, artists))
 }
 
+fn catalog_artist(id: &str, token: &str) -> Option<Artist> {
+    let (raw, track_ids, album_ids) = crate::uncensor::catalog_artist_json(id)?;
+    let popular = tracks_by_ids(&track_ids, token).unwrap_or_default();
+    let albums: Vec<Card> = albums_by_ids(&album_ids, token)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(card, _)| card)
+        .collect();
+    let release = albums.first().cloned();
+    Some(Artist {
+        id: id.to_string(),
+        name: raw["name"].as_str().unwrap_or("Без имени").to_string(),
+        cover: cover_uri(&raw),
+        listeners: 0,
+        popular,
+        albums,
+        also: Vec::new(),
+        similar: Vec::new(),
+        about: raw["description"].as_str().unwrap_or_default().to_string(),
+        links: Vec::new(),
+        familiar_collection: Vec::new(),
+        familiar_wave: Vec::new(),
+        release,
+        playlists: Vec::new(),
+        videos: Vec::new(),
+        clips: Vec::new(),
+        photos: Vec::new(),
+        bandlink: None,
+        disclaimer: Vec::new(),
+        modal: None,
+        upcoming: None,
+        concerts: Vec::new(),
+    })
+}
+
 pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
-    let v = get(&format!("artists/{id}/brief-info"), &[], token)?;
+    if crate::uncensor::is_synthetic_artist_id(id) {
+        return catalog_artist(id, token).ok_or_else(|| NOT_FOUND.to_string());
+    }
+    let v = match get(&format!("artists/{id}/brief-info"), &[], token) {
+        Ok(v) => v,
+        Err(err) => return catalog_artist(id, token).ok_or(err),
+    };
     // Несуществующего исполнителя Яндекс отдаёт пустым, с пометкой вместо 404.
     if result(&v)["artist"]["error"].as_str() == Some("not-found") {
-        return Err(NOT_FOUND.to_string());
+        return catalog_artist(id, token).ok_or_else(|| NOT_FOUND.to_string());
     }
     let mut artist = parse_artist(result(&v)).ok_or_else(|| "Яндекс не прислал исполнителя".to_string())?;
     artist.disclaimer = disclaimer("artists", id, &result(&v)["artist"]["disclaimers"], token);
@@ -1278,6 +1773,13 @@ pub fn artist(id: &str, token: &str) -> Result<Artist, String> {
 /// Трейлер альбома, исполнителя или плейлиста: название и отрывки. `path` — `albums/1`,
 /// `artists/1` или `users/1/playlists/3`. Нет трейлера — `None`.
 pub fn trailer(path: &str, token: &str) -> Result<Option<(String, Vec<Track>)>, String> {
+    let catalog_prefix = format!("users/{}/", crate::uncensor::CATALOG_OWNER);
+    if path.strip_prefix("albums/").is_some_and(crate::uncensor::is_synthetic_album_id)
+        || path.strip_prefix("artists/").is_some_and(crate::uncensor::is_synthetic_artist_id)
+        || path.starts_with(&catalog_prefix)
+    {
+        return Ok(None);
+    }
     let v = get(&format!("{path}/trailer"), &[], token)?;
     Ok(parse_trailer(&result(&v)["trailer"]))
 }
@@ -1422,8 +1924,10 @@ fn parse_found(v: &Value) -> Found {
             Some("artist") => found.artists.extend(artist_card(&item["artist"])),
             Some("clip") => found.clips.extend(parse_clip(&item["clip"])),
             Some("playlist") => {
-                let owner = id_text(&item["playlist"]["uid"]).unwrap_or_default();
-                found.playlists.extend(parse_playlist(&item["playlist"], &owner));
+                if !is_sync_playlist_json(&item["playlist"]) {
+                    let owner = id_text(&item["playlist"]["uid"]).unwrap_or_default();
+                    found.playlists.extend(parse_playlist(&item["playlist"], &owner));
+                }
             }
             _ => {}
         }
@@ -1438,7 +1942,50 @@ pub fn search_mixed(text: &str, types: &str, filter: Option<&str>, page_size: u3
     let mut params = vec![("text", text), ("type", types), ("page", "0"), ("pageSize", &size)];
     params.extend(filter.map(|filter| ("filter", filter)));
     let v = get("search/instant/mixed", &params, token)?;
-    Ok(parse_found(result(&v)))
+    let mut found = parse_found(result(&v));
+    if filter.is_none() {
+        let want: std::collections::HashSet<&str> = types.split(',').map(str::trim).collect();
+        if want.contains("track") {
+            let mut extra: Vec<Track> = crate::uncensor::search_tracks(text).iter().filter_map(parse_track).collect();
+            let existing: std::collections::HashSet<String> = extra.iter().map(|t| t.id.clone()).collect();
+            extra.extend(found.tracks.into_iter().filter(|t| !existing.contains(&t.id)));
+            found.tracks = extra;
+        }
+        if want.contains("album") {
+            let mut extra: Vec<Card> = crate::uncensor::search_albums(text).iter().filter_map(album_card).collect();
+            let existing: std::collections::HashSet<String> = extra.iter().map(|c| c.id.clone()).collect();
+            extra.extend(found.albums.into_iter().filter(|c| !existing.contains(&c.id)));
+            found.albums = extra;
+        }
+        if want.contains("artist") {
+            let mut extra: Vec<Card> = crate::uncensor::search_artists(text).iter().filter_map(artist_card).collect();
+            let existing: std::collections::HashSet<String> = extra.iter().map(|c| c.id.clone()).collect();
+            extra.extend(found.artists.into_iter().filter(|c| !existing.contains(&c.id)));
+            found.artists = extra;
+        }
+        if want.contains("playlist") {
+            let mut extra: Vec<Playlist> = crate::uncensor::search_playlists(text)
+                .into_iter()
+                .filter_map(|(kind, fields)| {
+                    let title = fields.get("title").and_then(Value::as_str)?.to_string();
+                    let count = fields.get("tracks").and_then(Value::as_array).map_or(0, Vec::len) as u64;
+                    let cover = fields.get("coverUri").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+                    Some(Playlist {
+                        source: Source::Playlist,
+                        owner: crate::uncensor::CATALOG_OWNER.to_string(),
+                        kind,
+                        title,
+                        count,
+                        cover,
+                    })
+                })
+                .collect();
+            let existing: std::collections::HashSet<String> = extra.iter().map(|p| p.kind.clone()).collect();
+            extra.extend(found.playlists.into_iter().filter(|p| p.owner != crate::uncensor::CATALOG_OWNER || !existing.contains(&p.kind)));
+            found.playlists = extra;
+        }
+    }
+    Ok(found)
 }
 
 /// Альбомы и исполнители, которые нравятся пользователю, и исполнители с дизлайком.
@@ -1448,11 +1995,40 @@ pub fn liked_pages(uid: &str, token: &str) -> Result<(Vec<Card>, Vec<Card>, Vec<
     let disliked = get(&format!("users/{uid}/dislikes/artists"), &[], token)?;
     // Исполнитель приходит то сам по себе, то внутри artist.
     let artist = |item: &Value| artist_card(item).or_else(|| artist_card(&item["artist"]));
-    Ok((parse_cards(result(&albums), |item| album_card(&item["album"])), parse_cards(result(&artists), artist_card), parse_cards(result(&disliked), artist)))
+
+    let local_albums: Vec<Card> = albums_by_ids(&crate::uncensor::local_liked_albums(), token)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(card, _)| card)
+        .collect();
+    let local_artists_for = |ids: Vec<String>| -> Vec<Card> {
+        ids.into_iter()
+            .filter_map(|id| crate::uncensor::catalog_artist_json(&id).and_then(|(raw, _, _)| artist_card(&raw)))
+            .collect()
+    };
+
+    let merge_cards = |mut first: Vec<Card>, rest: Vec<Card>| -> Vec<Card> {
+        let mut seen: HashSet<String> = first.iter().map(|c| c.id.clone()).collect();
+        for c in rest {
+            if seen.insert(c.id.clone()) {
+                first.push(c);
+            }
+        }
+        first
+    };
+
+    Ok((
+        merge_cards(local_albums, parse_cards(result(&albums), |item| album_card(&item["album"]))),
+        merge_cards(local_artists_for(crate::uncensor::local_liked_artists()), parse_cards(result(&artists), artist_card)),
+        merge_cards(local_artists_for(crate::uncensor::local_disliked_artists()), parse_cards(result(&disliked), artist)),
+    ))
 }
 
 /// Дизлайк исполнителя: он больше не появится в рекомендациях. Лайк с него Яндекс снимает сам.
 pub fn set_artist_disliked(uid: &str, id: &str, disliked: bool, token: &str) -> Result<(), String> {
+    if crate::uncensor::is_synthetic_artist_id(id) {
+        return crate::uncensor::set_local_artist_disliked(id, disliked);
+    }
     let path = if disliked { format!("users/{uid}/dislikes/artists/add?artist-id={id}") } else { format!("users/{uid}/dislikes/artists/{id}/remove") };
     post(&path, "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
 }
@@ -1703,10 +2279,16 @@ fn set_page_liked(uid: &str, kind: &str, param: &str, id: &str, liked: bool, tok
 }
 
 pub fn set_album_liked(uid: &str, id: &str, liked: bool, token: &str) -> Result<(), String> {
+    if crate::uncensor::is_synthetic_album_id(id) {
+        return crate::uncensor::set_local_album_liked(id, liked);
+    }
     set_page_liked(uid, "albums", "album-id", id, liked, token)
 }
 
 pub fn set_artist_liked(uid: &str, id: &str, liked: bool, token: &str) -> Result<(), String> {
+    if crate::uncensor::is_synthetic_artist_id(id) {
+        return crate::uncensor::set_local_artist_liked(id, liked);
+    }
     set_page_liked(uid, "artists", "artist-id", id, liked, token)
 }
 
@@ -1756,6 +2338,9 @@ fn parse_release(v: &Value) -> Option<HomeItem> {
 }
 
 fn parse_home_playlist(v: &Value) -> Option<HomeItem> {
+    if is_sync_playlist_json(v) {
+        return None;
+    }
     let owner = id_text(&v["uid"]).or_else(|| id_text(&v["owner"]["uid"]))?;
     let mut list = parse_playlist_loose(v, &owner)?;
     list.owner = owner;
@@ -1950,7 +2535,12 @@ pub fn tag_playlists(tag: &str, token: &str) -> Result<(Option<String>, Vec<Play
 }
 
 fn parse_tag_playlists(v: &Value) -> Vec<Playlist> {
-    v.as_array().into_iter().flatten().filter_map(|list| parse_playlist_loose(list, &id_text(&list["uid"]).or_else(|| id_text(&list["owner"]["uid"]))?)).collect()
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter(|list| !is_sync_playlist_json(list))
+        .filter_map(|list| parse_playlist_loose(list, &id_text(&list["uid"]).or_else(|| id_text(&list["owner"]["uid"]))?))
+        .collect()
 }
 
 /// Куда ведёт ссылка на Яндекс Музыку.
@@ -2072,8 +2662,10 @@ fn parse_similar(v: &Value) -> Vec<HomeItem> {
 /// Похожее на альбом или плейлист: альбомы, плейлисты, исполнители и волны.
 pub fn similar(list: &Playlist, token: &str) -> Result<Vec<HomeItem>, String> {
     let path = match list.source {
+        Source::Album if crate::uncensor::is_synthetic_album_id(&list.kind) => return Ok(Vec::new()),
         Source::Album => format!("albums/{}/similar-entities", list.kind),
         Source::Artist => return Ok(Vec::new()),
+        Source::Playlist if list.owner == crate::uncensor::CATALOG_OWNER => return Ok(Vec::new()),
         Source::Playlist => {
             let v = get(&format!("users/{}/playlists/{}", list.owner, list.kind), &[("rich-tracks", "true")], token)?;
             let Some(uuid) = result(&v)["playlistUuid"].as_str() else { return Ok(Vec::new()) };
@@ -2395,7 +2987,9 @@ pub fn rename_playlist(uid: &str, kind: &str, title: &str, token: &str) -> Resul
 }
 
 pub fn delete_playlist(uid: &str, kind: &str, token: &str) -> Result<(), String> {
-    post(&format!("users/{uid}/playlists/{kind}/delete"), "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
+    post(&format!("users/{uid}/playlists/{kind}/delete"), "application/x-www-form-urlencoded", String::new(), token).map(|_| ())?;
+    crate::uncensor::clear_local_playlist(uid, kind);
+    Ok(())
 }
 
 fn change_playlist(uid: &str, kind: &str, diff: &Value, revision: u64, token: &str) -> Result<(), String> {
@@ -2417,6 +3011,9 @@ fn playlist_state(uid: &str, kind: &str, token: &str) -> Result<Value, String> {
 }
 
 pub fn add_to_playlist(uid: &str, kind: &str, track: &Track, token: &str) -> Result<(), String> {
+    if crate::uncensor::is_synthetic_track_id(&track.id) {
+        return crate::uncensor::add_local_playlist_track(uid, kind, &track.id);
+    }
     let state = playlist_state(uid, kind, token)?;
     let diff = json!([{ "op": "insert", "at": 0, "tracks": [track_ref(&track.id, track.album.as_deref())] }]);
     change_playlist(uid, kind, &diff, state["revision"].as_u64().unwrap_or(0), token)
@@ -2426,6 +3023,9 @@ pub fn add_to_playlist(uid: &str, kind: &str, track: &Track, token: &str) -> Res
 /// в окне; на сервере трек ищется по номеру, а сдвиг переносится как есть. `to` — где трек
 /// окажется после перестановки.
 pub fn move_in_playlist(uid: &str, kind: &str, track: &Track, from: usize, to: usize, token: &str) -> Result<(), String> {
+    if crate::uncensor::is_synthetic_track_id(&track.id) {
+        return crate::uncensor::move_local_playlist_track(uid, kind, &track.id, from, to);
+    }
     let state = playlist_state(uid, kind, token)?;
     let items = state["tracks"].as_array().cloned().unwrap_or_default();
     let at = items.iter().position(|item| id_text(&item["track"]["id"]).or_else(|| id_text(&item["id"])).as_deref() == Some(track.id.as_str())).ok_or("Трека уже нет в плейлисте")?;
@@ -2440,10 +3040,19 @@ pub fn move_in_playlist(uid: &str, kind: &str, track: &Track, from: usize, to: u
 /// Переносит плейлист в коллекции, как оригинал (`change-position`). Место считается по списку
 /// с сервера: в окне могут быть не все плейлисты, а сдвиг тот же.
 pub fn move_playlist(uid: &str, kind: &str, from: usize, to: usize, token: &str) -> Result<(), String> {
-    let v = get(&format!("users/{uid}/playlists/list"), &[], token)?;
-    let kinds: Vec<String> = v["result"].as_array().into_iter().flatten().filter_map(|p| id_text(&p["kind"])).collect();
-    let at = kinds.iter().position(|k| k == kind).ok_or("Плейлиста уже нет")?;
-    let target = (at as isize + to as isize - from as isize).clamp(0, kinds.len() as isize - 1) as usize;
+    let v = get_fresh(&format!("users/{uid}/playlists/list"), &[], token)?;
+    let visible: Vec<(String, usize)> = v["result"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter(|(_, p)| !is_sync_playlist_json(p))
+        .filter_map(|(server_idx, p)| Some((id_text(&p["kind"])?, server_idx)))
+        .collect();
+    let vis_at = visible.iter().position(|(k, _)| k == kind).ok_or("Плейлиста уже нет")?;
+    let vis_target = (vis_at as isize + to as isize - from as isize).clamp(0, visible.len() as isize - 1) as usize;
+    let at = visible[vis_at].1;
+    let target = visible[vis_target].1;
     if target == at {
         return Ok(());
     }
@@ -2451,6 +3060,9 @@ pub fn move_playlist(uid: &str, kind: &str, from: usize, to: usize, token: &str)
 }
 
 pub fn remove_from_playlist(uid: &str, kind: &str, track: &Track, token: &str) -> Result<(), String> {
+    if crate::uncensor::is_synthetic_track_id(&track.id) {
+        return crate::uncensor::remove_local_playlist_track(uid, kind, &track.id);
+    }
     let state = playlist_state(uid, kind, token)?;
     let position = state["tracks"].as_array().into_iter().flatten().position(|item| id_text(&item["track"]["id"]).or_else(|| id_text(&item["id"])).as_deref() == Some(track.id.as_str())).ok_or("Трека уже нет в плейлисте")?;
     let diff = json!([{ "op": "delete", "from": position, "to": position + 1, "tracks": [track_ref(&track.id, track.album.as_deref())] }]);
@@ -2642,8 +3254,22 @@ impl PinRef {
     }
 }
 
+fn local_pin_key(target: &PinRef) -> Option<String> {
+    match target {
+        PinRef::Album(id) if crate::uncensor::is_synthetic_album_id(id) => Some(format!("album:{id}")),
+        PinRef::Artist(id) if crate::uncensor::is_synthetic_artist_id(id) => Some(format!("artist:{id}")),
+        PinRef::Playlist(owner, kind) if owner == crate::uncensor::CATALOG_OWNER => {
+            Some(format!("playlist:{owner}:{kind}"))
+        }
+        _ => None,
+    }
+}
+
 /// Закрепляет или открепляет: тело запроса одно, а метод разный.
 pub fn set_pinned(target: &PinRef, pinned: bool, token: &str) -> Result<(), String> {
+    if let Some(key) = local_pin_key(target) {
+        return crate::uncensor::set_local_pin(&key, pinned);
+    }
     let url = format!("{API}/{}", target.path());
     let body = target.body().to_string();
     forget_cache();
@@ -2664,6 +3290,12 @@ pub fn set_pinned(target: &PinRef, pinned: bool, token: &str) -> Result<(), Stri
 /// Описание и приватность плейлиста: их нет в общем списке треков.
 /// Описание, приватность и кто и когда обновил плейлист.
 pub fn playlist_meta(uid: &str, kind: &str, token: &str) -> Result<(String, String, Option<Updated>), String> {
+    if uid == crate::uncensor::CATALOG_OWNER {
+        let (fields, _) = crate::uncensor::catalog_playlist(kind)
+            .ok_or_else(|| "Плейлист не найден в каталоге Tune".to_string())?;
+        let desc = fields.get("description").and_then(Value::as_str).unwrap_or_default().to_string();
+        return Ok((desc, "public".to_string(), None));
+    }
     let v = get(&format!("users/{uid}/playlists/{kind}"), &[("rich-tracks", "false")], token)?;
     let v = result(&v);
     Ok((v["description"].as_str().unwrap_or_default().to_string(), v["visibility"].as_str().unwrap_or("public").to_string(), parse_updated(v)))
@@ -2704,16 +3336,42 @@ pub fn set_visibility(uid: &str, kind: &str, value: &str, token: &str) -> Result
 
 fn parse_liked_list(item: &Value) -> Option<Playlist> {
     let v = if item["playlist"].is_object() { &item["playlist"] } else { item };
+    if is_sync_playlist_json(v) {
+        return None;
+    }
     let owner = id_text(&v["uid"]).or_else(|| id_text(&v["owner"]["uid"]))?;
     parse_playlist_loose(v, &owner)
 }
 
 pub fn liked_playlists(uid: &str, token: &str) -> Result<Vec<Playlist>, String> {
+    let mut out: Vec<Playlist> = crate::uncensor::local_liked_playlists()
+        .into_iter()
+        .filter_map(|kind| {
+            let (fields, tracks) = crate::uncensor::catalog_playlist(&kind)?;
+            Some(Playlist {
+                source: Source::Playlist,
+                owner: crate::uncensor::CATALOG_OWNER.to_string(),
+                kind,
+                title: fields.get("title").and_then(Value::as_str)?.to_string(),
+                count: tracks.len() as u64,
+                cover: fields.get("coverUri").and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_string),
+            })
+        })
+        .collect();
     let v = get(&format!("users/{uid}/likes/playlists"), &[], token)?;
-    Ok(result(&v).as_array().into_iter().flatten().filter_map(parse_liked_list).collect())
+    let mut seen: HashSet<String> = out.iter().map(|p| format!("{}:{}", p.owner, p.kind)).collect();
+    for pl in result(&v).as_array().into_iter().flatten().filter_map(parse_liked_list) {
+        if seen.insert(format!("{}:{}", pl.owner, pl.kind)) {
+            out.push(pl);
+        }
+    }
+    Ok(out)
 }
 
 pub fn set_playlist_liked(uid: &str, owner: &str, kind: &str, liked: bool, token: &str) -> Result<(), String> {
+    if owner == crate::uncensor::CATALOG_OWNER {
+        return crate::uncensor::set_local_playlist_liked(kind, liked);
+    }
     let path = if liked { format!("users/{uid}/likes/playlists/add?owner-uid={owner}&kind={kind}") } else { format!("users/{uid}/likes/playlists/{owner}-{kind}/remove") };
     post(&path, "application/x-www-form-urlencoded", String::new(), token).map(|_| ())
 }
@@ -3242,8 +3900,19 @@ pub fn network_error(error: &str) -> bool {
 }
 
 pub fn plays(reports: Vec<Value>, token: &str) -> Result<(), String> {
+    let filtered: Vec<Value> = reports
+        .into_iter()
+        .filter(|report| {
+            !report["trackId"]
+                .as_str()
+                .is_some_and(crate::uncensor::is_synthetic_track_id)
+        })
+        .collect();
+    if filtered.is_empty() {
+        return Ok(());
+    }
     let client_now = now().replace(':', "%3A");
-    post(&format!("plays?clientNow={client_now}"), "application/json", json!({ "plays": reports }).to_string(), token).map(|_| ())
+    post(&format!("plays?clientNow={client_now}"), "application/json", json!({ "plays": filtered }).to_string(), token).map(|_| ())
 }
 
 /// Текст песни. У синхронного у каждой строки есть время.
@@ -3350,6 +4019,9 @@ fn lyrics_in(id: &str, format: &'static str, token: &str) -> Result<Option<Lyric
 
 /// Сначала синхронный текст, потом обычный. У многих треков есть только один из них.
 pub fn lyrics(id: &str, token: &str) -> Result<Option<Lyrics>, String> {
+    if crate::uncensor::is_synthetic_track_id(id) {
+        return Ok(None);
+    }
     match lyrics_in(id, "LRC", token)? {
         Some(found) => Ok(Some(found)),
         None => lyrics_in(id, "TEXT", token),
@@ -4164,6 +4836,26 @@ mod tests {
         let v: Value = serde_json::from_str(r#"{"kind":3,"title":"P","trackCount":2,"owner":{"uid":8},"cover":{"itemsUri":["a/%%"]}}"#).unwrap();
         let p = parse_playlist(&v, "1").unwrap();
         assert_eq!((p.owner.as_str(), p.kind.as_str(), p.count, p.cover.as_deref()), ("8", "3", 2, Some("a/%%")));
+    }
+
+    #[test]
+    fn sync_playlists_are_hidden_everywhere() {
+        let sync_pin = json!({"type":"playlist_item","data":{"kind":99,"uid":5,"title":"Tune Sync","description":""}});
+        assert!(parse_pin(&sync_pin).is_none());
+        let tagged_pin = json!({"type":"playlist_item","data":{"kind":100,"uid":5,"title":"Renamed","description":"hdr\n\n[tune-sync:v1:1/1:L:+1@0]"}});
+        assert!(parse_pin(&tagged_pin).is_none());
+
+        let search_v = json!({"results":[
+            {"type":"playlist","playlist":{"uid":5,"kind":99,"title":"Tune Sync","trackCount":0}},
+            {"type":"playlist","playlist":{"uid":5,"kind":100,"title":"Tune Sync 2","trackCount":0}},
+            {"type":"playlist","playlist":{"uid":5,"kind":101,"title":"Обычный","trackCount":3}}
+        ]});
+        let found = parse_found(&search_v);
+        assert_eq!(found.playlists.len(), 1);
+        assert_eq!(found.playlists[0].kind, "101");
+
+        let liked_sync = json!({"playlist":{"uid":5,"kind":99,"title":"Tune Sync"}});
+        assert!(parse_liked_list(&liked_sync).is_none());
     }
 
     #[test]

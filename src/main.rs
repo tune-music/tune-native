@@ -1259,6 +1259,7 @@ struct App {
     searched: bool,
     /// Уже полученные вкладки текущего запроса: возврат на них не ждёт сети.
     search_cache: HashMap<(String, SearchTab), Found>,
+    catalog_version: u64,
     liked_albums: Vec<Card>,
     /// Предсохранённые альбомы, которые ещё не вышли.
     presaved: Vec<Card>,
@@ -1373,6 +1374,7 @@ struct App {
     pin_saving: u32,
     playlists: Vec<Playlist>,
     playlists_loading: bool,
+    remote_sync_gen: u64,
     /// Открытый плейлист и его треки; показывается только начало списка.
     playlist: Option<Playlist>,
     playlist_tracks: Vec<Track>,
@@ -1479,6 +1481,7 @@ struct App {
     /// Сколько ещё треков волны до следующего удалённого: не чаще одного на 10–15.
     restored_gap: usize,
     uncensor: bool,
+    catalog: bool,
     /// Запуск, трей и заголовок окна.
     window_prefs: settings::WindowPrefs,
     /// Статус в Discord: настройки, поток связи и что ему отправлено последним —
@@ -1869,6 +1872,7 @@ enum Message {
     WheelToggle,
     KeepTrackToggle,
     UncensorToggle,
+    CatalogToggle,
     OwnInWaveToggle,
     RestoredInWaveToggle,
     RestoredWave(Result<Vec<Track>, String>),
@@ -1964,6 +1968,7 @@ enum Message {
     SyncTick,
     /// Ответ сверки: число лайков здесь на момент запроса и новые номера с ревизией, если что-то менялось.
     LikesSynced(u64, Result<Option<(Vec<String>, u64)>, String>),
+    CatalogSynced(Result<bool, String>),
     PlaylistLoaded(String, Result<Vec<Track>, String>),
     SimilarLoaded(String, Result<Vec<HomeItem>, String>),
     LinkTrack(Result<Vec<Track>, String>),
@@ -2206,6 +2211,7 @@ impl App {
             search_tab: SearchTab::All,
             searched: false,
             search_cache: HashMap::new(),
+            catalog_version: uncensor::version(),
             liked_albums: Vec::new(),
             presaved: Vec::new(),
             top_artists: Vec::new(),
@@ -2283,6 +2289,7 @@ impl App {
             pin_saving: 0,
             playlists: Vec::new(),
             playlists_loading: false,
+            remote_sync_gen: uncensor::remote_sync_generation(),
             playlist: None,
             playlist_tracks: Vec::new(),
             album: None,
@@ -2333,6 +2340,7 @@ impl App {
             restored_at: None,
             restored_gap: restored_gap(),
             uncensor: { uncensor::set_enabled(saved.uncensor); saved.uncensor },
+            catalog: { uncensor::set_catalog_enabled(saved.catalog); saved.catalog },
             window_prefs: saved.window,
             discord_prefs: discord::load(),
             volume_wheel: saved.volume_wheel,
@@ -2737,7 +2745,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, skin: self.skin, aquarium: self.aquarium, glass: self.glass, keep_track: self.keep_track, own_in_wave: self.own_in_wave, restored_in_wave: self.restored_in_wave, uncensor: self.uncensor, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb, eight_d: self.eight_d, lyrics: self.lyrics_sources, lyrics_size: self.lyrics_size });
+        settings::save(Settings { volume: self.volume, muted: self.muted, repeat: self.repeat, shuffle: self.shuffle, quality: self.quality, wave: self.wave_tuning, eq: self.eq, crossfade: self.crossfade, normalize: self.normalize, lite: self.lite, kids: self.kids, books: self.books_tab, concerts: self.concerts_tab, words: self.words_on, wheel: self.wheel_on, speed: self.speed, look: self.look, skin: self.skin, aquarium: self.aquarium, glass: self.glass, keep_track: self.keep_track, own_in_wave: self.own_in_wave, restored_in_wave: self.restored_in_wave, uncensor: self.uncensor, catalog: self.catalog, window: self.window_prefs, volume_wheel: self.volume_wheel, volume_step: self.volume_step, speed_control: self.speed_control, speed_step: self.speed_step, pitch: self.pitch, reverb: self.reverb, eight_d: self.eight_d, lyrics: self.lyrics_sources, lyrics_size: self.lyrics_size });
     }
 
     /// Куда идти дальше кнопкой или по концу трека. В волне повтора нет: она бесконечна.
@@ -2925,6 +2933,7 @@ impl App {
             p.stop();
         }
         api::logout();
+        api::clear_sync_session();
         self.screen = Screen::Login(false);
         self.section = Section::Wave;
         self.history.clear();
@@ -3066,6 +3075,11 @@ impl App {
             self.results.clear();
             self.found = Found::default();
             return Task::none();
+        }
+        let ver = uncensor::version();
+        if ver != self.catalog_version {
+            self.catalog_version = ver;
+            self.search_cache.clear();
         }
         if let Some(found) = self.search_cache.get(&(text.clone(), self.search_tab)).cloned() {
             self.searching = false;
@@ -3445,8 +3459,11 @@ impl App {
         let (Some(session), Some(token)) = (self.wave.clone(), self.token()) else { return };
         // Реакции в волне — вкус по исполнителям для удалённых треков.
         if let Some(track) = track {
-            let artists: Vec<String> = track.artist_list.iter().map(|(_, id)| id.clone()).filter(|id| !id.is_empty()).collect();
+            let artists: Vec<String> = track.artist_list.iter().map(|(_, id)| id.clone()).filter(|id| !id.is_empty() && !uncensor::is_synthetic_artist_id(id)).collect();
             taste::react(kind, &artists, played, track.duration.as_secs_f32());
+        }
+        if track.is_some_and(|t| uncensor::is_synthetic_track_id(&t.id)) {
+            return;
         }
         let body = api::feedback_body(kind, track, played);
         let seeds = self.wave_base.clone();
@@ -5023,6 +5040,62 @@ impl App {
         Task::perform(background(move || api::playlists(&uid, &token)), Message::PlaylistsLoaded)
     }
 
+    fn refresh_catalog_library(&mut self, reload_playlists: bool) -> Task<Message> {
+        self.remote_sync_gen = uncensor::remote_sync_generation();
+        let mut tasks = Vec::new();
+
+        // Обновляем локальные синтетические лайки в начале `liked_ids` / `liked_set`.
+        let local_likes = uncensor::local_liked_tracks();
+        let mut seen = HashSet::new();
+        let mut merged_likes = Vec::with_capacity(local_likes.len() + self.liked_ids.len());
+        for id in local_likes {
+            if seen.insert(id.clone()) {
+                merged_likes.push(id);
+            }
+        }
+        for id in &self.liked_ids {
+            if !uncensor::is_synthetic_track_id(id) && seen.insert(id.clone()) {
+                merged_likes.push(id.clone());
+            }
+        }
+        if merged_likes != self.liked_ids {
+            self.liked_ids = merged_likes;
+            self.liked_set = self.liked_ids.iter().cloned().collect();
+            self.likes_edits += 1;
+            if !self.liked.is_empty() || self.section == Section::Likes {
+                self.liked.clear();
+                self.likes_from = 0;
+                tasks.push(self.likes_more());
+            }
+        }
+
+        // Обновляем дизлайки синтетических треков.
+        self.disliked.retain(|id| !uncensor::is_synthetic_track_id(id));
+        self.disliked.extend(uncensor::local_disliked_tracks());
+        if let Some(profile) = &self.profile {
+            offline::save_account(profile, &self.liked_ids, &self.disliked.iter().cloned().collect::<Vec<_>>());
+        }
+        if self.section == Section::Dislikes {
+            if let (Some(uid), Some(token)) = (self.uid.clone(), self.token()) {
+                tasks.push(Task::perform(background(move || api::disliked_tracks(&uid, HISTORY_LIMIT, &token)), Message::DislikesLoaded));
+            }
+        }
+
+        tasks.push(self.liked_pages_load());
+        if let Some(token) = self.token() {
+            tasks.push(Task::perform(background(move || api::pins(&token)), Message::PinsLoaded));
+        }
+        if reload_playlists {
+            tasks.push(self.playlists_load());
+        }
+        if self.section == Section::Playlists {
+            if let Some(list) = self.playlist.clone().filter(|p| p.source == Source::Playlist) {
+                tasks.push(self.load_list(list));
+            }
+        }
+        Task::batch(tasks)
+    }
+
     fn handle(&mut self, message: Message) -> Task<Message> {
         // Пока открыт клип, клавиши плеера управляют им, а переход по ссылке закрывает его.
         if let Some(watch) = &self.clip {
@@ -5100,6 +5173,10 @@ impl App {
             }
             Message::Account(Ok((profile, ids, disliked))) => {
                 self.account_tries = 0;
+                self.remote_sync_gen = uncensor::remote_sync_generation();
+                if let Some(token) = self.token().filter(|_| !self.offline) {
+                    api::set_sync_session(&profile.uid, &token);
+                }
                 offline::save_account(&profile, &ids, &disliked);
                 if let Some(token) = self.token().filter(|_| !self.offline) {
                     offline::flush_plays(token);
@@ -5624,6 +5701,8 @@ impl App {
                 let pages = if self.sync_ticks % SYNC_PAGES_EVERY == 0 { self.liked_pages_load() } else { Task::none() };
                 let full = self.sync_ticks % SYNC_PAGES_EVERY == 0;
                 let (revision, edits) = (self.likes_revision, self.likes_edits);
+                let (sync_uid, sync_token) = (uid.clone(), token.clone());
+                let catalog = Task::perform(background(move || api::sync_pull(&sync_uid, &sync_token)), Message::CatalogSynced);
                 let likes = Task::perform(background(move || {
                     let changed = api::likes_since(&uid, revision, &token)?;
                     if changed.is_none() && full {
@@ -5631,8 +5710,14 @@ impl App {
                     }
                     Ok(changed)
                 }), move |r| Message::LikesSynced(edits, r));
-                return Task::batch([pages, likes]);
+                return Task::batch([pages, likes, catalog]);
             }
+            Message::CatalogSynced(Ok(changed)) => {
+                if changed || uncensor::remote_sync_generation() != self.remote_sync_gen {
+                    return self.refresh_catalog_library(true);
+                }
+            }
+            Message::CatalogSynced(Err(e)) => eprintln!("сверка каталога Tune не удалась: {e}"),
             Message::LikesSynced(edits, Ok(Some((ids, revision)))) => {
                 // Пока сверяли, лайкнули здесь или грузится страница списка: подождём следующей сверки.
                 if edits != self.likes_edits || self.likes_loading {
@@ -6601,7 +6686,16 @@ impl App {
             Message::UncensorToggle => {
                 self.uncensor = !self.uncensor;
                 uncensor::set_enabled(self.uncensor);
+                self.search_cache.clear();
                 self.save_settings();
+            }
+            Message::CatalogToggle => {
+                self.catalog = !self.catalog;
+                uncensor::set_catalog_enabled(self.catalog);
+                self.search_cache.clear();
+                self.save_settings();
+                let pins = self.token().map_or(Task::none(), |token| Task::perform(background(move || api::pins(&token)), Message::PinsLoaded));
+                return Task::batch([self.liked_pages_load(), self.playlists_load(), pins]);
             }
             Message::KeepTrackToggle => {
                 self.keep_track = !self.keep_track;
@@ -6843,17 +6937,22 @@ impl App {
                         self.playlists = playlists;
                         let jobs = self.playlists.iter().filter_map(|p| Some((playlist_cover_key(p), p.cover.clone()?))).collect();
                         let covers = self.fetch_cover_jobs(jobs, "200x200");
+                        let sync_refresh = if uncensor::remote_sync_generation() != self.remote_sync_gen {
+                            self.refresh_catalog_library(false)
+                        } else {
+                            Task::none()
+                        };
                         if matches!(self.preview, Some(Preview::Playlists)) {
                             self.preview = None;
                         }
                         if matches!(self.preview, Some(Preview::PageMenu)) {
                             let at = self.playlists.iter().position(|p| p.title == "Загруженное").unwrap_or(0);
-                            return Task::batch([covers, self.update(Message::PlaylistOpen(at))]);
+                            return Task::batch([covers, sync_refresh, self.update(Message::PlaylistOpen(at))]);
                         }
                         if matches!(self.preview, Some(Preview::Playlist | Preview::PlaylistHome)) {
-                            return Task::batch([covers, self.update(Message::PlaylistOpen(0))]);
+                            return Task::batch([covers, sync_refresh, self.update(Message::PlaylistOpen(0))]);
                         }
-                        return covers;
+                        return Task::batch([covers, sync_refresh]);
                     }
                     Err(e) => return self.fail_retry(e, Message::Open(self.section)),
                 }
@@ -10561,6 +10660,7 @@ impl App {
                     ]
                     .spacing(8),
                     group("Без цензуры", vec![toggle("Играть без цензуры", "Треки с запиканными словами играют в оригинале по открытому списку FckCensor, названия и обложки — без цензуры, удалённые треки возвращаются в альбомы. У таких треков значок открытого замка. Уже открытые страницы обновятся при следующем открытии", Some(self.uncensor), Some(Message::UncensorToggle))]),
+                    group("Каталог Tune", vec![toggle("Каталог Tune", "Дополнительные треки, альбомы, исполнители и плейлисты из каталога Tune. У таких треков значок T. Уже открытые страницы обновятся при следующем открытии", Some(self.catalog), Some(Message::CatalogToggle))]),
                     group("Моя волна", vec![
                         toggle("Свои треки в «Моей волне»", "Загруженные вами треки из «Мне нравится» иногда попадаются в волне, но не два раза подряд и без повторов", Some(self.own_in_wave), Some(Message::OwnInWaveToggle)),
                         toggle("Удалённые треки в «Моей волне»", "Треки, которые Яндекс удалил, а «Без цензуры» вернул, попадаются в волне по вашему вкусу: Tune сам оценивает исполнителей по лайкам, пропускам и похожим. Не чаще одного на 10–15 треков, без повторов неделю", Some(self.restored_in_wave), Some(Message::RestoredInWaveToggle)),
@@ -12191,7 +12291,8 @@ fn queue_key(tracks: &[Track], title: &str) -> u64 {
 fn track_title<'a>(track: &'a Track, size: f32, font: iced::Font, color: iced::Color, marquee: bool) -> Element<'a, Message> {
     let plus = if track.plus_only && !ui::HAS_PLUS.load(Ordering::Relaxed) { PLUS_RESERVE } else { 0.0 };
     let open = uncensor::has(&track.id);
-    let label = fit(&track.title).size(size).font(font).reserve(if track.explicit { EXPLICIT_RESERVE } else { 0.0 } + if open { EXPLICIT_RESERVE } else { 0.0 } + plus);
+    let tune_cat = uncensor::is_catalog_track(&track.id);
+    let label = fit(&track.title).size(size).font(font).reserve(if track.explicit { EXPLICIT_RESERVE } else { 0.0 } + if open { EXPLICIT_RESERVE } else { 0.0 } + if tune_cat { EXPLICIT_RESERVE } else { 0.0 } + plus);
     let label = if marquee { label.marquee() } else { label };
     let title: Element<'a, Message> = if track.album.is_some() {
         hover_line(label, color, if color == ui::c().accent { ui::c().strong } else { ui::c().accent }, Message::OpenAlbum(track.clone())).into()
@@ -12199,7 +12300,7 @@ fn track_title<'a>(track: &'a Track, size: f32, font: iced::Font, color: iced::C
         label.color(color).into()
     };
     let plus = track.plus_only && !ui::HAS_PLUS.load(Ordering::Relaxed);
-    if !track.explicit && !plus && !open {
+    if !track.explicit && !plus && !open && !tune_cat {
         return title;
     }
     let mut line = row![title].spacing(6).align_y(Alignment::Center);
@@ -12208,6 +12309,9 @@ fn track_title<'a>(track: &'a Track, size: f32, font: iced::Font, color: iced::C
     }
     if open {
         line = line.push(hint(container(ui::icon(ui::UNLOCKED, 12.0, ui::c().strong)).center(16).style(ui::explicit), "Без цензуры: играет оригинальная версия (список FckCensor)"));
+    }
+    if tune_cat {
+        line = line.push(hint(container(text("T").size(11).font(ui::font_medium()).color(ui::c().strong)).center(16).style(ui::explicit), "Каталог Tune"));
     }
     if plus {
         line = line.push(hint(container(text("Плюс").size(11).font(ui::font_medium())).padding([1, 6]).style(ui::plus), "Целиком — с Плюсом"));
@@ -12955,6 +13059,9 @@ fn load_account(token: String) -> Task<Message> {
                 std::thread::sleep(Duration::from_millis(ms));
             }
             let profile = api::profile(&token)?;
+            if let Err(e) = api::sync_pull(&profile.uid, &token) {
+                api::log(&format!("Tune Sync запуск: {e}"));
+            }
             let ids = api::liked_ids(&profile.uid, &token)?;
             let disliked = api::disliked_ids(&profile.uid, &token)?;
             Ok((profile, ids, disliked))

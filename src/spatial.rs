@@ -397,6 +397,7 @@ impl<S: Source> Source for Spatial<S> {
 mod tests {
     use super::*;
     use rodio::buffer::SamplesBuffer;
+    use std::f32::consts::PI;
     use std::num::NonZero;
 
     #[test]
